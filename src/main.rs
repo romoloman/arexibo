@@ -15,6 +15,10 @@ pub mod command;
 pub mod logger;
 pub mod util;
 pub mod gui;
+pub mod stats;
+pub mod criteria;
+pub mod faults;
+pub mod adspace;
 
 use std::path::PathBuf;
 use anyhow::{ensure, Context};
@@ -49,7 +53,14 @@ struct Args {
     /// Show web inspector to debug layout problems.
     #[arg(long)]
     inspect: bool,
-    /// Enable debug logging of WebEngine messags.
+    /// Enable debug logging of WebEngine messages: prints every JS
+    /// `console.*` message from every frame (main layout, overlay, and
+    /// every widget iframe alike) to this player's own log output, plus
+    /// a handful of the player's own diagnostic console.log calls
+    /// (`arexibo-show:`/`arexibo-shrink:`) that are otherwise silent --
+    /// also still sets Chromium's own verbose logging flags. Off by
+    /// default since this adds a fair amount of noise; useful when
+    /// troubleshooting why a widget isn't rendering/showing correctly.
     #[arg(long)]
     web_debug: bool,
     /// Clear the local file cache and re-download any files.
@@ -116,9 +127,14 @@ fn main_inner() -> anyhow::Result<()> {
     // create the backend handler and required channels
     let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
     let (fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+    // Interactive Control duration overrides (/duration/set|extend|expire,
+    // see server.rs) come in on the HTTP server's own thread pool and
+    // need to be relayed to the mainloop, which is the only place that
+    // can turn them into JS run in the currently-displayed page.
+    let (duration_tx, duration_rx) = crossbeam_channel::bounded(20);
 
-    let handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
-                                         args.allow_offline, togui_tx, fromgui_rx)
+    let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
+                                              args.allow_offline, togui_tx, fromgui_rx, duration_rx)
         .context("creating backend handler")?;
     let mut settings = handler.player_settings();
 
@@ -129,11 +145,45 @@ fn main_inner() -> anyhow::Result<()> {
         }
     }
 
-    // create the interval webserver on the requested port
-    let webserver = server::Server::new(args.envdir.join("res"), 0)
+    // Create the internal webserver on the requested port.
+    // Shared across the main server AND every shard below (see
+    // server::LocalDataStore's own doc comment) -- a single, genuinely
+    // shared store, not one per shard.
+    let local_data: server::LocalDataStore = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::new()));
+    let webserver = server::Server::new(args.envdir.join("res"), "127.0.0.1",
+                                         server::EMBEDDED_SERVER_PORT,
+                                         duration_tx.clone(), local_data.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
+    let shard_port = webserver.port();
+    handler.set_html_port(shard_port);
     webserver.start_pool();
+
+    // Additional listeners, same port, different loopback addresses, all
+    // serving the exact same directory -- see server::HTML_SHARD_COUNT's
+    // own doc comment for why (Chromium's hardcoded 6-connections-per-
+    // origin limit; a single layout can easily have more than 6
+    // simultaneous `render="html"` iframe widgets, each its own HTTP
+    // request, and this compounds further whenever an overlay is also
+    // showing such widgets at the same time -- a real report: main
+    // layout content intermittently missing/delayed, but only while an
+    // overlay was also active). `layout.rs::write_media` picks one of
+    // these shards per widget (deterministically, from the widget's own
+    // id) for every `render="html"` iframe's own `src`, spreading
+    // connection load across `HTML_SHARD_COUNT` independent pools
+    // regardless of which view(s) are currently active -- the `127.0.0.1`
+    // pool set up just above (used for each view's own top-level
+    // navigation, and implicitly shard 1) is one of them; loopback
+    // addresses 2..=HTML_SHARD_COUNT get their own dedicated listener
+    // here.
+    for shard in 2..=server::HTML_SHARD_COUNT {
+        let addr = format!("127.0.0.{shard}");
+        let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
+                                                 duration_tx.clone(), local_data.clone())
+            .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
+        shard_server.start_pool();
+    }
 
     std::thread::spawn(|| handler.run());
 

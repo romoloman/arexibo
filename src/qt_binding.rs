@@ -17,6 +17,7 @@ pub const CB_SCREENSHOT: isize = 5;
 pub const CB_COMMAND: isize = 6;
 pub const CB_SHELL: isize = 7;
 pub const CB_STOPSHELL: isize = 8;
+pub const CB_OVERLAY_LAYOUT_INIT: isize = 9;
 extern "C" {
     pub fn setup(
         base_uri: *const ::std::os::raw::c_char,
@@ -34,7 +35,7 @@ extern "C" {
     pub fn navigate(file: *const ::std::os::raw::c_char);
 }
 extern "C" {
-    pub fn screenshot();
+    pub fn screenshot(max_width: i32);
 }
 extern "C" {
     pub fn set_title(title: *const ::std::os::raw::c_char);
@@ -49,4 +50,10 @@ extern "C" {
 }
 extern "C" {
     pub fn run_js(js: *const ::std::os::raw::c_char);
+}
+extern "C" {
+    pub fn overlay_show(file: *const ::std::os::raw::c_char);
+}
+extern "C" {
+    pub fn overlay_hide();
 }

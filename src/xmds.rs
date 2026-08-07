@@ -97,12 +97,45 @@ impl Cms {
                 prevent_sleep: tree.parse_child::<i32>("preventSleep")? != 0,
                 collect_interval: tree.parse_child("collectInterval")?,
                 screenshot_interval: tree.parse_child("screenShotRequestInterval")?,
+                // FLAGGED AS UNVERIFIED (element name): follows the usual
+                // lowerCamelCase-of-the-C#-PascalCase convention
+                // (`ScreenShotSize` -> `screenShotSize`), but not
+                // independently confirmed against a real ActivationMessage.
+                // `def_child` with default 0 fails safe (no resize,
+                // today's existing behavior) if the CMS omits it.
+                screenshot_size: tree.def_child("screenShotSize", 0u32)?,
+                // Same lowerCamelCase convention as every other field
+                // here; the C# property name (`IsAdspaceEnabled`) is
+                // confirmed real (seen directly in ScheduleManager.cs),
+                // but the exact XML element name is FLAGGED AS
+                // UNVERIFIED. Fails closed (adspace off) if absent.
+                is_adspace_enabled: tree.def_child::<i32>("isAdspaceEnabled", 0)? != 0,
+                // BUG fix (found from a real report, confirmed via a
+                // real RegisterDisplay response): these are "HH:MM"
+                // strings, not plain integers -- see
+                // PlayerSettings::is_within_download_window for how
+                // they actually get parsed/enforced.
+                download_start_window: tree.def_child::<String>("downloadStartWindow",
+                                                                  String::new())?,
+                download_end_window: tree.def_child::<String>("downloadEndWindow",
+                                                                String::new())?,
                 embedded_server_port: tree.parse_child("embeddedServerPort")?,
                 size_x: tree.parse_child("sizeX")?,
                 size_y: tree.parse_child("sizeY")?,
                 pos_x: tree.parse_child("offsetX")?,
                 pos_y: tree.parse_child("offsetY")?,
                 commands,
+                // FLAGGED AS UNVERIFIED: element names follow the same
+                // lowerCamelCase-of-the-C#-PascalCase-property convention
+                // every other field here already uses (e.g. `preventSleep`
+                // for `PreventSleep`), but aren't independently confirmed
+                // against a real ActivationMessage response containing
+                // them. `def_child` with conservative defaults (shell
+                // commands OFF, empty allowlist) means a CMS that omits
+                // these entirely fails closed rather than silently
+                // enabling arbitrary command execution.
+                enable_shell_commands: tree.def_child::<i32>("enableShellCommands", 0)? != 0,
+                shell_command_allow_list: tree.def_child("shellCommandAllowList", "")?,
             }))
         }
     }
@@ -261,14 +294,46 @@ impl Cms {
     }
 
     pub fn submit_stats(&mut self, stat_xml: &str) -> Result<()> {
+        // Wrapped in CDATA for the same reason submit_log/
+        // submit_media_inventory above already do this: statXml's value
+        // is itself an XML fragment (`<stats>...</stats>`), and embedding
+        // it unescaped/unwrapped as a plain xsd:string parameter makes it
+        // parse as literal child elements of the SOAP body instead of
+        // text content -- well-formed XML overall, but a WSDL type
+        // violation that a real CMS was observed to reject outright with
+        // "SOAP-ERROR: Encoding: Violation of encoding rules". This was
+        // missing here even though the exact same problem was already
+        // solved for the two sibling calls above -- inconsistency, not a
+        // deliberate difference.
+        let stat_xml = format!("<![CDATA[{stat_xml}]]>");
         let res = self.service.SubmitStats(
             soap::SubmitStatsRequest {
                 serverKey: &self.cms_key,
                 hardwareKey: &self.hw_key,
-                statXml: stat_xml
+                statXml: &stat_xml
             }
         ).context("submitting stats")?;
         ensure!(res.success, "submitting stats not successful");
+        Ok(())
+    }
+
+    /// Report Player faults (XMDS v6+, faults.rs). `faults_json` is a
+    /// JSON array (see faults.rs's doc comment for the confirmed
+    /// payload shape). Wrapped in CDATA for the same reason as
+    /// submit_stats above -- JSON doesn't normally contain XML-unsafe
+    /// characters, but a fault's own `reason` text plausibly could (an
+    /// error message quoting a `<tag>`, for instance), and this is cheap
+    /// insurance against repeating today's SubmitStats encoding bug.
+    pub fn report_faults(&mut self, faults_json: &str) -> Result<()> {
+        let wrapped = format!("<![CDATA[{faults_json}]]>");
+        let res = self.service.ReportFaults(
+            soap::ReportFaultsRequest {
+                serverKey: &self.cms_key,
+                hardwareKey: &self.hw_key,
+                faults: &wrapped,
+            }
+        ).context("reporting faults")?;
+        ensure!(res.success, "reporting faults not successful");
         Ok(())
     }
 
@@ -317,3 +382,6 @@ pub struct Status<'s> {
     // pub latitude: f64,
     // pub longitude: f64,
 }
+
+
+

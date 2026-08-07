@@ -26,6 +26,23 @@ pub enum Message {
     Purge,
     WebHook(String),
     Command(String),
+    /// A specific widget's server-rendered content changed on the CMS
+    /// (payload carries only its widgetId) -- see resource.rs's
+    /// `Cache::refresh_resource` for how this gets applied.
+    DataUpdate(i64),
+    /// Force-show this one layout, bypassing the normal schedule, until
+    /// a `RevertToSchedule` (or another `ChangeLayout`) arrives.
+    ChangeLayout(i64),
+    /// Show this layout as an overlay on top of whatever's currently
+    /// playing, for the given duration in seconds -- doesn't interrupt
+    /// the underlying schedule at all (unlike `ChangeLayout`).
+    OverlayLayout(i64, u64),
+    /// Cancel any active `ChangeLayout` override and resume the normal
+    /// CMS-driven schedule.
+    RevertToSchedule,
+    /// One or more Schedule Criteria metrics changed:
+    /// (metric, value, ttl in seconds) tuples -- see criteria.rs.
+    CriteriaUpdate(Vec<(String, String, i64)>),
 }
 
 pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKey,
@@ -239,6 +256,42 @@ struct JsonMessage {
     #[serde(rename = "commandCode")]
     #[serde(default)]
     command_code: Option<String>,  // for commands
+    #[serde(rename = "widgetId")]
+    #[serde(default)]
+    widget_id: Option<i64>,  // for dataUpdate
+    // FLAGGED AS UNVERIFIED: field names inferred from the C# client's
+    // LayoutChangePlayerAction (layoutId, changeMode: "replace"/other) --
+    // could not fetch that exact POCO file's source directly, only
+    // confirmed its existence and rough shape via ScheduleManager.cs and
+    // XmrSubscriber.cs call sites. Verify against a real changeLayout
+    // XMR payload from the CMS before relying on this.
+    #[serde(rename = "layoutId")]
+    #[serde(default)]
+    layout_id: Option<i64>,  // for changeLayout
+    #[serde(rename = "changeMode")]
+    #[serde(default)]
+    change_mode: Option<String>,  // for changeLayout ("replace" vs. queue/add)
+    // FLAGGED AS UNVERIFIED: same caveat as layoutId/changeMode above --
+    // field name assumed for how long (in seconds) an overlayLayout
+    // action should stay visible before automatically hiding again.
+    #[serde(default)]
+    duration: Option<i64>,  // for overlayLayout
+    // Confirmed via official docs (account.xibosignage.com/docs/
+    // developer/player-control/schedule-criteria): payload is
+    // `{"criteriaUpdates": [{"metric": "...", "value": "...", "ttl": N}]}`
+    // -- action name is singular ("criteriaUpdate") but this field is
+    // plural, an array of updates in one message.
+    #[serde(rename = "criteriaUpdates")]
+    #[serde(default)]
+    criteria_updates: Option<Vec<CriteriaUpdateItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CriteriaUpdateItem {
+    metric: String,
+    value: String,
+    #[serde(default)]
+    ttl: i64,
 }
 
 impl JsonMessage {
@@ -266,6 +319,32 @@ impl JsonMessage {
             "purgeAll" => Some(Message::Purge),
             "triggerWebhook" => self.trigger_code.map(Message::WebHook),
             "commandAction" => self.command_code.map(Message::Command),
+            "dataUpdate" => self.widget_id.map(Message::DataUpdate),
+            "changeLayout" => {
+                if let Some(mode) = &self.change_mode {
+                    if mode != "replace" {
+                        log::warn!("changeLayout with changeMode {mode:?} received -- only \
+                                    \"replace\" semantics are implemented (a single override \
+                                    slot), not queuing/cycling multiple override layouts");
+                    }
+                }
+                self.layout_id.map(Message::ChangeLayout)
+            }
+            "revertToSchedule" => Some(Message::RevertToSchedule),
+            "overlayLayout" => self.layout_id.map(|id| {
+                // Default duration if the CMS message omits it entirely
+                // -- arbitrary but conservative choice so a malformed/
+                // missing duration doesn't leave the overlay stuck up
+                // forever; a real duration from the CMS always overrides
+                // this.
+                let secs = self.duration.filter(|&d| d > 0).unwrap_or(60) as u64;
+                Message::OverlayLayout(id, secs)
+            }),
+            "criteriaUpdate" => self.criteria_updates.map(|items| {
+                Message::CriteriaUpdate(
+                    items.into_iter().map(|i| (i.metric, i.value, i.ttl)).collect()
+                )
+            }),
             _ => {
                 log::info!("got unsupported XMR action {:?}", self.action);
                 None
@@ -359,6 +438,136 @@ impl ZmqSubSocket {
         self.0.read_exact(&mut result)?;
         Ok((result, more))
     }
+}
+
+#[test]
+fn test_data_update_action() {
+    let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
+    let msg = JsonMessage {
+        action: "dataUpdate".into(),
+        created: OffsetDateTime::parse(&now, &time::format_description::well_known::Rfc3339).unwrap(),
+        ttl: 120,
+        trigger_code: None,
+        command_code: None,
+        widget_id: Some(20349),
+        layout_id: None,
+        change_mode: None,
+        duration: None, criteria_updates: None,
+    };
+    assert!(matches!(msg.into_msg(), Some(Message::DataUpdate(20349))));
+
+    // malformed/older-CMS message missing the widgetId entirely -> ignored,
+    // not a panic or a DataUpdate(0)
+    let msg = JsonMessage {
+        action: "dataUpdate".into(),
+        created: OffsetDateTime::parse(&now, &time::format_description::well_known::Rfc3339).unwrap(),
+        ttl: 120,
+        trigger_code: None,
+        command_code: None,
+        widget_id: None,
+        layout_id: None,
+        change_mode: None,
+        duration: None, criteria_updates: None,
+    };
+    assert!(msg.into_msg().is_none());
+}
+
+#[test]
+fn test_change_layout_and_revert_actions() {
+    let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
+    let created = OffsetDateTime::parse(&now, &time::format_description::well_known::Rfc3339).unwrap();
+
+    let msg = JsonMessage {
+        action: "changeLayout".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: Some(627), change_mode: Some("replace".into()), duration: None, criteria_updates: None,
+    };
+    assert!(matches!(msg.into_msg(), Some(Message::ChangeLayout(627))));
+
+    // missing layoutId entirely -> ignored, not ChangeLayout(0)
+    let msg = JsonMessage {
+        action: "changeLayout".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: None, change_mode: None, duration: None, criteria_updates: None,
+    };
+    assert!(msg.into_msg().is_none());
+
+    let msg = JsonMessage {
+        action: "revertToSchedule".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: None, change_mode: None, duration: None, criteria_updates: None,
+    };
+    assert!(matches!(msg.into_msg(), Some(Message::RevertToSchedule)));
+}
+
+#[test]
+fn test_overlay_layout_action() {
+    let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
+    let created = OffsetDateTime::parse(&now, &time::format_description::well_known::Rfc3339).unwrap();
+
+    let msg = JsonMessage {
+        action: "overlayLayout".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: Some(42), change_mode: None, duration: Some(30), criteria_updates: None,
+    };
+    assert!(matches!(msg.into_msg(), Some(Message::OverlayLayout(42, 30))));
+
+    // missing/zero duration -> falls back to the default instead of a
+    // zero or negative duration that would hide the overlay instantly
+    let msg = JsonMessage {
+        action: "overlayLayout".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: Some(42), change_mode: None, duration: None, criteria_updates: None,
+    };
+    assert!(matches!(msg.into_msg(), Some(Message::OverlayLayout(42, 60))));
+
+    let msg = JsonMessage {
+        action: "overlayLayout".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: Some(42), change_mode: None, duration: Some(0), criteria_updates: None,
+    };
+    assert!(matches!(msg.into_msg(), Some(Message::OverlayLayout(42, 60))));
+
+    // missing layoutId entirely -> ignored
+    let msg = JsonMessage {
+        action: "overlayLayout".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: None, change_mode: None, duration: Some(30), criteria_updates: None,
+    };
+    assert!(msg.into_msg().is_none());
+}
+
+#[test]
+fn test_criteria_update_action() {
+    let now = OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap();
+    let created = OffsetDateTime::parse(&now, &time::format_description::well_known::Rfc3339).unwrap();
+
+    let msg = JsonMessage {
+        action: "criteriaUpdate".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: None, change_mode: None, duration: None,
+        criteria_updates: Some(vec![
+            CriteriaUpdateItem { metric: "temperature".into(), value: "25".into(), ttl: 3600 },
+            CriteriaUpdateItem { metric: "weather_condition".into(), value: "clear".into(), ttl: 60 },
+        ]),
+    };
+    match msg.into_msg() {
+        Some(Message::CriteriaUpdate(items)) => {
+            assert_eq!(items, vec![
+                ("temperature".to_string(), "25".to_string(), 3600),
+                ("weather_condition".to_string(), "clear".to_string(), 60),
+            ]);
+        }
+        other => panic!("expected CriteriaUpdate, got {other:?}"),
+    }
+
+    // missing criteriaUpdates entirely -> ignored
+    let msg = JsonMessage {
+        action: "criteriaUpdate".into(), created, ttl: 120,
+        trigger_code: None, command_code: None, widget_id: None,
+        layout_id: None, change_mode: None, duration: None, criteria_updates: None,
+    };
+    assert!(msg.into_msg().is_none());
 }
 
 #[test]

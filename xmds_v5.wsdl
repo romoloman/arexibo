@@ -73,6 +73,21 @@
     <message name="SubmitStatsResponse">
         <part name="success" type="xsd:boolean" />
     </message>
+    <!-- Added by hand (not in the original v5 WSDL this file otherwise
+         mirrors); ReportFaults was introduced in XMDS v6. Parameter
+         name "faults" is FLAGGED AS UNVERIFIED against the real v6+
+         WSDL (could not obtain its literal text); inferred from the
+         documented JSON payload shape and the naming convention every
+         other string-payload method here already uses (statXml,
+         mediaInventory, logXml). -->
+    <message name="ReportFaultsRequest">
+        <part name="serverKey" type="xsd:string" />
+        <part name="hardwareKey" type="xsd:string" />
+        <part name="faults" type="xsd:string" />
+    </message>
+    <message name="ReportFaultsResponse">
+        <part name="success" type="xsd:boolean" />
+    </message>
     <message name="MediaInventoryRequest">
         <part name="serverKey" type="xsd:string" />
         <part name="hardwareKey" type="xsd:string" />
@@ -142,6 +157,11 @@
             <documentation>Submit Display statistics from the Client</documentation>
             <input message="tns:SubmitStatsRequest"/>
             <output message="tns:SubmitStatsResponse"/>
+        </operation>
+        <operation name="ReportFaults">
+            <documentation>Report Player faults to the CMS (XMDS v6+)</documentation>
+            <input message="tns:ReportFaultsRequest"/>
+            <output message="tns:ReportFaultsResponse"/>
         </operation>
         <operation name="MediaInventory">
             <documentation>Report back the clients MediaInventory</documentation>
@@ -222,6 +242,21 @@
         </operation>
         <operation name="SubmitStats">
             <soap:operation soapAction="urn:xmds#SubmitLog" style="rpc"/>
+            <input>
+                <soap:body use="encoded" namespace="urn:xmds" encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"/>
+            </input>
+            <output>
+                <soap:body use="encoded" namespace="urn:xmds" encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"/>
+            </output>
+        </operation>
+        <!-- Added by hand, see the ReportFaultsRequest message doc
+             comment above. Note (NOT copied forward): SubmitStats above
+             has a pre-existing soapAction typo (says "SubmitLog");
+             left alone since it's out of scope and evidently harmless
+             in practice; this new operation uses its own correct
+             soapAction instead of perpetuating that copy-paste bug. -->
+        <operation name="ReportFaults">
+            <soap:operation soapAction="urn:xmds#ReportFaults" style="rpc"/>
             <input>
                 <soap:body use="encoded" namespace="urn:xmds" encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"/>
             </input>

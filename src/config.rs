@@ -28,6 +28,35 @@ pub struct PlayerSettings {
     pub log_level: String,
     #[serde(default)]
     pub screenshot_interval: u64,
+    // Max width (px) to downscale screenshots to before submission, 0 =
+    // no resize (send at full captured resolution) -- confirmed real
+    // setting from the C# client's own default.config.xml
+    // (`<ScreenShotSize>0</ScreenShotSize>`), previously not read/
+    // respected at all here.
+    #[serde(default)]
+    pub screenshot_size: u32,
+    // Master on/off switch for Adspace Exchange (`ssp` widgets, see
+    // adspace.rs) -- confirmed real field name from the actual C#
+    // client source seen during development
+    // (`ApplicationSettings.Default.IsAdspaceEnabled`). Defaults to
+    // false (fails closed: no Adspace Exchange network requests unless
+    // the CMS explicitly turns it on for this display).
+    #[serde(default)]
+    pub is_adspace_enabled: bool,
+    // BUG fix (found from a real report, confirmed via a real
+    // RegisterDisplay XML response the user shared): these are
+    // "HH:MM" strings (e.g. "12:00"/"15:00"), NOT plain integers --
+    // an earlier version of this code wrongly assumed a bare hour
+    // number based on a *different*, local config-file representation
+    // (a real XiboClient.config dump showing
+    // `<DownloadStartWindow>0</DownloadStartWindow>`), which turned out
+    // to not match the actual XMDS wire format at all. See
+    // `PlayerSettings::is_within_download_window` for how these
+    // actually get enforced.
+    #[serde(default)]
+    pub download_start_window: String,
+    #[serde(default)]
+    pub download_end_window: String,
     #[serde(default = "default_embedded_server_port")]
     pub embedded_server_port: u16,
     #[serde(default)]
@@ -44,6 +73,26 @@ pub struct PlayerSettings {
     pub pos_y: i32,
     #[serde(default)]
     pub commands: HashMap<String, Command>,
+    // Security: master on/off switch for shell/command execution
+    // capability, mirroring the C# client's `EnableShellCommands`
+    // (confirmed default `false` from a real exported XiboClient.config
+    // on the community forum). Defaults to `false` here too -- fail
+    // closed if the CMS response is somehow missing this field, rather
+    // than silently allowing arbitrary command execution.
+    #[serde(default)]
+    pub enable_shell_commands: bool,
+    // Comma-separated allowlist (`ShellCommandAllowList` in the C#
+    // client) restricting which commands a Layout's own shellcommand
+    // widget (`run_shell` in mainloop.rs -- an arbitrary command line
+    // embedded directly in Layout content, the actually risky vector)
+    // may run. Empty means "no restriction beyond enable_shell_commands
+    // itself" -- matches the observed default (`<ShellCommandAllowList
+    // />`, i.e. empty). Does NOT restrict `run_command` (CMS Display
+    // Profile-preregistered commands, triggered by *selecting* one via a
+    // `commandCode`/`commandAction` -- already vetted by being centrally
+    // configured, so only gated by enable_shell_commands itself).
+    #[serde(default)]
+    pub shell_command_allow_list: String,
 }
 
 impl PlayerSettings {
@@ -55,6 +104,84 @@ impl PlayerSettings {
     pub fn to_file(&self, path: impl AsRef<Path>) -> Result<()> {
         serde_json::to_writer_pretty(File::create(path.as_ref())?, self)
             .context("serializing player settings")
+    }
+
+    /// Whether bulk file downloads (media/resources/layouts -- NOT the
+    /// lightweight RegisterDisplay/Schedule/RequiredFiles metadata calls
+    /// themselves, which should keep happening regardless so the
+    /// schedule stays current) are currently allowed, per the CMS's own
+    /// `DownloadStartWindow`/`DownloadEndWindow` Display Profile setting
+    /// -- a way to keep a display from hogging bandwidth during
+    /// business hours. BUG fix (found from a real report): this setting
+    /// was parsed nowhere and enforced nowhere at all before -- see
+    /// `mainloop.rs`'s `collect_once` for where this is actually applied
+    /// now.
+    ///
+    /// `start == end` (0/0 is the common CMS default when the feature
+    /// isn't actively configured) means "no restriction" -- a literal
+    /// zero-width window would otherwise permanently block every
+    /// download, which is certainly not the intent of an unconfigured
+    /// setting. `start > end` is a legitimate overnight window (e.g.
+    /// 22-6, meaning 22:00 through 06:00 the next day) -- checked as a
+    /// wraparound rather than assuming `start <= end`.
+    /// Whether bulk file downloads (media/resources/layouts -- NOT the
+    /// lightweight RegisterDisplay/Schedule/RequiredFiles metadata calls
+    /// themselves, which should keep happening regardless so the
+    /// schedule stays current) are currently allowed, per the CMS's own
+    /// `DownloadStartWindow`/`DownloadEndWindow` Display Profile setting
+    /// -- a way to keep a display from hogging bandwidth during
+    /// business hours. BUG fix (found from a real report): this setting
+    /// was parsed nowhere and enforced nowhere at all before -- see
+    /// `mainloop.rs`'s `collect_once` for where this is actually applied
+    /// now.
+    ///
+    /// Either field being empty, missing, or unparseable as `"HH:MM"`
+    /// (confirmed real wire format from an actual RegisterDisplay
+    /// response) means "no restriction" -- fails open rather than
+    /// blocking every download just because this setting wasn't
+    /// configured or came back in some unexpected shape. `start == end`
+    /// (parsed to the same minute-of-day) is treated the same way -- a
+    /// literal zero-width window would otherwise permanently block
+    /// every download, which is certainly not the intent of an
+    /// unconfigured setting.
+    pub fn is_within_download_window(&self) -> bool {
+        let (Some(start), Some(end)) = (
+            Self::parse_hhmm(&self.download_start_window),
+            Self::parse_hhmm(&self.download_end_window),
+        ) else {
+            return true;
+        };
+        let now_minute = time::OffsetDateTime::now_local()
+            .map(|t| t.hour() as u16 * 60 + t.minute() as u16)
+            .unwrap_or(0);
+        Self::minute_in_download_window(now_minute, start, end)
+    }
+
+    /// Parses a `"HH:MM"` string (the confirmed real wire format for
+    /// `downloadStartWindow`/`downloadEndWindow`) into minutes since
+    /// midnight, or `None` if empty/malformed/out of range.
+    fn parse_hhmm(s: &str) -> Option<u16> {
+        let (h, m) = s.trim().split_once(':')?;
+        let h: u16 = h.parse().ok()?;
+        let m: u16 = m.parse().ok()?;
+        (h < 24 && m < 60).then(|| h * 60 + m)
+    }
+
+    /// Pure logic behind `is_within_download_window`, split out purely
+    /// so it can be unit-tested against specific times directly instead
+    /// of depending on the real wall-clock time the test happens to run
+    /// at. All three arguments are minutes since midnight (0-1439).
+    fn minute_in_download_window(now_minute: u16, start: u16, end: u16) -> bool {
+        if start == end {
+            return true;
+        }
+        if start < end {
+            now_minute >= start && now_minute < end
+        } else {
+            // Overnight wraparound: e.g. 22:00-06:00 -> allowed from
+            // 22:00 through 23:59, then again from 00:00 through 05:59.
+            now_minute >= start || now_minute < end
+        }
     }
 }
 
@@ -100,6 +227,32 @@ impl CmsSettings {
         };
         Ok(ureq::config::Config::builder()
             .timeout_connect(Some(Duration::from_secs(3)))
+            // BUG fix (found from a real report: after several
+            // "Cache not ready" SOAP faults and retries -- section 33
+            // -- the whole player appeared to stop responding to
+            // *everything*, not just dataset updates: no more XMR
+            // messages processed, no more periodic layout refresh
+            // either). `timeout_connect` alone only bounds how long
+            // establishing the connection itself can take -- once
+            // connected, if the CMS is slow to respond (plausibly
+            // exactly when it's already struggling enough to return
+            // "Cache not ready" in the first place) or the connection
+            // simply hangs after that point, ureq would wait
+            // indefinitely for a response, with no timeout at all
+            // protecting against it. Since every network call this
+            // agent makes runs synchronously on the mainloop's own
+            // single thread (shared with XMR message handling and the
+            // periodic schedule_check tick, see mainloop.rs's `run()`
+            // select! loop), one such hang blocks literally everything
+            // else the player does, indefinitely -- exactly the
+            // reported symptom. `timeout_global` is end-to-end (DNS
+            // lookup through finishing reading the response body) and
+            // therefore covers this case regardless of *where* in the
+            // request lifecycle something goes wrong; 30s is generous
+            // enough for a normal SOAP round-trip (including a slow
+            // GetResource render) while still bounding the worst case
+            // to something the player can recover from on its own.
+            .timeout_global(Some(Duration::from_secs(30)))
             .tls_config(tls_config)
             .proxy(proxy)
             .build().into())
@@ -188,6 +341,11 @@ mod tests {
         assert_eq!(s.display_name, "Xibo");
         assert!(!s.stats_enabled);
         assert!(!s.prevent_sleep);
+        // security: fail closed if these are somehow absent
+        assert!(!s.enable_shell_commands);
+        assert_eq!(s.shell_command_allow_list, "");
+        assert_eq!(s.screenshot_size, 0);
+        assert!(!s.is_adspace_enabled);
     }
 
     #[test]
@@ -264,5 +422,131 @@ mod tests {
         assert_eq!(parsed.key, cms.key);
         assert_eq!(parsed.display_id, cms.display_id);
         assert_eq!(parsed.display_name, cms.display_name);
+    }
+
+    #[test]
+    fn download_window_parses_real_hhmm_strings_from_a_real_registerdisplay_response() {
+        // Regression test using the exact values from a real
+        // RegisterDisplay response the user shared, confirming the
+        // wire format really is "HH:MM" strings (an earlier version of
+        // this code wrongly assumed a bare integer, based on a
+        // different, local config-file representation that doesn't
+        // match this at all).
+        assert_eq!(PlayerSettings::parse_hhmm("12:00"), Some(12 * 60));
+        assert_eq!(PlayerSettings::parse_hhmm("15:00"), Some(15 * 60));
+        // The exact scenario from that real response: outside 12:00-15:00.
+        assert!(!PlayerSettings::minute_in_download_window(16 * 60, 12 * 60, 15 * 60));
+        assert!(PlayerSettings::minute_in_download_window(13 * 60 + 30, 12 * 60, 15 * 60));
+    }
+
+    #[test]
+    fn download_window_parse_hhmm_handles_minutes_precisely() {
+        assert_eq!(PlayerSettings::parse_hhmm("09:05"), Some(9 * 60 + 5));
+        assert_eq!(PlayerSettings::parse_hhmm("23:59"), Some(23 * 60 + 59));
+        assert_eq!(PlayerSettings::parse_hhmm(""), None, "empty string means unconfigured");
+        assert_eq!(PlayerSettings::parse_hhmm("garbage"), None);
+        assert_eq!(PlayerSettings::parse_hhmm("24:00"), None, "hour out of range");
+        assert_eq!(PlayerSettings::parse_hhmm("12:60"), None, "minute out of range");
+    }
+
+    #[test]
+    fn download_window_missing_or_empty_means_no_restriction() {
+        let s: PlayerSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.download_start_window, "");
+        assert_eq!(s.download_end_window, "");
+        assert!(s.is_within_download_window(), "unconfigured (empty) window must fail open");
+    }
+
+    #[test]
+    fn download_window_start_equals_end_means_no_restriction() {
+        // Same minute-of-day for both -- must NOT be interpreted as a
+        // literal zero-width window that blocks every download
+        // permanently.
+        for minute in [0, 1, 100, 719, 720, 1439] {
+            assert!(PlayerSettings::minute_in_download_window(minute, 540, 540),
+                    "minute {minute} should be allowed when start==end");
+        }
+    }
+
+    #[test]
+    fn download_window_normal_range() {
+        // 09:00-17:00
+        let (start, end) = (9 * 60, 17 * 60);
+        assert!(!PlayerSettings::minute_in_download_window(8 * 60 + 59, start, end));
+        assert!(PlayerSettings::minute_in_download_window(9 * 60, start, end),
+                "start minute is inclusive");
+        assert!(PlayerSettings::minute_in_download_window(12 * 60, start, end));
+        assert!(PlayerSettings::minute_in_download_window(16 * 60 + 59, start, end));
+        assert!(!PlayerSettings::minute_in_download_window(17 * 60, start, end),
+                "end minute is exclusive");
+        assert!(!PlayerSettings::minute_in_download_window(20 * 60, start, end));
+    }
+
+    #[test]
+    fn download_window_overnight_wraparound() {
+        // 22:00-06:00 (10pm through 6am the next day)
+        let (start, end) = (22 * 60, 6 * 60);
+        assert!(PlayerSettings::minute_in_download_window(22 * 60, start, end),
+                "start minute is inclusive");
+        assert!(PlayerSettings::minute_in_download_window(23 * 60, start, end));
+        assert!(PlayerSettings::minute_in_download_window(0, start, end));
+        assert!(PlayerSettings::minute_in_download_window(5 * 60 + 59, start, end));
+        assert!(!PlayerSettings::minute_in_download_window(6 * 60, start, end),
+                "end minute is exclusive");
+        assert!(!PlayerSettings::minute_in_download_window(12 * 60, start, end),
+                "midday should be blocked");
+        assert!(!PlayerSettings::minute_in_download_window(21 * 60 + 59, start, end));
+    }
+}
+
+#[cfg(test)]
+mod download_window_unset_variants_tests {
+    use super::*;
+
+    #[test]
+    fn literal_colon_with_nothing_around_it_means_no_restriction() {
+        // Confirmed real: when the download window isn't actively
+        // configured, the CMS can send a literal ":" (empty hour, empty
+        // minute, just the separator) rather than an empty string
+        // entirely.
+        assert_eq!(PlayerSettings::parse_hhmm(":"), None,
+                    "\":\" alone has no parseable hour or minute");
+        let s = PlayerSettings {
+            download_start_window: ":".into(),
+            download_end_window: ":".into(),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        assert!(s.is_within_download_window(), "\":\" on both sides must fail open");
+    }
+
+    #[test]
+    fn plain_windows_style_zero_also_means_no_restriction() {
+        // The *other* real-world shape mentioned: the bare "0" default
+        // seen in a real XiboClient.config dump (a different, local
+        // representation from the live XMDS wire format, but still
+        // worth tolerating gracefully rather than erroring/misbehaving
+        // if it were ever sent this way too).
+        assert_eq!(PlayerSettings::parse_hhmm("0"), None,
+                    "a bare integer has no ':' separator to split on");
+        let s = PlayerSettings {
+            download_start_window: "0".into(),
+            download_end_window: "0".into(),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        assert!(s.is_within_download_window(), "bare \"0\" on both sides must fail open");
+    }
+
+    #[test]
+    fn mixed_colon_and_real_value_still_fails_open() {
+        // Asymmetric/partial configurations (one side set, the other
+        // still the "unset" placeholder) should also fail open rather
+        // than doing something undefined -- `is_within_download_window`
+        // requires *both* sides to parse successfully.
+        let s = PlayerSettings {
+            download_start_window: ":".into(),
+            download_end_window: "15:00".into(),
+            ..serde_json::from_str("{}").unwrap()
+        };
+        assert!(s.is_within_download_window());
     }
 }

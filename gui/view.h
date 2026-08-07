@@ -3,11 +3,58 @@
 
 #include <QMainWindow>
 #include <QScreen>
+#include <QMap>
 #include <QtWebEngineWidgets/QWebEngineView>
+#include <QtWebEngineCore/QWebEnginePage>
+#include <QtWebEngineCore/QWebEngineScript>
+#include <QtWebEngineCore/QWebEngineScriptCollection>
 #include <QtWebChannel/QWebChannel>
 #include <iostream>
 
 #include "lib.h"
+
+// Logs every JS `console.*` message from a page to arexibo's own stdout
+// (same "INFO :"/"WARN :" convention as the rest of gui/*.cpp), including
+// messages from *any iframe* within that page -- Chromium's own
+// javaScriptConsoleMessage callback fires for the whole page's frame
+// tree, not just the top-level document, so setting this on `view`
+// alone already covers every widget iframe inside it too (no need to
+// hook each iframe separately). Added as a lightweight, always-on
+// diagnostic aid (found genuinely useful investigating a real Dataset
+// View widget rendering problem: the *first* concrete evidence of
+// what's actually failing inside a widget's own JS, without needing
+// network-reachable remote debugging -- which, on a real totem where
+// the debugging port only binds to 127.0.0.1 and SSH port forwarding
+// wasn't reliable, wasn't a practical option at all).
+// Controlled by --web-debug (see main.rs's Args -- "Enable debug
+// logging of WebEngine messages", threaded through as gui::run's own
+// `debug` parameter): whether LoggingPage actually prints anything, and
+// whether `window.arexiboDebug` gets injected into every frame (see
+// setup()) so JS-side diagnostics (layout.rs's own `arexibo-show:`
+// console.log, and the shrink-to-fit script's `arexibo-shrink:` one) are
+// gated the same way -- previously all unconditional, adding permanent
+// noise to every single run regardless of whether anyone actually
+// wanted this level of detail. A single flag, not a whole new one, on
+// request: this one's own existing description already matched exactly
+// what these do.
+static bool g_web_debug_enabled = false;
+
+class LoggingPage : public QWebEnginePage
+{
+    Q_OBJECT
+public:
+    LoggingPage(QObject *parent = nullptr) : QWebEnginePage(parent) {}
+
+protected:
+    void javaScriptConsoleMessage(JavaScriptConsoleMessageLevel level, const QString &message,
+                                   int lineNumber, const QString &sourceID) override
+    {
+        if (!g_web_debug_enabled) return;
+        const char *tag = level == ErrorMessageLevel ? "WARN " : "INFO ";
+        std::cout << tag << ": [arexibo::qt] JS console [" << sourceID.toStdString()
+                   << ":" << lineNumber << "] " << message.toStdString() << std::endl;
+    }
+};
 
 class Window : public QMainWindow
 {
@@ -29,20 +76,66 @@ private:
     int layout_width;
     int layout_height;
 
+    // One additional, non-iframed QWebEngineView per `render="native"`
+    // webpage widget currently on screen in the MAIN layout -- keyed by
+    // the widget's XLF media id. See jsNativeWebShowImpl/jsNativeWebHideImpl
+    // in view.cpp for why this exists instead of just using an iframe
+    // (X-Frame-Options and similar frame-busting headers only block
+    // *embedding*, not a real top-level browser view).
+    QMap<int, QWebEngineView*> native_views;
+
+    // --- Overlay layout support (XMR `overlayLayout` action) ---
+    // A second, independent QWebEngineView/QWebChannel/JSInterface stack,
+    // shown on top of the main view without interrupting it (unlike
+    // `changeLayout`, which replaces what's on screen -- see
+    // xmr::Message::OverlayLayout/ChangeLayout in mainloop.rs). Lazily
+    // created on first use via ensureOverlayView(); torn down (not just
+    // hidden) in overlayHideImpl() so an idle overlay doesn't keep a live
+    // QWebEngineView/renderer process around indefinitely between uses.
+    QWebEngineView *overlay_view = nullptr;
+    QWebChannel *overlay_channel = nullptr;
+    int overlay_layout_width = 1920;
+    int overlay_layout_height = 1080;
+    // Own set of native_views for `webpage render="native"` widgets that
+    // happen to be inside the overlay layout itself -- kept separate
+    // from the main view's `native_views` so overlayHideImpl() tears down
+    // exactly its own without touching the main layout's.
+    QMap<int, QWebEngineView*> overlay_native_views;
+
+    void ensureOverlayView();
+
     void adjustScale(int, int);
+    void adjustOverlayScale(int, int);
+
+public:
+    // `overlay` selects which view/geometry/native-view-map a call
+    // applies to -- see jsNativeWebShow/jsNativeWebHide in JSInterface,
+    // which is itself bound to a specific view via its own `is_overlay`
+    // flag and passes it straight through.
+    void jsNativeWebShowImpl(bool overlay, int, QString, int, int, int, int);
+    void jsNativeWebHideImpl(bool overlay, int);
+    // Destroys any native_views left over from the *previous* layout --
+    // called before navigating to a new one, since those widgets don't
+    // exist in the new page at all and would otherwise leak/linger on
+    // screen indefinitely.
+    void clearNativeViews(bool overlay);
 
 signals:
     void navigateTo(QString);
-    void screenShot();
+    void screenShot(int max_width);
     void setTitle(QString);
     void setSize(int, int, int, int);
     void runJavascript(QString);
+    void overlayShow(QString);
+    void overlayHide();
 
 public slots:
     void navigateToImpl(QString);
-    void screenShotImpl();
+    void screenShotImpl(int max_width);
     void setSizeImpl(int, int, int, int);
     void runJavascriptImpl(QString);
+    void overlayShowImpl(QString);
+    void overlayHideImpl();
 };
 
 class JSInterface : public QObject
@@ -50,10 +143,17 @@ class JSInterface : public QObject
     Q_OBJECT
 
 public:
-    JSInterface(Window *wnd) : QObject(wnd), wnd(wnd) {}
+    // `is_overlay` distinguishes which view/QWebChannel this instance is
+    // bound to -- see the members it guards in view.cpp (e.g. jsLayoutInit
+    // must NOT report the overlay's own layout id as "the current layout"
+    // to the CMS; jsLayoutDone has no cross-layout cycling to do for a
+    // standalone overlay).
+    JSInterface(Window *wnd, bool is_overlay = false) :
+        QObject(wnd), wnd(wnd), is_overlay(is_overlay) {}
 
 private:
     Window *wnd;
+    bool is_overlay;
 
 public slots:
     void jsLayoutInit(int, int, int);
@@ -63,6 +163,8 @@ public slots:
     void jsCommand(QString);
     void jsShell(QString, int);
     void jsStopShell(int);
+    void jsNativeWebShow(int, QString, int, int, int, int);
+    void jsNativeWebHide(int);
 };
 
 #endif

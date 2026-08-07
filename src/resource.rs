@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 use std::{fs, io, io::Write, path::PathBuf, sync::Arc};
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
+use elementtree::Element;
 use md5::{Md5, Digest};
 use serde::{Serialize, Deserialize};
 use ureq::Agent;
@@ -16,7 +17,7 @@ use crate::config::CmsSettings;
 pub type LayoutId = i64;
 
 /// An entry in the "required files" set.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ReqFile {
     File {
         id: i64,
@@ -63,7 +64,15 @@ pub struct LayoutInfo {
     pub code: Option<String>,
     #[serde(default)]
     pub translated_version: u32,
+    // Needed for Proof of Play (see stats.rs) -- #[serde(default =
+    // "default_true")] so existing cached content.json entries (written
+    // before this field existed) deserialize as "stats enabled", matching
+    // Xibo's own documented default when the XLF attribute is absent.
+    #[serde(default = "default_true")]
+    pub enable_stat: bool,
 }
+
+fn default_true() -> bool { true }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MediaInfo {
@@ -78,6 +87,12 @@ pub struct ResourceInfo {
     pub id: i64,
     pub layoutid: LayoutId,
     pub regionid: i64,
+    // Needed to reconstruct a ReqFile::Resource for a targeted re-download
+    // (see Cache::refresh_resource) -- #[serde(default)] so existing
+    // content.json caches on disk (written before this field existed)
+    // still deserialize instead of erroring out on upgrade.
+    #[serde(default)]
+    pub mediaid: i64,
     pub updated: i64,
     pub duration: Option<f64>,
     #[serde(default)]
@@ -98,6 +113,25 @@ pub struct Cache {
     agent: Agent,
     content: HashMap<String, Resource>,
     code_map: HashMap<String, LayoutId>,
+    /// Whether Adspace Exchange (`ssp` widgets) should be resolved
+    /// during layout translation -- off by default (fails closed,
+    /// matching the C#'s own `IsAdspaceEnabled` default), set by
+    /// `mainloop.rs` whenever PlayerSettings refreshes. See
+    /// `adspace.rs`'s module-level doc comment for the significant
+    /// caveats on this whole feature.
+    pub adspace_enabled: bool,
+    /// FLAGGED AS UNVERIFIED, see adspace.rs: which SSP/partner to
+    /// request from, if the CMS provides one. None = omit from the bid
+    /// request entirely.
+    pub adspace_partner: Option<String>,
+    /// Port the embedded HTTP server (server.rs) is listening on, needed
+    /// at translation time so `write_media` can build each
+    /// `render="html"` widget's own absolute, sharded iframe URL (see
+    /// `server::HTML_SHARD_COUNT`'s own doc comment). Set once by
+    /// main.rs right after the server starts, before any layout is ever
+    /// translated -- 0 is not a meaningful/valid port and would only
+    /// appear here if that wiring were ever skipped by mistake.
+    pub html_port: u16,
 }
 
 impl Cache {
@@ -140,7 +174,8 @@ impl Cache {
             None
         }).collect();
 
-        let cache = Self { dir, agent: cms.make_agent(no_verify)?, content, code_map };
+        let cache = Self { dir, agent: cms.make_agent(no_verify)?, content, code_map,
+                           adspace_enabled: false, adspace_partner: None, html_port: 0 };
         cache.install_pdfjs()?;
         Ok(cache)
     }
@@ -203,7 +238,7 @@ impl Cache {
                 });
                 fs::write(self.dir.join(&fname), data)?;
                 self.content.insert(fname, Resource::Resource(Arc::new(
-                    ResourceInfo { id, layoutid, regionid, updated, duration, numitems }
+                    ResourceInfo { id, layoutid, regionid, mediaid, updated, duration, numitems }
                 )));
                 self.save()?;
             }
@@ -224,15 +259,22 @@ impl Cache {
 
                 if typ == "layout" {
                     // translate the layout into HTML
+                    let adspace_cfg = self.adspace_enabled.then(|| crate::adspace::AdspaceConfig {
+                        agent: self.agent.clone(),
+                        cache_dir: self.dir.join("adspace"),
+                        partner: self.adspace_partner.clone(),
+                    });
                     let xl = layout::Translator::new(
                         id,
                         &self.dir.join(&name),
                         &self.dir.join(format!("{name}.html")),
-                        &self.code_map
+                        &self.code_map,
+                        adspace_cfg,
+                        self.html_port,
                     )?;
-                    let size = xl.translate()?;
+                    let (w, h, enable_stat) = xl.translate()?;
                     self.content.insert(name, Resource::Layout(Arc::new(
-                        LayoutInfo { id, md5, size, code,
+                        LayoutInfo { id, md5, size: (w, h), code, enable_stat,
                                      translated_version: TRANSLATOR_VERSION }
                     )));
                 } else {
@@ -288,6 +330,14 @@ impl Cache {
         })
     }
 
+    /// Whether Proof of Play should record a "layout" stat for this
+    /// layout id -- true (record) if the layout isn't cached at all
+    /// (fail open, matching the "default enabled" convention), since a
+    /// missing/uncached layout shouldn't silently suppress stats.
+    pub fn layout_enable_stat(&self, id: LayoutId) -> bool {
+        self.get_layout(id).map(|info| info.enable_stat).unwrap_or(true)
+    }
+
     fn get_media(&self, name: &str) -> Option<Arc<MediaInfo>> {
         self.content.get(name).and_then(|entry| match entry {
             Resource::Media(media) => Some(media.clone()),
@@ -302,6 +352,145 @@ impl Cache {
         })
     }
 
+    /// Force a re-download of a single already-cached resource widget,
+    /// bypassing the normal `has()`/`updated`-timestamp check -- used for
+    /// the XMR `dataUpdate` notification (see xmr.rs/mainloop.rs), which
+    /// tells us a specific widget's server-rendered content changed,
+    /// identified only by its id (== the CMS's `widgetId`, which recent
+    /// Xibo versions use interchangeably with `mediaId` for this purpose).
+    /// Requires the resource to already be in the cache (from a previous
+    /// full collection) since layoutid/regionid/mediaid aren't part of
+    /// the XMR message itself and have to come from there.
+    /// Returns the id of the resource that was actually re-downloaded --
+    /// normally just `id` itself, but see the second fallback branch
+    /// below for why this can genuinely differ from the requested `id`.
+    /// Callers that reload/refresh whatever's currently on screen (see
+    /// mainloop.rs's `DataUpdate` handling) need the *returned* id, not
+    /// the one they originally asked for: a nested widget has no DOM
+    /// element of its own to reload (there's no separate `<iframe
+    /// id="m{id}">` for it at all -- see write_media's `Some("html")`
+    /// branch, which only ever creates one for a widget that's actually
+    /// its own `<media>` element), only its *container*'s does.
+    pub fn refresh_resource(&mut self, id: i64, cms: &mut xmds::Cms) -> Result<i64> {
+        let (fetch_id, layoutid, regionid, mediaid, updated) =
+        if let Some(info) = self.get_resource(id) {
+            (id, info.layoutid, info.regionid, info.mediaid, info.updated)
+        } else if let Some((layoutid, regionid, mediaid, updated)) =
+            self.find_widget_layout_region(id)
+        {
+            // BUG fix (found from a real report: dataset-bound widgets
+            // -- confirmed via a real required.xml, this affects
+            // DataSet View widgets specifically) never appear in the
+            // CMS's own RequiredFiles response at all, even though
+            // *neighboring* resources in the exact same region/layout
+            // are listed completely normally -- apparently a genuine
+            // CMS-side omission for this widget type, not an arexibo
+            // parsing bug (verified: the raw XML the user shared truly
+            // has no `<file type="resource" id="...">` entry for this
+            // id anywhere). Since GetResource still needs (layoutid,
+            // regionid, mediaid) to fetch this widget's HTML, and
+            // RequiredFiles never gave us that mapping for this
+            // particular id, fall back to searching the XLF of every
+            // layout we DO have cached for a `<media id="{id}">`
+            // element and reading its parent region's id directly --
+            // the XLF itself unambiguously declares this regardless of
+            // whether the CMS also chose to mention it in
+            // RequiredFiles.
+            (id, layoutid, regionid, mediaid, updated)
+        } else if let Some((fetch_id, layoutid, regionid, mediaid, updated)) =
+            self.find_nested_widget_resource(id)
+        {
+            // BUG fix (found from a real report, a second real widget
+            // id hitting a related but distinct gap): some widgets
+            // aren't `<media>` elements in any XLF *at all* -- the
+            // newer "Elements" designer can combine several logical
+            // widgets into *one* resource file (confirmed via real
+            // widget HTML the user shared: a single `{id}.html` embeds
+            // a `widgetData`/`elements` JSON array covering multiple
+            // widget ids together, e.g. a "global elements" background
+            // widget and a dataset-bound text widget sharing one file).
+            // Refreshing the *nested* widget's own id makes no sense
+            // (there is no separate resource for it to fetch) --
+            // instead, search every resource we DO have cached for a
+            // `"widgetId":{id}` entry inside its own JSON (a reliable,
+            // distinctive marker: this exact string is written by the
+            // CMS itself as part of each nested widget's own JSON
+            // object), and refresh *that containing resource* instead
+            // -- re-fetching the combined file naturally refreshes
+            // every widget nested inside it, including this one.
+            log::info!("widget {id} isn't its own resource, but is nested inside \
+                        resource {fetch_id}'s own combined HTML -- refreshing that instead");
+            (fetch_id, layoutid, regionid, mediaid, updated)
+        } else {
+            bail!("resource {id} not in cache, not found in any cached layout's own XLF, \
+                   and not nested inside any cached resource's own HTML either (was it \
+                   ever downloaded via a full collection?)");
+        };
+        self.download(ReqFile::Resource { id: fetch_id, layoutid, regionid, mediaid, updated }, cms)?;
+        Ok(fetch_id)
+    }
+
+    /// See `refresh_resource`'s own doc comment on the second fallback
+    /// branch. Returns `(fetch_id, layoutid, regionid, mediaid, updated)`
+    /// for whichever *cached resource* contains `widget_id` nested
+    /// inside its own combined JSON -- `fetch_id` is that container
+    /// resource's own id (what actually needs re-downloading), not
+    /// `widget_id` itself (which has no resource of its own to fetch).
+    fn find_nested_widget_resource(&self, widget_id: i64) -> Option<(i64, LayoutId, i64, i64, i64)> {
+        let needle = format!("\"widgetId\":{widget_id}");
+        for (fname, res) in &self.content {
+            let Resource::Resource(info) = res else { continue };
+            // Deliberately `continue` (not `?`/early-return) on any
+            // per-resource read failure -- one unreadable cached file
+            // must not stop the search across the *other* resources we
+            // do have cached (same lesson as `find_widget_layout_region`
+            // just above).
+            let Ok(content) = fs::read_to_string(self.dir.join(fname)) else { continue };
+            if content.contains(&needle) {
+                return Some((info.id, info.layoutid, info.regionid, info.mediaid, info.updated));
+            }
+        }
+        None
+    }
+
+    /// Fallback used when a widget's resource was never listed in the
+    /// CMS's own RequiredFiles response at all (see `refresh_resource`'s
+    /// own doc comment for why this is a real, confirmed gap rather than
+    /// speculative). Searches every currently-cached layout's own
+    /// `.xlf` file (already on disk, no network access needed) for a
+    /// `<media id="{widget_id}">` element and returns
+    /// `(layoutid, regionid, mediaid, updated)` if found. `updated` is
+    /// set to 0 (unknown, since RequiredFiles never gave us a real
+    /// value for this resource) -- harmless, it's only ever compared
+    /// against a *future* RequiredFiles value to decide whether a
+    /// routine (non-targeted) re-download is needed, which doesn't
+    /// apply on this always-unconditional targeted-refresh path.
+    fn find_widget_layout_region(&self, widget_id: i64) -> Option<(i64, i64, i64, i64)> {
+        for (fname, res) in &self.content {
+            let Resource::Layout(info) = res else { continue };
+            // Deliberately `continue` (not `?`/early-return) on any
+            // per-layout failure here -- one unreadable/unparseable
+            // cached XLF must not stop the search across the *other*
+            // layouts we do have cached.
+            let Ok(file) = fs::File::open(self.dir.join(fname)) else { continue };
+            let Ok(tree) = Element::from_reader(file) else { continue };
+            // Regions and drawers both have their own `id` and their own
+            // `<media>` children with the exact same structure -- a
+            // widget could in principle live in either.
+            for region in tree.find_all("region").chain(tree.find_all("drawer")) {
+                let Some(region_id) = region.get_attr("id").and_then(|s| s.parse::<i64>().ok())
+                    else { continue };
+                for media in region.find_all("media") {
+                    if media.get_attr("id").and_then(|s| s.parse::<i64>().ok())
+                        == Some(widget_id) {
+                        return Some((info.id, region_id, widget_id, 0));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn save(&self) -> Result<()> {
         let fp = fs::File::create(self.dir.join("content.json")).context("writing cache content")?;
         serde_json::to_writer_pretty(fp, &self.content).context("serializing cache content")?;
@@ -311,9 +500,41 @@ impl Cache {
     pub fn purge_some(&mut self, list: &[String]) -> Result<()> {
         let mut changed = false;
         for name in list {
-            if self.content.contains_key(name) {
-                fs::remove_file(self.dir.join(name))?;
-                self.content.remove(name);
+            // BUG fix (found from a real report: the CMS's purge list
+            // wasn't being honored at all for media files). Two separate
+            // problems in the old version of this function:
+            //
+            // 1. Removal was only even *attempted* if `self.content`
+            //    already had a matching key for this exact filename --
+            //    silently skipping the file entirely if it didn't (e.g.
+            //    a key-naming mismatch between how a file was originally
+            //    registered and what the CMS's own `storedAs` value is,
+            //    or this file was never successfully registered in
+            //    `self.content` in the first place for some other
+            //    reason). Now: always attempt `fs::remove_file`
+            //    regardless of whether this key is tracked -- deleting a
+            //    file the CMS is explicitly telling us to remove isn't a
+            //    risk just because our own bookkeeping doesn't (or
+            //    doesn't yet) have a matching entry for it.
+            // 2. `fs::remove_file(...)?` inside the loop meant a SINGLE
+            //    failed removal (e.g. a permissions issue, or a file
+            //    already gone) aborted the *entire* purge batch via the
+            //    `?` operator, silently skipping every remaining file in
+            //    `list` -- and the caller (mainloop.rs) discarded the
+            //    resulting error entirely (`let _ = ...`), so this could
+            //    never even be noticed in the logs. Now: every file in
+            //    the batch is attempted independently; a failure on one
+            //    is logged and does not prevent the rest from being
+            //    purged.
+            match fs::remove_file(self.dir.join(name)) {
+                Ok(()) => changed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone (or never downloaded) -- the common,
+                    // unremarkable case, not worth a log line.
+                }
+                Err(e) => log::warn!("could not purge {name}: {e:#}"),
+            }
+            if self.content.remove(name).is_some() {
                 changed = true;
             }
         }
@@ -370,3 +591,216 @@ impl<W> Write for HashingWriter<W> where W: Write {
 /// Bundled pdf.js library (Mozilla, Apache 2.0 license).
 const PDFJS_LIB: &[u8] = include_bytes!("../assets/pdfjs/pdf.min.mjs");
 const PDFJS_WORKER: &[u8] = include_bytes!("../assets/pdfjs/pdf.worker.min.mjs");
+
+#[cfg(test)]
+mod purge_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn make_cache() -> (Cache, std::path::PathBuf) {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("arexibo_purge_test_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cms = CmsSettings {
+            address: "https://example.com".into(),
+            key: "k".into(),
+            display_id: "d".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let cache = Cache::new(&cms, dir.clone(), false, true).unwrap();
+        (cache, dir)
+    }
+
+    #[test]
+    fn purges_file_even_if_not_tracked_in_content() {
+        // BUG fix regression test: a real file on disk that ISN'T (for
+        // whatever reason) present in `self.content` must still get
+        // deleted when the CMS says to purge it -- the old code silently
+        // skipped this case entirely.
+        let (mut cache, dir) = make_cache();
+        fs::write(dir.join("orphan.jpg"), b"fake image data").unwrap();
+        assert!(dir.join("orphan.jpg").is_file());
+        assert!(!cache.content.contains_key("orphan.jpg")); // deliberately untracked
+
+        cache.purge_some(&["orphan.jpg".to_string()]).unwrap();
+        assert!(!dir.join("orphan.jpg").is_file(), "untracked file should still be purged");
+    }
+
+    #[test]
+    fn one_failed_purge_does_not_abort_the_rest_of_the_batch() {
+        // BUG fix regression test: previously, using `?` inside the loop
+        // meant a single failure (here: a name that doesn't exist on
+        // disk at all, a very ordinary real-world case -- e.g. already
+        // removed by an earlier purge) would abort the whole batch,
+        // silently skipping every subsequent file.
+        let (mut cache, dir) = make_cache();
+        fs::write(dir.join("real1.jpg"), b"data").unwrap();
+        fs::write(dir.join("real2.jpg"), b"data").unwrap();
+        // "missing.jpg" doesn't exist at all -- must not block real1/real2
+        let result = cache.purge_some(&[
+            "missing.jpg".to_string(),
+            "real1.jpg".to_string(),
+            "real2.jpg".to_string(),
+        ]);
+        assert!(result.is_ok(), "purge_some should not error out on a missing file");
+        assert!(!dir.join("real1.jpg").is_file(), "real1.jpg should still be purged");
+        assert!(!dir.join("real2.jpg").is_file(), "real2.jpg should still be purged");
+    }
+
+    #[test]
+    fn purging_missing_file_is_not_an_error() {
+        let (mut cache, _dir) = make_cache();
+        let result = cache.purge_some(&["never-existed.jpg".to_string()]);
+        assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod dataset_fallback_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn make_cache_with_layout(xlf_content: &str, layout_id: LayoutId) -> Cache {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_dataset_fallback_test_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cms = CmsSettings {
+            address: "https://example.com".into(), key: "k".into(),
+            display_id: "d".into(), display_name: None, proxy: None,
+        };
+        let mut cache = Cache::new(&cms, dir.clone(), false, true).unwrap();
+        let fname = format!("{layout_id}.xlf");
+        fs::write(dir.join(&fname), xlf_content).unwrap();
+        cache.content.insert(fname, Resource::Layout(Arc::new(LayoutInfo {
+            id: layout_id, md5: vec![], size: (1080, 1920), code: None,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION,
+        })));
+        cache
+    }
+
+    #[test]
+    fn finds_widget_missing_from_required_files_via_cached_xlf() {
+        // Regression test for a real report: a DataSet View widget's own
+        // resource never appeared in the CMS's RequiredFiles response at
+        // all (confirmed via a real required.xml), even though
+        // neighboring resources in the same region did. The (layoutid,
+        // regionid) must still be derivable from the layout's own
+        // already-cached XLF.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="3630"><media id="3261" type="datasetview"/></region>
+            <region id="3631"><media id="3262" type="datasetview"/><media id="3263" type="text"/></region>
+        </layout>"#;
+        let cache = make_cache_with_layout(xlf, 749);
+        let found = cache.find_widget_layout_region(3262);
+        assert_eq!(found, Some((749, 3631, 3262, 0)));
+    }
+
+    #[test]
+    fn finds_widget_inside_a_drawer_too() {
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1"><media id="100" type="text"/></region>
+            <drawer id="99"><media id="3047" type="shellcommand"/></drawer>
+        </layout>"#;
+        let cache = make_cache_with_layout(xlf, 555);
+        let found = cache.find_widget_layout_region(3047);
+        assert_eq!(found, Some((555, 99, 3047, 0)));
+    }
+
+    #[test]
+    fn returns_none_when_widget_truly_not_found_anywhere() {
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1"><media id="100" type="text"/></region>
+        </layout>"#;
+        let cache = make_cache_with_layout(xlf, 749);
+        assert_eq!(cache.find_widget_layout_region(999999), None);
+    }
+
+    #[test]
+    fn one_unparseable_cached_layout_does_not_block_finding_it_in_another() {
+        // Regression test for the same class of bug just fixed in
+        // purge_some: a `?`/early-return on the first layout's own parse
+        // failure must not prevent searching the *other* cached layouts.
+        let mut cache = make_cache_with_layout(
+            r#"<layout width="1080" height="1920">
+                <region id="1"><media id="100" type="text"/></region>
+            </layout>"#,
+            555,
+        );
+        // Register a SECOND layout whose actual file is missing/corrupt
+        // on disk (never written), which must not block the search.
+        cache.content.insert("777.xlf".to_string(), Resource::Layout(Arc::new(LayoutInfo {
+            id: 777, md5: vec![], size: (1080, 1920), code: None,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION,
+        })));
+        assert_eq!(cache.find_widget_layout_region(100), Some((555, 1, 100, 0)));
+    }
+}
+
+#[cfg(test)]
+mod nested_widget_fallback_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn make_cache_with_resource(html_content: &str, resource_id: i64) -> Cache {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_nested_widget_test_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cms = CmsSettings {
+            address: "https://example.com".into(), key: "k".into(),
+            display_id: "d".into(), display_name: None, proxy: None,
+        };
+        let mut cache = Cache::new(&cms, dir.clone(), false, true).unwrap();
+        let fname = format!("{resource_id}.html");
+        fs::write(dir.join(&fname), html_content).unwrap();
+        cache.content.insert(fname, Resource::Resource(Arc::new(ResourceInfo {
+            id: resource_id, layoutid: 749, regionid: 3630, mediaid: resource_id,
+            updated: 12345, duration: Some(10.0), numitems: Some(1),
+        })));
+        cache
+    }
+
+    #[test]
+    fn finds_widget_nested_inside_another_resources_combined_html() {
+        // Regression test for a real report: widget 3262 lives *inside*
+        // resource 3261's own combined "Elements" HTML (its own
+        // `widgetData`/`elements` JSON arrays reference both widget ids
+        // together), it is not its own separate resource at all.
+        let html = r#"<html><script>
+            widgetData.push({"widgetId":3261,"templateId":null});
+            widgetData.push({"widgetId":3262,"templateId":"elements"});
+            elements.push([{"elements":[],"widgetId":3262}]);
+        </script></html>"#;
+        let cache = make_cache_with_resource(html, 3261);
+        let found = cache.find_nested_widget_resource(3262);
+        assert_eq!(found, Some((3261, 749, 3630, 3261, 12345)));
+    }
+
+    #[test]
+    fn returns_none_when_widget_id_truly_not_nested_anywhere() {
+        let html = r#"<html><script>widgetData.push({"widgetId":3261});</script></html>"#;
+        let cache = make_cache_with_resource(html, 3261);
+        assert_eq!(cache.find_nested_widget_resource(9999), None);
+    }
+
+    #[test]
+    fn does_not_false_positive_on_similar_field_names() {
+        // "mediaId" and "widgetId" must not be confused with each other
+        // even though they share letters -- exact string match on the
+        // full distinctive marker only.
+        let html = r#"<html><script>
+            elements.push([{"mediaId":"3262","widgetId":3261}]);
+        </script></html>"#;
+        let cache = make_cache_with_resource(html, 3261);
+        assert_eq!(cache.find_nested_widget_resource(3262), None);
+        assert_eq!(cache.find_nested_widget_resource(3261), Some((3261, 749, 3630, 3261, 12345)));
+    }
+}

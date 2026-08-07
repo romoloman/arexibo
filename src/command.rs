@@ -58,8 +58,19 @@ impl Command {
             .method(opts.method.as_str())
             .uri(url)
             .header("Content-Type", content_type);
-        for (k, v) in opts.headers {
-            builder = builder.header(k, v);
+        // Tolerant: an empty/whitespace-only or unparseable headers
+        // string (the common real-world case, literally "{}" as text)
+        // just means "no extra headers" rather than failing the whole
+        // request -- see HttpOpts::headers's own doc comment for why
+        // this needs a second parse step at all.
+        if !opts.headers.trim().is_empty() {
+            match serde_json::from_str::<HashMap<String, String>>(&opts.headers) {
+                Ok(headers) => for (k, v) in headers {
+                    builder = builder.header(k, v);
+                },
+                Err(e) => log::warn!("ignoring unparseable HTTP command headers {:?}: {e:#}",
+                                      opts.headers),
+            }
         }
         let request = builder.body(opts.body).context("invalid HTTP request")?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -141,6 +152,48 @@ impl Command {
 #[derive(Deserialize)]
 struct HttpOpts {
     method: String,
-    headers: HashMap<String, String>,
+    // BUG fix (found via a real log the user shared): this is NOT a
+    // nested JSON object in practice -- the real payload has
+    // `"headers":"{}"`, i.e. `headers` is itself a STRING whose content
+    // happens to be JSON text (the CMS's command-builder form appears
+    // to store the raw text a user typed into a headers field this
+    // way, same as `body` below already is). Declaring this as
+    // `HashMap<String, String>` directly made deserialization fail
+    // outright on every real HTTP ad-hoc command, not just ones with
+    // populated headers -- parsed as a plain string here instead, then
+    // parsed *again* as JSON where actually used (see run_http), which
+    // tolerates the common empty "{}" case gracefully instead of
+    // erroring the whole command out.
+    headers: String,
     body: String
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_opts_parses_real_payload_from_user_log() {
+        // Regression test using the exact JSON the user's log showed
+        // failing: "invalid type: string \"{}\", expected a map".
+        let json = r#"{"method":"GET","headers":"{}","body":"{}"}"#;
+        let opts: HttpOpts = serde_json::from_str(json).unwrap();
+        assert_eq!(opts.method, "GET");
+        assert_eq!(opts.headers, "{}");
+        assert_eq!(opts.body, "{}");
+    }
+
+    #[test]
+    fn http_opts_parses_populated_headers_string() {
+        let json = r#"{"method":"POST","headers":"{\"Authorization\":\"Bearer xyz\"}","body":"{}"}"#;
+        let opts: HttpOpts = serde_json::from_str(json).unwrap();
+        let headers: HashMap<String, String> = serde_json::from_str(&opts.headers).unwrap();
+        assert_eq!(headers.get("Authorization"), Some(&"Bearer xyz".to_string()));
+    }
+
+    #[test]
+    fn empty_headers_string_parses_to_empty_map() {
+        let headers: HashMap<String, String> = serde_json::from_str("{}").unwrap();
+        assert!(headers.is_empty());
+    }
 }

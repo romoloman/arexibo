@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use crate::config::PlayerSettings;
 use crate::mainloop::{ToGui, FromGui, Kill};
 use crate::resource::LayoutId;
+use crate::server;
 
 #[path = "qt_binding.rs"]
 #[allow(non_camel_case_types)]
@@ -42,13 +43,21 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
     }
 
     std::thread::spawn(move || {
+        // Tracks the latest known PlayerSettings::screenshot_size (updated
+        // whenever ToGui::Settings arrives) so ToGui::Screenshot can pass
+        // the CMS-configured max width through to the actual capture --
+        // previously this was completely ignored, always submitting the
+        // screenshot at full captured resolution regardless of what the
+        // Display Profile requested.
+        let mut screenshot_size = settings.screenshot_size;
         for msg in togui {
             match msg {
                 ToGui::Screenshot => {
-                    unsafe { cpp::screenshot(); }
+                    unsafe { cpp::screenshot(screenshot_size as i32); }
                 }
                 ToGui::Settings(s) => {
                     let title = CString::new(s.display_name).unwrap();
+                    screenshot_size = s.screenshot_size;
                     unsafe {
                         cpp::set_title(title.as_ptr());
                         cpp::set_size(s.pos_x as _, s.pos_y as _, s.size_x as _, s.size_y as _);
@@ -66,6 +75,74 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                 ToGui::WebHook(code) => {
                     let code = CString::new(format!(
                         "window.arexibo.trigger(\"{code}\");")).unwrap();
+                    unsafe {
+                        cpp::run_js(code.as_ptr());
+                    }
+                }
+                ToGui::ReloadWidget(id) => {
+                    // Only reload this one iframe in place -- not a full
+                    // layout navigate(), which would restart every other
+                    // widget's own playback/cycling state unnecessarily.
+                    // Guards for the element missing (e.g. widget isn't
+                    // on the currently displayed layout at all) and for
+                    // it not being an iframe (server-rendered resource
+                    // widgets always are -- see write_media's `Some("html")`
+                    // branch in layout.rs -- so this is just defensive).
+                    //
+                    // BUG fix (found from a real report): this used to
+                    // call `el.contentWindow.location.reload(true)` --
+                    // but since widgets are now sharded across several
+                    // loopback origins (see server::HTML_SHARD_COUNT),
+                    // an iframe can genuinely be cross-origin relative
+                    // to this page, and reaching into its
+                    // `contentWindow` throws a same-origin-policy
+                    // SecurityError ("Blocked a frame with origin ...
+                    // from accessing a frame with origin ..."),
+                    // silently failing the reload. Re-assigning the
+                    // iframe's own `src` attribute instead needs no
+                    // cross-origin access at all -- a parent page can
+                    // always change *which* URL one of its own iframes
+                    // points to, regardless of what origin that iframe
+                    // currently shows. Clearing it first (rather than
+                    // just re-assigning the same string) avoids the
+                    // browser treating an unchanged `src` value as a
+                    // no-op and skipping the reload entirely.
+                    let code = CString::new(format!(
+                        "(function() {{ \
+                           var el = document.getElementById('m{id}'); \
+                           if (el && el.tagName === 'IFRAME') {{ \
+                             var src = el.src; \
+                             el.src = ''; \
+                             el.src = src; \
+                           }} \
+                         }})();")).unwrap();
+                    unsafe {
+                        cpp::run_js(code.as_ptr());
+                    }
+                }
+                ToGui::ShowOverlay(id) => {
+                    let file = CString::new(format!("{id}.xlf.html")).unwrap();
+                    unsafe {
+                        cpp::overlay_show(file.as_ptr());
+                    }
+                }
+                ToGui::HideOverlay => {
+                    unsafe {
+                        cpp::overlay_hide();
+                    }
+                }
+                ToGui::ControlDuration(req) => {
+                    // Matches layout.rs's `controlDuration(widgetId, action,
+                    // durationSecs)` -- action is passed as a plain string
+                    // since there's no need for anything fancier here.
+                    let action = match req.action {
+                        server::DurationAction::Set => "set",
+                        server::DurationAction::Extend => "extend",
+                        server::DurationAction::Expire => "expire",
+                    };
+                    let code = CString::new(format!(
+                        "window.arexibo.controlDuration({}, \"{action}\", {});",
+                        req.widget_id, req.duration.unwrap_or(0))).unwrap();
                     unsafe {
                         cpp::run_js(code.as_ptr());
                     }
@@ -139,6 +216,16 @@ extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _
             };
             let _ = cb_data.sender.send(FromGui::StopShell(killmode));
         }
+        cpp::CB_OVERLAY_LAYOUT_INIT => {
+            // Deliberately not wired to anything -- unlike CB_LAYOUT_INIT,
+            // this must NOT set current_layout (see FromGui::Showing) or
+            // touch the main Schedule<T> cycling state, since the overlay
+            // is not part of the normal schedule at all. Logged purely
+            // for diagnostics.
+            if arg1 > 0 {
+                log::info!("overlay layout {arg1} initialized");
+            }
+        }
         _ => {
             log::warn!("got unknown callback from Qt: {typ}");
         }
@@ -162,13 +249,29 @@ impl<T: Eq + Default + Clone> Schedule<T> {
 
         // if this layout is also in the new schedule, keep it
         if let Some(new_index) = self.layouts.iter().position(|t| t == &cur_t) {
-            if self.single_done {
-                self.index = Some((new_index + 1) % self.layouts.len());
+            let next_index = if self.single_done {
+                (new_index + 1) % self.layouts.len()
             } else {
-                self.index = Some(new_index);
-            }
+                new_index
+            };
             self.single_done = false;
-            None
+            self.index = Some(next_index);
+            // `single_done` can advance `next_index` to a layout other
+            // than the one currently on screen (the single scheduled
+            // layout just finished a full loop, and there's now more
+            // than one candidate to cycle through) -- BUG FIXED: this
+            // used to unconditionally return `None` here, meaning the
+            // caller (gui.rs's ToGui::Layouts handler) never told the
+            // browser to actually navigate whenever this happened, so
+            // the internal index silently drifted away from what was
+            // really being displayed, and the display could get stuck
+            // showing a stale layout indefinitely even as the schedule
+            // kept changing around it. Comparing against `cur_t` (the
+            // layout actually shown before this call) is what a plain
+            // index comparison can't do, since `self.index` itself was
+            // just overwritten above.
+            let next_t = self.layouts[next_index].clone();
+            (next_t != cur_t).then_some(next_t)
         } else if !self.layouts.is_empty() {
             // otherwise, start showing the first of the new layouts if we have some
             self.index = Some(0);
@@ -231,4 +334,29 @@ fn test_schedule() {
     assert_eq!(schedule.next(), Some(3));
     assert_eq!(schedule.next(), Some(2));
     assert_eq!(schedule.update(vec![1, 3]), Some(1));
+}
+
+/// Regression test for the bug reported in production: a single scheduled
+/// layout (627) looping repeatedly sets `single_done` every time it
+/// finishes a cycle (via `next()` returning `None` because there's only
+/// one layout). When the schedule then gains a second layout (605) that
+/// also contains 627, `update()` used to silently move `index` to the
+/// other layout while still returning `None` -- so the browser was never
+/// told to navigate, and the display got stuck on the old layout forever,
+/// even across subsequent schedule changes (since `current()` from then
+/// on reported the *new*, never-actually-shown layout as current).
+#[cfg(test)]
+#[test]
+fn test_schedule_single_done_triggers_navigation() {
+    let mut schedule = Schedule { index: Some(0), layouts: vec![627], single_done: false };
+    // layout 627 finishes a full loop while it's the only one scheduled
+    assert_eq!(schedule.next(), None);
+    schedule.mark_done();
+    // CMS now also schedules 605 alongside 627 -- must actually switch to
+    // showing 605 (previously this returned None and never navigated)
+    assert_eq!(schedule.update(vec![605, 627]), Some(605));
+    // next collection: 627 drops out of the schedule entirely, only 605
+    // remains -- since 605 was already the displayed layout, no further
+    // navigation should be triggered
+    assert_eq!(schedule.update(vec![605]), None);
 }

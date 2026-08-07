@@ -236,6 +236,28 @@ mod tests {
     }
 
     #[test]
+    fn percent_decode_real_shellcommand_from_user_log() {
+        // Regression test using the exact values from a real log the
+        // user shared, confirming a genuine bug: these were never
+        // decoded before being logged or run.
+        assert_eq!(
+            percent_decode("%2Fusr%2Fbin%2Ftouch+%2Ftmp%2Fxibo-adhoc-test"),
+            "/usr/bin/touch /tmp/xibo-adhoc-test"
+        );
+    }
+
+    #[test]
+    fn percent_decode_real_http_command_from_user_log() {
+        assert_eq!(
+            percent_decode(
+                "http%7Chttp%3A%2F%2F192.168.0.245%3A8888%2Fping%7Capplication%2Fjson%7C\
+                 %7B%22method%22%3A%22GET%22%2C%22headers%22%3A%22%7B%7D%22%2C%22body%22%3A%22%7B%7D%22%7D"
+            ),
+            r#"http|http://192.168.0.245:8888/ping|application/json|{"method":"GET","headers":"{}","body":"{}"}"#
+        );
+    }
+
+    #[test]
     fn base64_field_roundtrip() {
         let data = vec![1, 2, 3, 255, 0];
         let field = Base64Field(data.clone());
