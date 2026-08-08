@@ -118,6 +118,11 @@ pub struct Handler {
     /// handled in `run()`'s select! loop since only that JS run in the
     /// currently-displayed page can actually change a widget's timer.
     duration_rx: Receiver<server::DurationRequest>,
+    /// Whether `--debug` was passed on the command line -- if so, the
+    /// CMS's own `logLevel` Display Profile setting (see
+    /// `PlayerSettings::log_level_filter`) is never applied, so the
+    /// explicit local override always wins over a remote setting.
+    debug_override: bool,
     /// Timer that fires when the currently-shown overlay (whichever
     /// source -- see below) should be hidden/advanced. Moved here (was
     /// previously a local variable in `run()`) because `schedule_check()`
@@ -162,7 +167,7 @@ const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 5;
 impl Handler {
     /// Create a new handler, with channels to the GUI thread.
     pub fn new(cms: &CmsSettings, clear_cache: bool, envdir: &Path,
-               no_verify: bool, allow_offline: bool,
+               no_verify: bool, allow_offline: bool, debug_override: bool,
                to_gui: Sender<ToGui>, from_gui: Receiver<FromGui>,
                duration_rx: Receiver<server::DurationRequest>) -> Result<Self> {
         let (privkey, pubkey) = load_or_create_keypair(envdir)?;
@@ -224,7 +229,8 @@ impl Handler {
                                  shell_process: None, last_command_success: None,
                                  duration_rx, overlay_expiry: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
-                                 resource_retry_queue: Vec::new(), resource_retry_timer: never() };
+                                 resource_retry_queue: Vec::new(), resource_retry_timer: never(),
+                                 debug_override };
             slf.update_settings();
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
@@ -939,6 +945,19 @@ impl Handler {
 
     /// Apply new player settings.
     fn update_settings(&mut self) {
+        // BUG fix (found from a real report -- cross-checking another
+        // fork's own overnight-audit findings): the CMS's own `logLevel`
+        // Display Profile setting was parsed into `PlayerSettings` but
+        // never actually applied anywhere -- only the local `--debug`
+        // CLI flag affected real log verbosity. `--debug` still always
+        // wins when set (an explicit local override for troubleshooting
+        // shouldn't be silently overridden by a remote setting), but
+        // otherwise this now genuinely takes effect, and is re-applied
+        // every time settings are refreshed in case the CMS changes it.
+        if !self.debug_override {
+            log::set_max_level(self.settings.log_level_filter());
+        }
+
         // Propagate to the cache so newly-translated layouts pick up
         // the current Adspace Exchange on/off state (see adspace.rs) --
         // `adspace_partner` is deliberately left unset here: no

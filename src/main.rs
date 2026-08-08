@@ -134,7 +134,8 @@ fn main_inner() -> anyhow::Result<()> {
     let (duration_tx, duration_rx) = crossbeam_channel::bounded(20);
 
     let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
-                                              args.allow_offline, togui_tx, fromgui_rx, duration_rx)
+                                              args.allow_offline, args.debug,
+                                              togui_tx, fromgui_rx, duration_rx)
         .context("creating backend handler")?;
     let mut settings = handler.player_settings();
 

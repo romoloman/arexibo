@@ -183,6 +183,28 @@ impl PlayerSettings {
             now_minute >= start || now_minute < end
         }
     }
+
+    /// Maps the CMS's own `logLevel` Display Profile setting (a string,
+    /// e.g. "error"/"warn"/"info"/"debug"/"audit") to the equivalent
+    /// Rust `log::LevelFilter`. BUG fix (found from a real report --
+    /// cross-checking another fork's own overnight-audit findings,
+    /// which flagged a *mapping* bug here; on inspection, this codebase's
+    /// gap was more fundamental than a wrong mapping: `log_level` was
+    /// parsed from the CMS's response into `PlayerSettings` but never
+    /// actually applied anywhere at all -- only the local `--debug` CLI
+    /// flag affected the real log verbosity, regardless of what the
+    /// CMS's own Display Profile said). Falls back to `Info` for any
+    /// unrecognized value, rather than silently doing nothing.
+    pub fn log_level_filter(&self) -> log::LevelFilter {
+        match self.log_level.to_lowercase().as_str() {
+            "error" => log::LevelFilter::Error,
+            "warn" | "warning" => log::LevelFilter::Warn,
+            "info" | "audit" => log::LevelFilter::Info,
+            "debug" => log::LevelFilter::Debug,
+            "trace" => log::LevelFilter::Trace,
+            _ => log::LevelFilter::Info,
+        }
+    }
 }
 
 fn default_collect_interval() -> u64 { 900 }
@@ -548,5 +570,41 @@ mod download_window_unset_variants_tests {
             ..serde_json::from_str("{}").unwrap()
         };
         assert!(s.is_within_download_window());
+    }
+}
+
+#[cfg(test)]
+mod log_level_tests {
+    use super::*;
+
+    fn settings_with_log_level(level: &str) -> PlayerSettings {
+        PlayerSettings {
+            log_level: level.into(),
+            ..serde_json::from_str("{}").unwrap()
+        }
+    }
+
+    #[test]
+    fn maps_all_known_cms_values_correctly() {
+        assert_eq!(settings_with_log_level("error").log_level_filter(), log::LevelFilter::Error);
+        assert_eq!(settings_with_log_level("warn").log_level_filter(), log::LevelFilter::Warn);
+        assert_eq!(settings_with_log_level("warning").log_level_filter(), log::LevelFilter::Warn);
+        assert_eq!(settings_with_log_level("info").log_level_filter(), log::LevelFilter::Info);
+        assert_eq!(settings_with_log_level("audit").log_level_filter(), log::LevelFilter::Info);
+        assert_eq!(settings_with_log_level("debug").log_level_filter(), log::LevelFilter::Debug);
+        assert_eq!(settings_with_log_level("trace").log_level_filter(), log::LevelFilter::Trace);
+    }
+
+    #[test]
+    fn is_case_insensitive() {
+        assert_eq!(settings_with_log_level("ERROR").log_level_filter(), log::LevelFilter::Error);
+        assert_eq!(settings_with_log_level("Debug").log_level_filter(), log::LevelFilter::Debug);
+    }
+
+    #[test]
+    fn unrecognized_value_falls_back_to_info_not_silently_ignored() {
+        assert_eq!(settings_with_log_level("something-unexpected").log_level_filter(),
+                   log::LevelFilter::Info);
+        assert_eq!(settings_with_log_level("").log_level_filter(), log::LevelFilter::Info);
     }
 }
