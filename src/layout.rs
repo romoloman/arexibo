@@ -16,7 +16,7 @@ use crate::util::{ElementExt, percent_decode};
 // - overriding duration from resources
 // - fromDt/toDt
 
-pub const TRANSLATOR_VERSION: u32 = 26;
+pub const TRANSLATOR_VERSION: u32 = 27;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -865,8 +865,31 @@ impl<'a> Translator<'a> {
                          if mute { "muted" } else { "" },
                          if loop_video { "loop" } else { "" },
                          object_fit(opts), object_pos(opts))?;
-                if loop_video {
+                // BUG fix (found from a real report: "Playlist with videos
+                // does not obey play time duration set in playlist video
+                // properties"). The CMS's own `useDuration` attribute on
+                // the <media> node (CONFIRMED REAL, from an official
+                // documentation XLF example:
+                // `<media type="image" duration="300" useDuration="1">`
+                // vs `duration="10" useDuration="0">`) governs exactly
+                // this: "1" means play for the CMS-configured `duration`
+                // seconds regardless of the video's own natural length
+                // (cutting it short, or holding past it); "0" (or absent)
+                // means play for the video's own natural length instead,
+                // with `duration` only a fallback default. The
+                // native-`ended`-event approach below was previously used
+                // unconditionally for any non-looping video, silently
+                // ignoring an explicit useDuration="1" override entirely.
+                let use_duration = media.get_attr("useDuration").is_some_and(|v| v == "1");
+                if loop_video || use_duration {
                     add_start = format!("document.getElementById('m{mid}').play();");
+                    // `duration` already defaults to the CMS-configured
+                    // XLF `duration` attribute (set at the top of this
+                    // function, same as any other non-video widget type)
+                    // -- nothing further to do here for the useDuration=1
+                    // case; for loop_video, the native `loop` attribute on
+                    // the <video> element above handles actual repetition,
+                    // this just needs *a* duration to know when to move on.
                 } else {
                     // BUG fix (found from a real report: a non-looping
                     // video "seems stuck, a screenshot always shows the
@@ -1358,6 +1381,35 @@ mod loop_tests {
         // must use the native 'ended' event to advance instead
         assert!(html.contains("el.onended = () => window.arexibo.region_switch(1, -1, false);"));
         assert!(html.contains("() => 86400"));
+    }
+
+    #[test]
+    fn video_with_use_duration_1_respects_configured_duration_even_without_loop() {
+        // Regression test for a real bug report: "Playlist with videos
+        // does not obey play time duration set in playlist video
+        // properties in CMS backend." Before this fix, any non-looping
+        // video always used the native `ended` event to advance,
+        // completely ignoring an explicit useDuration="1" + a configured
+        // duration shorter (or longer) than the video's own natural
+        // length.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5003" type="video" duration="15" useDuration="1">
+                    <options><uri>a.mp4</uri><loop>0</loop></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        // must NOT be treated as looping (no `loop` HTML attribute) --
+        // useDuration=1 without loop still just plays once, but for the
+        // *configured* duration, not however long the video naturally is.
+        assert!(!html.contains(" loop "));
+        // must use the CMS-configured duration, not the ended-event/86400
+        // safety-net fallback.
+        assert!(html.contains("() => 15"));
+        assert!(!html.contains("() => 86400"));
+        assert!(!html.contains("el.onended"));
+        assert!(html.contains("document.getElementById('m5003').play();"));
     }
 
     #[test]
