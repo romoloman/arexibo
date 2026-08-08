@@ -56,7 +56,7 @@ impl Cms {
                 displayName: &self.display_name,
                 clientType: "linux",
                 clientVersion: clap::crate_version!(),
-                clientCode: 400,
+                clientCode: 407,
                 operatingSystem: "linux",
                 macAddress: &self.mac_addr,
                 xmrChannel: &self.channel,

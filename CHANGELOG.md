@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.6.0 - upcoming
+
+- Fix `--allow-offline` exiting the process anyway when XMR setup fails
+  on a genuinely unreachable network; retries XMR automatically once
+  the network returns.
+- Apply the CMS's own `logLevel` Display Profile setting (previously
+  parsed but never actually used); `--debug` still always takes
+  precedence when passed.
+- Implement `DownloadStartWindow`/`DownloadEndWindow` (previously
+  parsed but never enforced).
+- Implement Overlay Layout as a CMS-scheduled event type (the
+  `<overlays>` schedule section), in addition to the existing XMR
+  `overlayLayout` push action; don't render the overlay's own
+  background, matching documented Xibo behaviour.
+- Fix several DataSet View / "Elements" data-table widget issues that
+  could prevent the widget from ever rendering: a resource missing
+  from the CMS's own `RequiredFiles` response, widgets nested inside
+  another widget's combined resource HTML, the embedded server's port
+  changing on every restart, a cross-origin widget-reload failure, and
+  missing `Cache-Control` headers.
+- Work around Chromium's per-origin HTTP connection limit for layouts
+  with many `render="html"` widgets by sharding requests across
+  several loopback origins.
+- Apply Interactive Control duration changes (`/duration/set|extend|
+  expire`), previously acknowledged but never actually applied.
+- Add a dedicated, longer timeout for `GetResource` specifically, so a
+  legitimately slow (not dead) CMS response isn't cut off prematurely.
+- Add optional `--web-debug`-gated diagnostics: JS console capture
+  from every frame, plus a couple of internal state logs useful for
+  troubleshooting a "content renders but isn't visible" widget.
+- Customizable startup splash screen (logo + text).
+
 ## 0.5.1 - upcoming
 
 - Implement `--no-verify` for WebSocket XMR.

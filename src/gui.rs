@@ -53,6 +53,13 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
         for msg in togui {
             match msg {
                 ToGui::Screenshot => {
+                    // Diagnostic log (found genuinely useful
+                    // investigating a real report: screenshots not
+                    // reaching the CMS with --debug active, no error
+                    // anywhere) -- confirms the cross-thread message
+                    // from mainloop.rs actually arrives here, and that
+                    // cpp::screenshot() is genuinely being called.
+                    log::debug!("received screenshot request, capturing at max_width={screenshot_size}");
                     unsafe { cpp::screenshot(screenshot_size as i32); }
                 }
                 ToGui::Settings(s) => {

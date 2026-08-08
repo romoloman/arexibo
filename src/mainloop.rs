@@ -326,6 +326,13 @@ impl Handler {
                 },
                 // timer channel that fires when screenshot is needed
                 recv(screenshot) -> _ => {
+                    // Diagnostic log (found genuinely useful investigating
+                    // a real report: screenshots not reaching the CMS with
+                    // --debug active, no error anywhere) -- confirms
+                    // whether this timer arm actually fires and the
+                    // message to the GUI thread is sent, since neither
+                    // was logged anywhere before.
+                    log::debug!("screenshot timer fired, requesting capture from GUI thread");
                     self.to_gui.send(ToGui::Screenshot).unwrap();
                     screenshot = if self.settings.screenshot_interval != 0 {
                         after(Duration::from_secs(self.settings.screenshot_interval * 60))
@@ -372,7 +379,10 @@ impl Handler {
                 // channel for XMR messages
                 recv(self.xmr) -> msg => match msg {
                     Ok(xmr::Message::CollectNow) => collect = after(Duration::from_secs(0)),
-                    Ok(xmr::Message::Screenshot) => screenshot = after(Duration::from_secs(0)),
+                    Ok(xmr::Message::Screenshot) => {
+                        log::debug!("XMR screenshot request received, arming immediate timer");
+                        screenshot = after(Duration::from_secs(0));
+                    }
                     Ok(xmr::Message::Purge) => {
                         if let Err(e) = self.cache.purge() {
                             log::error!("durign cache purge: {e:#}");

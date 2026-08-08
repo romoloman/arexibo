@@ -47,9 +47,28 @@ impl Service {
 </tns:{name}>
 </soap:Body>
 </soap:Envelope>"#);
-        self.agent
-            .post(&self.baseuri)
-            .config().http_status_as_error(false).build()
+        let mut cfg = self.agent.post(&self.baseuri).config().http_status_as_error(false);
+        if name == "GetResource" {
+            // BUG fix (found from a real report, while investigating a
+            // "player appears stuck for minutes with no new log output"
+            // symptom on a DataSet-View/Elements-based widget): the CMS
+            // can genuinely take longer than the general 30s
+            // timeout_global (see config.rs's own doc comment on it) to
+            // render this kind of widget's resource, especially the
+            // first time a given dataset/widget combination is queried
+            // and the CMS's own internal cache for it is still "cold" --
+            // not a dead/hung connection, just a legitimately slow one.
+            // A dedicated, longer timeout specifically for GetResource
+            // avoids prematurely aborting (and then unnecessarily
+            // retrying via the resource_retry_queue in mainloop.rs) a
+            // request that would have succeeded if given a bit more
+            // time, while keeping the shorter, general timeout for
+            // lighter calls (RegisterDisplay, RequiredFiles, Schedule,
+            // etc.) where a slow response is more likely to indicate a
+            // genuine problem worth failing fast on.
+            cfg = cfg.timeout_global(Some(std::time::Duration::from_secs(90)));
+        }
+        cfg.build()
             .send(&data)
             .with_context(|| format!("sending {name} SOAP request"))?
             .into_body().read_to_string().with_context(|| format!("decoding {name} SOAP response"))?
