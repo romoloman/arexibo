@@ -16,7 +16,7 @@ use crate::util::{ElementExt, percent_decode};
 // - overriding duration from resources
 // - fromDt/toDt
 
-pub const TRANSLATOR_VERSION: u32 = 27;
+pub const TRANSLATOR_VERSION: u32 = 28;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -121,15 +121,23 @@ window.arexibo = {
     else if (next == -2)
       next = (cur + total - 1) % total;
 
-    // If we've completed one full pass through the region's own media
-    // list and looping is disabled (region <loop> option, see
-    // write_region), freeze here on the currently-shown (last) item
-    // instead of wrapping back to the first -- matches Xibo's own
-    // documented/observed convention (a non-looping region/playlist
-    // plays through once then holds on its last item; it does not go
-    // blank or keep cycling). Checked *before* touching visibility so
-    // the current item is left showing, not hidden.
-    if (next == 0 && !first && !loop) {
+    // BUG fix (found from a real report: "Playlist with 3 pictures
+    // slideshow timed for 3 seconds each freezes on last picture after
+    // 1st run"). CONFIRMED via official Xibo documentation (two
+    // independent sources, xibosignage.com and the xibo.org.uk manual,
+    // consistent wording): "The Loop option is only applicable when
+    // there is only 1 media item in the region." -- for a region with
+    // MORE than one item, `loop` simply doesn't apply at all; it must
+    // always keep cycling through its items regardless of that
+    // setting. This freeze-on-wrap logic was previously applied
+    // unconditionally (added to fix a *different*, real report of
+    // "playlists kept cycling forever" -- that one, on reflection, was
+    // very likely about a single-item region, or about layout/campaign-
+    // level cycle counts, not about this multi-item case at all) --
+    // now scoped to `total <= 1` specifically, matching the documented
+    // semantics precisely instead of applying it to every region
+    // regardless of how many items it actually has.
+    if (next == 0 && !first && !loop && total <= 1) {
       this.region_done(rid);
       return;
     }
@@ -542,14 +550,22 @@ impl<'a> Translator<'a> {
             let ms: u32 = opts.find("transitionDuration")
                 .and_then(|e| e.text().trim().parse().ok()).unwrap_or(0);
             // BUG fix (found from a real report: playlists kept cycling
-            // forever regardless of this setting): this was never read
-            // at all before. `<loop>` here is the REGION's own playlist
-            // loop -- whether, after showing every media item in this
-            // region once, it should wrap back to the first (1) or
-            // freeze on the last one (0/absent) -- see region_switch's
-            // own handling above. Distinct from a video widget's own
-            // `<loop>` in its *own* `<options>` (see write_media's video
-            // branch), which governs native single-widget looping.
+            // forever regardless of this setting -- on reflection, most
+            // likely a single-item region case, or a layout/campaign-
+            // level cycle count, given the official docs confirm `loop`
+            // "is only applicable when there is only 1 media item in
+            // the region"): this was never read at all before. `<loop>`
+            // here is the REGION's own single-item loop -- whether,
+            // after showing its one media item once, it should reload/
+            // restart it (1) or freeze/hold on it until the layout
+            // itself finishes (0/absent) -- see region_switch's own
+            // handling above, which only applies this when the region
+            // has exactly one item; a region with more than one item
+            // always keeps cycling through them regardless of this
+            // setting, per the same documented semantics. Distinct from
+            // a video widget's own `<loop>` in its *own* `<options>`
+            // (see write_media's video branch), which governs native
+            // single-widget looping.
             let lp = opts.find("loop").map(|e| e.text().trim() == "1").unwrap_or(false);
             (ty, ms, lp)
         }).unwrap_or((None, 0, false));
@@ -1384,6 +1400,28 @@ mod loop_tests {
     }
 
     #[test]
+    fn region_switch_only_freezes_on_wrap_for_single_item_regions() {
+        // Regression test for a real bug report: "Playlist with 3
+        // pictures slideshow timed for 3 seconds each freezes on last
+        // picture after 1st run." CONFIRMED via official Xibo
+        // documentation: "The Loop option is only applicable when
+        // there is only 1 media item in the region" -- verified with a
+        // real functional QtWebEngine run during development that a
+        // 3-item region with no loop set genuinely keeps cycling
+        // (0 -> 1 -> 2 -> 0 -> 1 -> ...) rather than freezing after the
+        // first pass; this test checks the generated condition itself.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="1" type="image" duration="3"><options><uri>a.png</uri></options></media>
+                <media id="2" type="image" duration="3"><options><uri>b.png</uri></options></media>
+                <media id="3" type="image" duration="3"><options><uri>c.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("if (next == 0 && !first && !loop && total <= 1)"));
+    }
+
+    #[test]
     fn video_with_use_duration_1_respects_configured_duration_even_without_loop() {
         // Regression test for a real bug report: "Playlist with videos
         // does not obey play time duration set in playlist video
@@ -1527,3 +1565,4 @@ mod html_sharding_tests {
         assert!(html.contains("src='http://127.0.0.4:9999/4003.html")); // 4003%4=3 -> shard4
     }
 }
+
