@@ -212,7 +212,7 @@ fn default_log_level() -> String { "debug".into() }
 fn default_embedded_server_port() -> u16 { 9696 }
 fn default_display_name() -> String { "Xibo".into() }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CmsSettings {
     pub address: String,
     pub key: String,

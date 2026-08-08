@@ -123,6 +123,22 @@ pub struct Handler {
     /// `PlayerSettings::log_level_filter`) is never applied, so the
     /// explicit local override always wins over a remote setting.
     debug_override: bool,
+    /// `Some` only while XMR genuinely isn't connected because startup
+    /// happened offline with `--allow-offline` (see the real bug this
+    /// fixes: github.com/birkenfeld/arexibo/issues/33) -- retried once
+    /// per collection cycle (see `collect_once`) until it succeeds, at
+    /// which point this goes back to `None` and `self.xmr` becomes the
+    /// real channel. Kept as a cloned key (RsaPrivateKey is Clone)
+    /// specifically so a retry attempt is possible without needing to
+    /// re-derive or persist it separately -- the original is otherwise
+    /// consumed once, at `Handler::new()` time.
+    /// Owned copies of the CMS settings and no-cert-verify flag,
+    /// specifically kept for the XMR retry in `collect_once` (see
+    /// `xmr_retry_key`'s own doc comment) -- the constructor otherwise
+    /// only ever needs a borrow of these.
+    cms: CmsSettings,
+    no_verify: bool,
+    xmr_retry_key: Option<RsaPrivateKey>,
     /// Timer that fires when the currently-shown overlay (whichever
     /// source -- see below) should be hidden/advanced. Moved here (was
     /// previously a local variable in `run()`) because `schedule_check()`
@@ -214,8 +230,41 @@ impl Handler {
 
         // if we got settings, we are registered and authorized
         if let Some(settings) = res {
-            // create the XMR manager which sends us updates via channel
-            let xmr = xmr::start(cms, &settings, privkey, no_verify)?;
+            // BUG fix (found from a real, well-documented upstream
+            // report -- github.com/birkenfeld/arexibo/issues/33,
+            // confirmed by multiple independent users): `--allow-offline`
+            // correctly tolerated the *first* network-dependent step
+            // above (RegisterDisplay) by falling back to cached
+            // settings/schedule -- but this *second* one (setting up the
+            // XMR connection, itself needing DNS resolution/a live
+            // socket) was NOT given the same tolerance, and used `?` to
+            // propagate any failure unconditionally. On a genuinely
+            // offline network (the exact reported scenario: "Network is
+            // unreachable" / DNS resolution failure), this meant
+            // `--allow-offline` was completely defeated by the very next
+            // step after the one it was specifically designed to
+            // tolerate -- the whole process would exit instead of
+            // starting up with cached content as intended. Now: if
+            // allow_offline is set, an XMR setup failure logs a warning
+            // and falls back to `never()` (the same "no channel active
+            // right now" placeholder already used elsewhere in this file
+            // for optional timers) instead of aborting startup entirely
+            // -- the player still starts and shows whatever's already
+            // cached, which is the whole point of this flag. The cloned
+            // private key is kept in `xmr_retry_key` so `collect_once`
+            // can retry the XMR connection on a later cycle, once
+            // network genuinely returns, without needing a full restart.
+            let mut xmr_retry_key = None;
+            let xmr = match xmr::start(cms, &settings, privkey.clone(), no_verify) {
+                Ok(xmr) => xmr,
+                Err(e) if allow_offline => {
+                    log::warn!("could not set up XMR (will retry on a later collection \
+                                cycle instead of real-time push): {e:#}");
+                    xmr_retry_key = Some(privkey);
+                    never()
+                }
+                Err(e) => return Err(e),
+            };
 
             settings.to_file(&setting_file).context("writing player settings")?;
 
@@ -230,7 +279,7 @@ impl Handler {
                                  duration_rx, overlay_expiry: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(), resource_retry_timer: never(),
-                                 debug_override };
+                                 debug_override, xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
@@ -613,6 +662,26 @@ impl Handler {
             }
         } else {
             bail!("display is not authorized anymore");
+        }
+
+        // See `xmr_retry_key`'s own doc comment / the `--allow-offline`
+        // bug fix in `Handler::new` -- only even attempted once
+        // `register_display()` above has *already* succeeded this cycle
+        // (confirming the network is genuinely reachable again), rather
+        // than wasting a connection attempt on a cycle where we already
+        // know it can't possibly work.
+        if let Some(key) = self.xmr_retry_key.take() {
+            match xmr::start(&self.cms, &self.settings, key.clone(), self.no_verify) {
+                Ok(xmr) => {
+                    log::info!("XMR connection recovered, switching from offline mode \
+                                to real-time push updates");
+                    self.xmr = xmr;
+                }
+                Err(e) => {
+                    log::warn!("XMR still not reachable, will retry next collection: {e:#}");
+                    self.xmr_retry_key = Some(key);
+                }
+            }
         }
 
         // get the missing files
