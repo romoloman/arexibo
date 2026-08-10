@@ -155,6 +155,29 @@ impl WsConnector {
 
     fn process_msg(&mut self) -> Result<()> {
         let msg = self.socket.read()?;
+        // BUG fix (found from a real report: XMR WebSocket connection
+        // closing almost immediately after connecting, newly appearing
+        // after a CMS 4.5 upgrade -- CONFIRMED via xibo-xmr's own real
+        // source code, index.php: `$wsServer->enableKeepAlive(...)`,
+        // using Ratchet's WsServer keepalive, which pings connected
+        // clients and closes any that don't Pong back in time.
+        // tungstenite *does* auto-queue a Pong reply on receiving a
+        // Ping, per its own docs, but only *flushes* it out on the
+        // *next* call to read/write/write_pending -- relying on that
+        // implicit queue-and-flush-next-time behavior, combined with
+        // our blocking read() with a 40s timeout, felt like an
+        // avoidable source of a race/delay against a keepalive that
+        // (per the earlier "linux WebSocket XMR" feature being brand
+        // new, merged March 2026, apparently only tested against "the
+        // new Linux player in beta") could plausibly have a short
+        // interval. Sending the Pong back explicitly and immediately
+        // removes any ambiguity about timing, regardless of whether
+        // this exact mechanism turns out to be the full explanation.
+        if msg.is_ping() {
+            self.socket.send(tungstenite::Message::Pong(msg.into_data()))
+                .context("sending XMR WebSocket pong reply")?;
+            return Ok(());
+        }
         if msg.is_text() {
             if msg.to_text().ok() == Some(HEARTBEAT) {
                 return Ok(());

@@ -173,6 +173,14 @@ pub struct Handler {
     /// retrying forever for a resource that's genuinely, permanently
     /// broken, e.g. a widget referencing a deleted Dataset).
     resource_retry_queue: Vec<(crate::resource::ReqFile, u32)>,
+    /// Same transient-fault retry protection as `resource_retry_queue`
+    /// above, but for the XMR `dataUpdate` path specifically (see
+    /// `Cache::refresh_resource`) -- that path doesn't go through a raw
+    /// `ReqFile` at all (it has its own fallback lookups for nested/
+    /// dataset-bound widgets), so it needs its own (id, attempts) queue
+    /// rather than sharing `resource_retry_queue`'s `ReqFile`-based one.
+    /// Drained by the same `resource_retry_timer`.
+    dataupdate_retry_queue: Vec<(i64, u32)>,
     resource_retry_timer: Receiver<std::time::Instant>,
 }
 
@@ -278,7 +286,9 @@ impl Handler {
                                  shell_process: None, last_command_success: None,
                                  duration_rx, overlay_expiry: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
-                                 resource_retry_queue: Vec::new(), resource_retry_timer: never(),
+                                 resource_retry_queue: Vec::new(),
+                                 dataupdate_retry_queue: Vec::new(),
+                                 resource_retry_timer: never(),
                                  debug_override, xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
             slf.schedule_check();  // only useful in case of cached schedule
@@ -421,8 +431,24 @@ impl Handler {
                             Ok(fetch_id) => {
                                 self.to_gui.send(ToGui::ReloadWidget(fetch_id)).unwrap();
                             }
-                            Err(e) => log::error!("refreshing widget {widget_id} \
-                                                    after dataUpdate: {e:#}"),
+                            Err(e) => {
+                                // BUG fix (found from a real report: a
+                                // widget refreshed via dataUpdate hit
+                                // the same real, confirmed transient CMS
+                                // fault as a normal bulk collection
+                                // ("Cache not ready" for a widget it
+                                // hadn't finished rendering yet), but
+                                // this path -- unlike a normal bulk
+                                // download failure -- was never retried
+                                // at all, leaving the widget stuck
+                                // blank/stale until an unrelated full
+                                // collection or layout switch happened
+                                // to refresh it anyway.
+                                log::error!("refreshing widget {widget_id} \
+                                            after dataUpdate: {e:#}");
+                                self.dataupdate_retry_queue.push((widget_id, 0));
+                                self.resource_retry_timer = after(RESOURCE_RETRY_DELAY);
+                            }
                         }
                     }
                     Ok(xmr::Message::ChangeLayout(layout_id)) => {
@@ -988,12 +1014,28 @@ impl Handler {
         let queue = std::mem::take(&mut self.resource_retry_queue);
         for (file, attempts) in queue {
             let desc = file.description();
+            // BUG fix (found from a real report: a resource widget
+            // stuck permanently blank on screen even after its retry
+            // download had genuinely succeeded server-side -- fixed
+            // only by an unrelated, full layout switch away and back,
+            // which forces the whole page to reload from scratch).
             // Capture the widget id before `file` is consumed by
-            // download() -- needed below only on success, to refresh
+            // download() below -- needed on success, to refresh
             // whatever's already on screen (shown blank/broken from the
-            // original failed attempt).
+            // original failed attempt). This must be `id`, matching the
+            // XLF's own `<media id="...">` attribute that becomes the
+            // iframe's `id="m{id}"` in the generated HTML (see
+            // layout.rs's write_media: `let mid =
+            // media.parse_attr("id")?;`) -- NOT `mediaid`, a genuinely
+            // different field (parsed from a separate `mediaid` XML
+            // attribute in the RequiredFiles response, unrelated to the
+            // widget's own identity) that was used here by mistake. The
+            // dataUpdate path (Cache::refresh_resource, mainloop.rs's
+            // own DataUpdate handler) already gets this right, using
+            // `fetch_id`/`id` correctly -- this was the one path that
+            // didn't.
             let widget_id = match &file {
-                crate::resource::ReqFile::Resource { mediaid, .. } => Some(*mediaid),
+                crate::resource::ReqFile::Resource { id, .. } => Some(*id),
                 _ => None,
             };
             match self.cache.download(file.clone(), &mut self.xmds) {
@@ -1015,7 +1057,33 @@ impl Handler {
                 }
             }
         }
-        self.resource_retry_timer = if self.resource_retry_queue.is_empty() {
+        // Same transient-fault retry, for the dataUpdate path (see
+        // `dataupdate_retry_queue`'s own doc comment on the Handler
+        // struct -- this doesn't go through a raw ReqFile, so it can't
+        // share the loop above; calls `refresh_resource` again instead,
+        // exactly as the original DataUpdate handler did).
+        let dataupdate_queue = std::mem::take(&mut self.dataupdate_retry_queue);
+        for (widget_id, attempts) in dataupdate_queue {
+            match self.cache.refresh_resource(widget_id, &mut self.xmds) {
+                Ok(fetch_id) => {
+                    log::info!("retry succeeded for dataUpdate widget {widget_id}");
+                    self.to_gui.send(ToGui::ReloadWidget(fetch_id)).unwrap();
+                }
+                Err(e) => {
+                    let attempts = attempts + 1;
+                    if attempts >= RESOURCE_RETRY_MAX_ATTEMPTS {
+                        log::warn!("giving up on dataUpdate widget {widget_id} after \
+                                    {attempts} failed retries: {e:#}");
+                    } else {
+                        log::warn!("retry {attempts}/{RESOURCE_RETRY_MAX_ATTEMPTS} failed for \
+                                    dataUpdate widget {widget_id}, will retry again: {e:#}");
+                        self.dataupdate_retry_queue.push((widget_id, attempts));
+                    }
+                }
+            }
+        }
+        self.resource_retry_timer = if self.resource_retry_queue.is_empty()
+            && self.dataupdate_retry_queue.is_empty() {
             never()
         } else {
             after(RESOURCE_RETRY_DELAY)

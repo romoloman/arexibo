@@ -49,15 +49,46 @@ impl Cms {
     }
 
     pub fn register_display(&mut self) -> Result<Option<PlayerSettings>> {
+        // Temporary diagnostic knob (found genuinely useful investigating
+        // a real report: XMR WebSocket connection closing almost
+        // immediately after connecting on CMS 4.5 with "Invalid key" in
+        // the XMR relay's own log -- confirmed via the relay's real
+        // source code that key validation depends entirely on a
+        // per-instance key having been registered via `addKey()`
+        // beforehand, seemingly never wired up for the brand new
+        // (March 2026) linux WebSocket XMR support path specifically).
+        // Lets us test whether reporting as clientType "windows"
+        // (an older, more mature WebSocket XMR code path) hits a
+        // *working* addKey()-registration path on the CMS side, without
+        // needing a real Windows machine to compare against. NOT meant
+        // to be left set permanently -- this misrepresents the player to
+        // the CMS, which could affect other clientType-conditional CMS
+        // behavior in ways beyond just this specific XMR question.
+        let fake_client_type = std::env::var("AREXIBO_FAKE_CLIENTTYPE").ok();
+        let (client_type, client_code, operating_system): (&str, i64, &str) =
+            match fake_client_type.as_deref() {
+                Some("windows") => {
+                    log::info!("overriding clientType to \"windows\" via \
+                                AREXIBO_FAKE_CLIENTTYPE (diagnostic only)");
+                    ("windows", 407, "windows")
+                }
+                Some(other) if !other.is_empty() => {
+                    log::warn!("AREXIBO_FAKE_CLIENTTYPE={other:?} not a supported \
+                                override value, ignoring (only \"windows\" is \
+                                implemented) -- using real clientType \"linux\"");
+                    ("linux", 407, "linux")
+                }
+                _ => ("linux", 407, "linux"),
+            };
         let xml = self.service.RegisterDisplay(
             soap::RegisterDisplayRequest {
                 serverKey: &self.cms_key,
                 hardwareKey: &self.hw_key,
                 displayName: &self.display_name,
-                clientType: "linux",
+                clientType: client_type,
                 clientVersion: clap::crate_version!(),
-                clientCode: 407,
-                operatingSystem: "linux",
+                clientCode: client_code,
+                operatingSystem: operating_system,
                 macAddress: &self.mac_addr,
                 xmrChannel: &self.channel,
                 xmrPubKey: &self.pub_key,
@@ -88,15 +119,47 @@ impl Cms {
             } else { String::new() };
 
             Ok(Some(PlayerSettings {
-                xmr_network_address: tree.parse_child("xmrNetworkAddress")?,
+                // BUG fix (found while testing a diagnostic clientType
+                // override): this used `parse_child` (erroring out if
+                // the field is absent entirely), inconsistent with its
+                // sibling XMR fields right above (xmrWebSocketAddress,
+                // xmrType, xmrCmsKey), all of which correctly use
+                // `def_child` with a graceful empty-string fallback. The
+                // CMS can legitimately omit this field for a client that
+                // only uses WebSocket XMR (it's the legacy ZMQ fallback
+                // address specifically) -- treating its absence as a
+                // hard registration failure meant collection fell back
+                // to stale cached settings entirely, rather than simply
+                // not having a ZMQ fallback available.
+                xmr_network_address: tree.def_child("xmrNetworkAddress", "")?,
                 xmr_web_socket_address,
                 xmr_cms_key: tree.def_child("xmrCmsKey", "")?,
-                log_level: tree.parse_child("logLevel")?,
-                display_name: tree.parse_child("displayName")?,
-                stats_enabled: tree.parse_child::<i32>("statsEnabled")? != 0,
-                prevent_sleep: tree.parse_child::<i32>("preventSleep")? != 0,
-                collect_interval: tree.parse_child("collectInterval")?,
-                screenshot_interval: tree.parse_child("screenShotRequestInterval")?,
+                // BUG fix (found while testing a diagnostic clientType
+                // override, "windows" -- the CMS's real ActivationMessage
+                // response omitted several fields entirely for that
+                // client type, causing a cascade of hard registration
+                // failures one field at a time as each was fixed in
+                // turn). All of the following were previously mandatory
+                // via `parse_child`, erroring the whole registration out
+                // (falling back to stale cached settings) if the CMS
+                // omitted any single one of them. Made optional with
+                // conservative, documented defaults instead, matching
+                // the same pattern already used for the fields above.
+                log_level: tree.def_child("logLevel", "error".to_string())?,
+                display_name: tree.def_child("displayName", self.display_name.clone())?,
+                // Xibo's own typical CMS default for Proof of Play stats
+                // is enabled; failing closed here (defaulting off) would
+                // be surprising, not safe, so default to the CMS's own
+                // usual behavior instead.
+                stats_enabled: tree.def_child::<i32>("statsEnabled", 1)? != 0,
+                prevent_sleep: tree.def_child::<i32>("preventSleep", 0)? != 0,
+                // 300s (5 minutes) matches Xibo's own commonly-documented
+                // default collection interval.
+                collect_interval: tree.def_child("collectInterval", 300u32)?,
+                // 0 already means "don't poll for screenshots" elsewhere
+                // (see mainloop.rs's `if self.settings.screenshot_interval
+                // != 0`) -- safe, inert default.
+                screenshot_interval: tree.def_child("screenShotRequestInterval", 0u32)?,
                 // FLAGGED AS UNVERIFIED (element name): follows the usual
                 // lowerCamelCase-of-the-C#-PascalCase convention
                 // (`ScreenShotSize` -> `screenShotSize`), but not
@@ -119,11 +182,19 @@ impl Cms {
                                                                   String::new())?,
                 download_end_window: tree.def_child::<String>("downloadEndWindow",
                                                                 String::new())?,
-                embedded_server_port: tree.parse_child("embeddedServerPort")?,
-                size_x: tree.parse_child("sizeX")?,
-                size_y: tree.parse_child("sizeY")?,
-                pos_x: tree.parse_child("offsetX")?,
-                pos_y: tree.parse_child("offsetY")?,
+                // embeddedServerPort from the CMS is effectively
+                // vestigial regardless -- main.rs immediately overwrites
+                // it with whatever port we actually bound locally
+                // (`settings.embedded_server_port = webserver.port();`),
+                // so any value here (or its absence) has no real effect.
+                embedded_server_port: tree.def_child("embeddedServerPort", 0u16)?,
+                // 0 already means "use the full screen" for both
+                // dimensions (see gui/view.cpp: `if (size_x == 0) size_x
+                // = screen_w;`) -- safe, already-established sentinel.
+                size_x: tree.def_child("sizeX", 0i32)?,
+                size_y: tree.def_child("sizeY", 0i32)?,
+                pos_x: tree.def_child("offsetX", 0i32)?,
+                pos_y: tree.def_child("offsetY", 0i32)?,
                 commands,
                 // FLAGGED AS UNVERIFIED: element names follow the same
                 // lowerCamelCase-of-the-C#-PascalCase-property convention
