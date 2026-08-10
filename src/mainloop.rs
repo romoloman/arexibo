@@ -185,8 +185,21 @@ pub struct Handler {
 }
 
 /// See `Handler::resource_retry_queue`'s own doc comment.
-const RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(15);
-const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 5;
+///
+/// TUNING NOTE (found from a real report): the original 15s x 5
+/// attempts (75s total window) proved too short in a real case
+/// observed live via `--debug` -- the CMS's "Cache not ready" fault
+/// for a widget's resource persisted for *well over a minute*, and
+/// arexibo gave up on its own retries mere moments before the CMS
+/// would have resolved it on its own (an unrelated XMR `dataUpdate`
+/// push for that same widget, arriving independently ~90s after
+/// giving up, succeeded immediately). Widened to a ~3 minute total
+/// window to give the CMS more realistic room to finish generating
+/// this kind of lazily-rendered content, while still eventually
+/// giving up rather than retrying forever for a resource that's
+/// genuinely, permanently broken.
+const RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(20);
+const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
 
 impl Handler {
     /// Create a new handler, with channels to the GUI thread.
