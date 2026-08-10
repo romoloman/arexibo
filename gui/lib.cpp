@@ -68,6 +68,23 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
     settings->setAttribute(QWebEngineSettings::ScreenCaptureEnabled, true);
     settings->setAttribute(QWebEngineSettings::PlaybackRequiresUserGesture, false);
 
+    // Temporary diagnostic knob (found genuinely useful investigating a
+    // real report: "RSS marquee scroller does not display text"), NOT
+    // meant to be a permanent feature -- QTWEBENGINE_CHROMIUM_FLAGS'
+    // own "--user-agent=" is silently overridden by QtWebEngine's own
+    // default UA construction later, so this has to go through
+    // QWebEngineProfile's dedicated API instead to actually take
+    // effect. Lets us test whether bundle.min.js (or a third-party
+    // jQuery plugin bundled inside it) does *any* UA-based platform
+    // detection that happens to affect Linux differently, without
+    // needing a real Windows machine to compare against.
+    const char *fakeUserAgentEnv = std::getenv("AREXIBO_FAKE_USERAGENT");
+    if (fakeUserAgentEnv && *fakeUserAgentEnv) {
+        std::cout << "INFO : [arexibo::qt] overriding navigator.userAgent via \\
+                     AREXIBO_FAKE_USERAGENT (diagnostic only): " << fakeUserAgentEnv << std::endl;
+        QWebEngineProfile::defaultProfile()->setHttpUserAgent(QString(fakeUserAgentEnv));
+    }
+
     // Pragmatic, deliberately-not-root-caused font size calibration:
     // user-reported (and independently re-confirmed via a real
     // side-by-side comparison) that text renders visibly larger under
@@ -241,6 +258,62 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                 var sw = body.scrollWidth, sh = body.scrollHeight;
                 if (sw <= 0 || sh <= 0) return;
                 var scale = Math.min(1, w / sw, h / sh);
+                // DELIBERATE DECISION (discussed explicitly with the user,
+                // not an oversight): MIN_SHRINK_SCALE is set to 1, which
+                // disables this shrink-to-fit mechanism entirely by
+                // default -- `scale < MIN_SHRINK_SCALE` (i.e. `scale < 1`)
+                // is true for any content that would otherwise be
+                // shrunk at all, so the code below (the actual shrink
+                // application) is now permanently unreachable at this
+                // setting.
+                //
+                // Why: this mechanism was originally built (section 11 in
+                // AREXIBO_STATO_LAVORO.md) to fix a genuine, confirmed bug
+                // -- a widget like a clock rendering 2-3x too large,
+                // because Xibo's own auto-scaling JS (xiboLayoutScaler in
+                // bundle.min.js) never actually triggers in arexibo's
+                // specific embedding architecture (it compares the
+                // container size against originalWidth/originalHeight,
+                // which arexibo always passes as the *same* numbers by
+                // construction, so the ratio is always exactly 1 -- a
+                // structural gap, NOT a font-rendering difference between
+                // platforms, which is what AREXIBO_FONT_SCALE addresses
+                // instead, a distinct and unrelated mechanism).
+                //
+                // It was later found (this same file, RSS marquee ticker
+                // report) to badly misfire on any widget whose content is
+                // *intentionally* much larger than its own box (e.g. a
+                // marquee plugin duplicating its scrolling content many
+                // times over for a seamless loop) -- shrinking such
+                // content into imperceptibility, and repeatedly
+                // resetting/re-measuring body.style.transform on every DOM
+                // mutation (see armObserver below), which can race with
+                // that same content's own width measurement/animation
+                // setup happening concurrently.
+                //
+                // Weighing a known, already-fixed bug (the clock case)
+                // against an unknown number of *other*, untested
+                // third-party widget plugins that could have similar
+                // legitimately-overflowing content and be broken the same
+                // way the marquee was -- the user explicitly chose to
+                // disable this blanket mechanism entirely rather than
+                // keep chasing individual widget-type exceptions one real
+                // bug report at a time. If the original clock-sizing bug
+                // (or a similar one) resurfaces, lowering this back down
+                // (e.g. to 0.2, the value used after the marquee fix,
+                // before this decision) restores the previous behavior
+                // without needing to reconstruct the mechanism from
+                // scratch.
+                var MIN_SHRINK_SCALE = 1;
+                if (scale < MIN_SHRINK_SCALE) {
+                    if (window.arexiboDebug) {
+                        console.log('arexibo-shrink: target=' + w + 'x' + h +
+                                    ' measured=' + sw + 'x' + sh + ' scale=' + scale +
+                                    ' -- skipped, below MIN_SHRINK_SCALE (shrink-to-fit ' +
+                                    'is disabled by default -- see this comment)');
+                    }
+                    return;
+                }
                 if (scale < 1) {
                     // Diagnostic log (found genuinely useful investigating
                     // a real "content generated correctly but invisible"

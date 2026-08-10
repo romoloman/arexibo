@@ -16,7 +16,7 @@ use crate::util::{ElementExt, percent_decode};
 // - overriding duration from resources
 // - fromDt/toDt
 
-pub const TRANSLATOR_VERSION: u32 = 28;
+pub const TRANSLATOR_VERSION: u32 = 29;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -399,8 +399,25 @@ impl<'a> Translator<'a> {
                 .context("bad targetId")?;
             let mut layoutid = 0;
             if action == "navLayout" {
-                layoutid = self.code_map.get(layoutcode).copied()
-                    .context("unknown layout code")?;
+                // BUG fix (found from a real report, confirmed with a
+                // real XLF sample from the CMS): `targetId` already
+                // carries the target layout's own numeric id directly
+                // (confirmed in the real sample: `targetId="780"`
+                // correctly pointing at that same, valid layout) --
+                // resolving via `layoutCode`/`code_map` instead
+                // unconditionally meant a stale/unassigned layoutCode
+                // value (e.g. "test1", not present in code_map for any
+                // currently-required layout) failed the whole action,
+                // even though targetId alone was already sufficient and
+                // correct. Now: use targetId directly when it's a real,
+                // positive id; only fall back to the layoutCode lookup
+                // if targetId is absent/zero.
+                layoutid = if targetid > 0 {
+                    targetid
+                } else {
+                    self.code_map.get(layoutcode).copied()
+                        .context("unknown layout code")?
+                };
             }
             format!("window.arexibo.performAction({action:?}, {target:?}, {targetid}, {layoutid})")
         };
@@ -449,6 +466,27 @@ impl<'a> Translator<'a> {
                     writeln!(self.out, "document.body.addEventListener('click', function() {{ {call}; }});")?;
                 }
             }
+            // BUG fix (found from a real report: "Interactive layout
+            // button... did not recognize keyboard space key press...
+            // but touch is recognized"). CONFIRMED via a real XLF
+            // sample from the CMS: Xibo's "Key Press" interactive
+            // trigger (CMS 4.4+, docs: "trigger interactive content
+            // with your keyboard, without the need for a touchscreen
+            // display") does NOT use a separate triggerType -- it's the
+            // *same* triggerType="touch" action, with `triggerCode`
+            // additionally carrying a keyboard key name (e.g. "Space",
+            // matching the KeyboardEvent.code convention) as an
+            // *alternative* way to fire the identical action, alongside
+            // the touch/click zone above, not instead of it. This was
+            // previously never implemented at all -- triggerCode was
+            // read only for the (unrelated) webhook action type,
+            // completely ignored here. Always adding this listener is
+            // safe/inert for a touch-only action that doesn't use this
+            // feature: a triggerCode that isn't a real KeyboardEvent.code
+            // value (e.g. "<not set>") will simply never match any real
+            // key event.
+            writeln!(self.out, "document.addEventListener('keydown', function(e) {{ \
+                                if (e.code === {code:?}) {{ {call}; }} }});")?;
         } else {
             log::warn!("unsupported action type: {typ}");
         }
@@ -1488,6 +1526,107 @@ mod loop_tests {
 
 
 #[cfg(test)]
+mod action_tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn translate_xlf(xlf: &str) -> String {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("arexibo_action_test_{}_{n}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let map = HashMap::new();
+        let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        html
+    }
+
+    #[test]
+    fn touch_action_also_binds_a_keydown_listener_for_triggercode() {
+        // Regression test for a real bug report: "Interactive layout
+        // button... did not recognize keyboard space key press... but
+        // touch is recognized." Confirmed via a real XLF sample from
+        // the CMS that Xibo's "Key Press" trigger (4.4+) reuses
+        // triggerType="touch" with triggerCode carrying a keyboard key
+        // name (e.g. "Space") as an *alternative* way to fire the same
+        // action -- this was previously never implemented, triggerCode
+        // was read only for the (unrelated) webhook action type.
+        let xlf = r#"<layout width="1080" height="1920" code="defaultxibomultimedia">
+            <action layoutCode="test1" target="screen" source="layout"
+                    actionType="navLayout" triggerType="touch" triggerCode="Space"
+                    id="756" targetId="780" sourceId="780"/>
+            <region id="1" left="0" top="0" width="1080" height="1920">
+                <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("document.addEventListener('keydown'"),
+                "must bind a keydown listener for the touch+triggerCode Key Press feature");
+        assert!(html.contains("e.code === \"Space\""));
+        // the existing click/touch handling (source=="layout" -> whole
+        // body) must still be present too -- this is an *addition*, not
+        // a replacement.
+        assert!(html.contains("document.body.addEventListener('click'"));
+    }
+
+    #[test]
+    fn navlayout_prefers_targetid_over_stale_layoutcode() {
+        // Regression test for a real bug report/log: a real XLF sample
+        // had targetId="780" (a valid, correct numeric layout id --
+        // this layout's own id) but layoutCode="test1", which wasn't
+        // present in code_map for the current collection -- the action
+        // failed entirely ("unknown layout code") even though targetId
+        // alone was already sufficient.
+        let xlf = r#"<layout width="1080" height="1920" code="defaultxibomultimedia">
+            <action layoutCode="test1" target="screen" source="layout"
+                    actionType="navLayout" triggerType="touch" triggerCode="Space"
+                    id="756" targetId="780" sourceId="780"/>
+            <region id="1" left="0" top="0" width="1080" height="1920">
+                <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        // targetId (780) must be used directly as the resolved layout
+        // id, not fail on the stale/unassigned layoutCode.
+        assert!(html.contains("performAction(\"navLayout\", \"screen\", 780, 780)"));
+    }
+
+    #[test]
+    fn navlayout_falls_back_to_layoutcode_when_targetid_absent() {
+        // The layoutCode-based resolution path must still work for the
+        // case it was originally written for: no usable targetId at
+        // all, only a layoutCode to resolve via the code map.
+        let xlf = r#"<layout width="1080" height="1920" code="mainlayout">
+            <action layoutCode="othercode" target="screen" source="layout"
+                    actionType="navLayout" triggerType="touch" triggerCode="Space" id="1"/>
+            <region id="1" left="0" top="0" width="1080" height="1920">
+                <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let dir = std::env::temp_dir().join(format!("arexibo_action_fallback_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let mut map = HashMap::new();
+        map.insert("othercode".to_string(), 999i64);
+        let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        assert!(html.contains("performAction(\"navLayout\", \"screen\", 0, 999)"));
+    }
+}
+
+
+
+#[cfg(test)]
 mod html_sharding_tests {
     use super::*;
     use std::io::Read;
@@ -1565,4 +1704,5 @@ mod html_sharding_tests {
         assert!(html.contains("src='http://127.0.0.4:9999/4003.html")); // 4003%4=3 -> shard4
     }
 }
+
 
