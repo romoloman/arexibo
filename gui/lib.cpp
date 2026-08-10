@@ -258,59 +258,52 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                 var sw = body.scrollWidth, sh = body.scrollHeight;
                 if (sw <= 0 || sh <= 0) return;
                 var scale = Math.min(1, w / sw, h / sh);
-                // DELIBERATE DECISION (discussed explicitly with the user,
-                // not an oversight): MIN_SHRINK_SCALE is set to 1, which
-                // disables this shrink-to-fit mechanism entirely by
-                // default -- `scale < MIN_SHRINK_SCALE` (i.e. `scale < 1`)
-                // is true for any content that would otherwise be
-                // shrunk at all, so the code below (the actual shrink
-                // application) is now permanently unreachable at this
-                // setting.
+                // BUG fix (found from a real report: "RSS marquee scroller
+                // does not display text" -- confirmed via real DevTools
+                // inspection on a real widget: body.scrollWidth measured
+                // in the ~1,000,000px range for a horizontally-scrolling
+                // marquee ticker, whose plugin duplicates its own content
+                // several times over to create a seamless scrolling loop
+                // -- entirely intentional, not oversized content to fix).
+                // This shrink mechanism was designed for a different,
+                // genuine bug (a widget like a clock rendering 2-3x too
+                // large due to a font/CSS sizing issue) -- a MODEST
+                // overflow ratio. A scale this extreme (over ~5x too
+                // "big") is a strong signal the content is *designed* to
+                // overflow (a scrolling ticker/marquee, not a sizing bug),
+                // and forcibly shrinking it to fit -- besides visually
+                // squashing it into imperceptibility -- also repeatedly
+                // resets and re-measures `body.style.transform` on every
+                // DOM mutation (see armObserver below), which can race
+                // with a marquee plugin's *own* width measurement/
+                // animation setup happening at the same time. Below this
+                // threshold, skip shrinking entirely and leave the
+                // content exactly as the CMS/widget itself intended.
                 //
-                // Why: this mechanism was originally built (section 11 in
-                // AREXIBO_STATO_LAVORO.md) to fix a genuine, confirmed bug
-                // -- a widget like a clock rendering 2-3x too large,
-                // because Xibo's own auto-scaling JS (xiboLayoutScaler in
-                // bundle.min.js) never actually triggers in arexibo's
-                // specific embedding architecture (it compares the
-                // container size against originalWidth/originalHeight,
-                // which arexibo always passes as the *same* numbers by
-                // construction, so the ratio is always exactly 1 -- a
-                // structural gap, NOT a font-rendering difference between
-                // platforms, which is what AREXIBO_FONT_SCALE addresses
-                // instead, a distinct and unrelated mechanism).
-                //
-                // It was later found (this same file, RSS marquee ticker
-                // report) to badly misfire on any widget whose content is
-                // *intentionally* much larger than its own box (e.g. a
-                // marquee plugin duplicating its scrolling content many
-                // times over for a seamless loop) -- shrinking such
-                // content into imperceptibility, and repeatedly
-                // resetting/re-measuring body.style.transform on every DOM
-                // mutation (see armObserver below), which can race with
-                // that same content's own width measurement/animation
-                // setup happening concurrently.
-                //
-                // Weighing a known, already-fixed bug (the clock case)
-                // against an unknown number of *other*, untested
-                // third-party widget plugins that could have similar
-                // legitimately-overflowing content and be broken the same
-                // way the marquee was -- the user explicitly chose to
-                // disable this blanket mechanism entirely rather than
-                // keep chasing individual widget-type exceptions one real
-                // bug report at a time. If the original clock-sizing bug
-                // (or a similar one) resurfaces, lowering this back down
-                // (e.g. to 0.2, the value used after the marquee fix,
-                // before this decision) restores the previous behavior
-                // without needing to reconstruct the mechanism from
-                // scratch.
-                var MIN_SHRINK_SCALE = 1;
+                // HISTORY: briefly set to 1 (disabling this mechanism
+                // entirely) after a deliberate decision to trade the
+                // clock-sizing fix for reduced risk of unknown
+                // interactions with other, untested third-party widget
+                // plugins. Reverted immediately -- confirmed via a direct
+                // Linux-vs-Windows screenshot comparison from the user
+                // that this reintroduced the exact original clock bug
+                // (Europe/Rome digital clock rendering correctly, cleanly
+                // sized on Windows -- a completely separate CEF-based
+                // client architecture that never went through this
+                // mechanism at all -- but overflowing into a clipped,
+                // near-black box on Linux/arexibo the moment this was
+                // disabled). 0.2 is confirmed, via real functional
+                // testing, to fix both cases correctly at once: the clock
+                // (a modest, genuine sizing bug) gets shrunk; the marquee
+                // (content intentionally far larger than its box) does
+                // not.
+                var MIN_SHRINK_SCALE = 0.2;
                 if (scale < MIN_SHRINK_SCALE) {
                     if (window.arexiboDebug) {
                         console.log('arexibo-shrink: target=' + w + 'x' + h +
                                     ' measured=' + sw + 'x' + sh + ' scale=' + scale +
-                                    ' -- skipped, below MIN_SHRINK_SCALE (shrink-to-fit ' +
-                                    'is disabled by default -- see this comment)');
+                                    ' -- skipped, below MIN_SHRINK_SCALE (likely ' +
+                                    'intentionally-overflowing content, e.g. a marquee)');
                     }
                     return;
                 }
@@ -331,6 +324,37 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                     }
                     body.style.transformOrigin = '0 0';
                     body.style.transform = 'scale(' + scale + ')';
+                    return;
+                }
+                // BUG fix (found from a real report: a worldclock-digital-
+                // date widget rendering as a small dark box in the corner
+                // of its own much larger region, rather than filling it --
+                // confirmed via real DevTools inspection: the widget's own
+                // handlebars template hardcodes data-width="200"
+                // data-height="80" as its native design size, while its
+                // actual region was 711x241 -- body.scrollWidth/Height
+                // measured exactly 200x80, confirming it never gets scaled
+                // UP to fill the larger box at all). Same root cause as the
+                // shrink case above (xiboLayoutScaler comparing container
+                // size against globalOptions.originalWidth/Height, which
+                // arexibo always sets equal to the container by
+                // construction, so the ratio it computes is always exactly
+                // 1 and it never does anything) -- just the opposite
+                // direction: undersized content that needs to grow to fill
+                // its box, rather than oversized content that needs to
+                // shrink. A generous but bounded cap (MAX_GROW_SCALE) avoids
+                // grotesquely scaling up content that's tiny/broken for an
+                // unrelated reason (e.g. a genuinely empty/errored widget)
+                // rather than merely designed smaller than its region.
+                var MAX_GROW_SCALE = 10;
+                var growScale = Math.min(MAX_GROW_SCALE, w / sw, h / sh);
+                if (growScale > 1) {
+                    if (window.arexiboDebug) {
+                        console.log('arexibo-shrink: target=' + w + 'x' + h +
+                                    ' measured=' + sw + 'x' + sh + ' growScale=' + growScale);
+                    }
+                    body.style.transformOrigin = '0 0';
+                    body.style.transform = 'scale(' + growScale + ')';
                 }
             }
             function run() { try { tryShrink(); } catch (e) {} }
