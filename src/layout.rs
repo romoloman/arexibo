@@ -399,25 +399,8 @@ impl<'a> Translator<'a> {
                 .context("bad targetId")?;
             let mut layoutid = 0;
             if action == "navLayout" {
-                // BUG fix (found from a real report, confirmed with a
-                // real XLF sample from the CMS): `targetId` already
-                // carries the target layout's own numeric id directly
-                // (confirmed in the real sample: `targetId="780"`
-                // correctly pointing at that same, valid layout) --
-                // resolving via `layoutCode`/`code_map` instead
-                // unconditionally meant a stale/unassigned layoutCode
-                // value (e.g. "test1", not present in code_map for any
-                // currently-required layout) failed the whole action,
-                // even though targetId alone was already sufficient and
-                // correct. Now: use targetId directly when it's a real,
-                // positive id; only fall back to the layoutCode lookup
-                // if targetId is absent/zero.
-                layoutid = if targetid > 0 {
-                    targetid
-                } else {
-                    self.code_map.get(layoutcode).copied()
-                        .context("unknown layout code")?
-                };
+                layoutid = self.code_map.get(layoutcode).copied()
+                        .context("unknown layout code")?;
             }
             format!("window.arexibo.performAction({action:?}, {target:?}, {targetid}, {layoutid})")
         };
