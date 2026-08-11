@@ -108,6 +108,26 @@ impl WsConnector {
         let port = uri.port_u16().unwrap_or(
             if uri.scheme_str() == Some("wss") { 443 } else { 80 }
         );
+        // Diagnostic warning (found from a real report on GitHub: a
+        // Docker-based CMS correctly exposed its WebSocket XMR service
+        // on :8080, but the CMS's own "XMR WebSocket Address" setting
+        // was missing the port -- resulting in a silent, confusing
+        // "Connection refused" against the *scheme's own default port*
+        // (80/443) instead, since nothing runs XMR there. A missing
+        // port is virtually always a CMS misconfiguration for this
+        // specific address (real XMR WebSocket services essentially
+        // never run on 80/443 by convention) -- flagging it explicitly
+        // here should save the next person from re-deriving this from
+        // scratch via the TCP-level error alone.
+        if uri.port_u16().is_none() {
+            log::warn!("XMR WebSocket address {uri:?} has no explicit port -- \
+                        defaulting to {port} per URI scheme convention. This is \
+                        almost always a CMS misconfiguration (Administration -> \
+                        Settings -> Displays -> \"XMR WebSocket Address\") rather \
+                        than an intentional address -- if this address is wrong, \
+                        connections will fail with a confusing TCP-level error \
+                        rather than an obviously-XMR-related one.");
+        }
         let socket = TcpStream::connect((host, port))
             .context("connecting XMR WebSocket TCP stream")?;
         socket.set_read_timeout(Some(READ_TMO))?;

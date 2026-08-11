@@ -281,7 +281,24 @@ impl CmsSettings {
     }
 
     pub fn make_rustls_client_config(&self, no_verify: bool) -> Result<rustls::ClientConfig> {
-        aws_lc_rs::default_provider().install_default().expect("crypto provider init");
+        // BUG fix (found from a real crash report on GitHub: "Player now
+        // freeze on splash screen", panicking at this exact line).
+        // `install_default()` can only ever *succeed* once per process --
+        // this function gets called every time `xmr::start()` runs
+        // (src/xmr.rs), and that happens not just once at startup but
+        // also from the `--allow-offline` retry path (mainloop.rs,
+        // section 50's own fix: if the initial XMR setup fails and
+        // `--allow-offline` is set, a retry happens later once network
+        // connectivity is confirmed). On that second call, the crypto
+        // provider is already installed -- `install_default()` correctly
+        // returns `Err(Arc<CryptoProvider>)` in that case (simply handing
+        // back the *already-installed* provider, not signaling a genuine
+        // failure), but treating that as fatal via `.expect(...)` crashed
+        // the entire player the moment a real-world retry actually fired.
+        // Ignoring the Err case here is exactly what should happen: some
+        // provider (ours or otherwise) is already active either way, and
+        // that's perfectly fine for our purposes.
+        let _ = aws_lc_rs::default_provider().install_default();
         let mut root_store = rustls::RootCertStore::empty();
         if !no_verify {
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -606,5 +623,31 @@ mod log_level_tests {
         assert_eq!(settings_with_log_level("something-unexpected").log_level_filter(),
                    log::LevelFilter::Info);
         assert_eq!(settings_with_log_level("").log_level_filter(), log::LevelFilter::Info);
+    }
+
+    #[test]
+    fn make_rustls_client_config_is_safe_to_call_more_than_once() {
+        // Regression test for a real crash report: "Player now freeze
+        // on splash screen", panicking inside this function. Calling it
+        // a second time (matching what genuinely happens via the
+        // --allow-offline XMR retry path in mainloop.rs, not just a
+        // theoretical scenario) must not panic -- the crypto provider
+        // can only be *installed* once per process, but that's fine;
+        // a second, redundant install attempt should be a silent no-op,
+        // not fatal.
+        let cms = CmsSettings {
+            address: "https://example.com".into(),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        // First call -- matches the normal startup path.
+        cms.make_rustls_client_config(false).unwrap();
+        // Second call -- matches a later XMR retry re-creating its own
+        // TLS config from scratch. Must not panic.
+        cms.make_rustls_client_config(false).unwrap();
+        // A third, for good measure, with the other no_verify branch.
+        cms.make_rustls_client_config(true).unwrap();
     }
 }
