@@ -287,6 +287,48 @@ impl Handler {
                 Err(e) => return Err(e),
             };
 
+            // BUG fix (found from a real report: "Arexibo player
+            // settings.json WS port gets deleted on startup when it
+            // detects CMS v4.5.0" -- combined with a real crash caused
+            // by the resulting --allow-offline retry, section 63).
+            // CONFIRMED via the CMS's own real source code
+            // (lib/Xmds/Soap5.php): `xmrType` is set to 'ws' or 'zmq'
+            // based on `$this->display->isWebSocketXmrSupported()`,
+            // evaluated fresh on *every* RegisterDisplay call -- and our
+            // own parsing (xmds.rs) unconditionally sets
+            // xmr_web_socket_address to an EMPTY string whenever
+            // xmrType isn't exactly "ws", discarding whatever
+            // xmrWebSocketAddress value the CMS might have also sent.
+            // If isWebSocketXmrSupported() ever returns false just
+            // *once* for what should be a normally-WebSocket-capable
+            // display (e.g. a transient CMS-side state/timing issue --
+            // exactly the kind of once-off external condition we can't
+            // fully diagnose or prevent from here), this silently and
+            // *permanently* overwrites a previously-good cached
+            // WebSocket address with an empty one, since we always
+            // write the freshest registration straight to disk with no
+            // comparison against what was there before. Rather than
+            // guessing whether an empty address is an intentional CMS
+            // reconfiguration (legitimate) or a transient hiccup (not),
+            // this can't safely be auto-corrected -- but it can, and
+            // should, be made loudly visible instead of failing silently.
+            if let Ok(prev) = PlayerSettings::from_file(&setting_file) {
+                if !prev.xmr_web_socket_address.is_empty()
+                    && settings.xmr_web_socket_address.is_empty() {
+                    log::warn!("XMR WebSocket address just disappeared: was \
+                                {:?} in the cached settings, but this \
+                                registration came back empty (CMS reported \
+                                xmrType != \"ws\" this time) -- falling back \
+                                to ZMQ. If this display should have WebSocket \
+                                XMR, check the CMS's own display record for \
+                                this display (Administration -> Displays) -- \
+                                this can happen if the CMS's \
+                                isWebSocketXmrSupported() check didn't \
+                                recognize this display as WebSocket-capable \
+                                on this specific registration.",
+                                prev.xmr_web_socket_address);
+                }
+            }
             settings.to_file(&setting_file).context("writing player settings")?;
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
@@ -705,6 +747,24 @@ impl Handler {
 
         // call register to get updated player settings
         if let Some(settings) = self.xmds.register_display()? {
+            // See the matching check + doc comment in `Handler::new`
+            // (section 63/64's own fix) -- same issue, but here it's
+            // the *in-memory* settings used for the XMR retry attempt
+            // right below that would silently end up with an empty
+            // WebSocket address, rather than the on-disk settings.json
+            // (which only gets written at startup, not on every
+            // ongoing collection cycle).
+            if !self.settings.xmr_web_socket_address.is_empty()
+                && settings.xmr_web_socket_address.is_empty() {
+                log::warn!("XMR WebSocket address just disappeared: was {:?}, \
+                            but this registration came back empty (CMS \
+                            reported xmrType != \"ws\" this time) -- falling \
+                            back to ZMQ. If this display should have \
+                            WebSocket XMR, check the CMS's own display \
+                            record for this display (Administration -> \
+                            Displays).",
+                            self.settings.xmr_web_socket_address);
+            }
             if settings != self.settings {
                 self.settings = settings;
                 self.update_settings();
