@@ -3,7 +3,7 @@
 
 //! Internal webserver to point the webview to.
 
-use std::{sync::{Arc, Mutex}, fs, io::Read, io::Seek, thread, collections::HashMap};
+use std::{sync::{Arc, Mutex, OnceLock}, fs, io::Read, io::Seek, thread, collections::HashMap};
 use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use crossbeam_channel::Sender;
@@ -216,7 +216,7 @@ impl Server {
             "/branding.png" => Response::from_data(SPLASH_LOGO)
                 .with_header(Header::from_bytes(b"Content-Type", b"image/png").unwrap())
                 .boxed(),
-            "/0.xlf.html" => Response::from_data(SPLASH_HTML).boxed(),
+            "/0.xlf.html" => Response::from_data(splash_html()).boxed(),
 
             // Interactive Control duration overrides (see
             // xibo-interactive-control's setWidgetDuration/
@@ -358,15 +358,34 @@ impl Server {
     }
 }
 
-const SPLASH_HTML: &[u8] = br#"<!DOCTYPE html>
+// BUG fix / feature (found from a real request: knowing the totem's own
+// hostname/IP during initial setup, or while waiting for CMS
+// authorization, previously required a separate SSH session -- showing
+// it directly on the splash screen the totem is already displaying is
+// much more convenient). Computed once (OnceLock) and shared across
+// every `Server` instance (see `Server::new`'s own doc comment on why
+// several independent instances exist, for HTML sharding) -- this info
+// is extremely unlikely to change during a single run, so recomputing
+// it on every request would be pure waste.
+fn splash_html() -> &'static [u8] {
+    static SPLASH: OnceLock<Vec<u8>> = OnceLock::new();
+    SPLASH.get_or_init(|| {
+        let hostname = crate::util::get_display_name();
+        let ips = crate::util::get_local_ips();
+        let ips_display = if ips.is_empty() {
+            "(no network address found)".to_string()
+        } else {
+            ips.join(", ")
+        };
+        format!(r#"<!DOCTYPE html>
 <html>
 <head>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <script>
-new QWebChannel(qt.webChannelTransport, function(channel) {
+new QWebChannel(qt.webChannelTransport, function(channel) {{
   window.arexiboGui = channel.objects.arexibo;
   window.arexiboGui.jsLayoutInit(0, 1920, 1080);
-});
+}});
 </script>
 </head>
 <body style="margin: 0; width: 100vw; height: 100vh; background-color: #ffffff;
@@ -377,17 +396,23 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
 <!-- BUG fix (found from a real report): the *old* splash.jpg had its own
      "LOADING..." text baked directly into the image's own pixels --
      replacing that image with a different logo (see branding.png's own
-     doc comment in server.rs) silently lost that text along with it,
-     since it was never a separate, independent element to begin with.
-     A real HTML text element here stays readable regardless of
-     whatever logo image is configured, present or future. -->
+     doc comment below) silently lost that text along with it, since it
+     was never a separate, independent element to begin with. A real
+     HTML text element here stays readable regardless of whatever logo
+     image is configured, present or future. -->
 <div style="margin-top: 24px; font-family: sans-serif; font-size: 28px;
             font-weight: 600; color: #333333; letter-spacing: 0.05em;">
   LOADING...
 </div>
+<div style="margin-top: 12px; font-family: sans-serif; font-size: 16px;
+            color: #888888;">
+  {hostname} &middot; {ips_display}
+</div>
 </body>
 </html>
-"#;
+"#).into_bytes()
+    })
+}
 
 // Shown full-screen at startup, before the first collection completes
 // (see gui.rs/view.cpp's own "layout 0" handling) -- deliberately named
@@ -569,5 +594,55 @@ mod no_cache_header_tests {
         // wrapper as everything else, verified directly on the
         // successful-response case above.
         assert!(matches!(resp, Err(ureq::Error::StatusCode(404))));
+    }
+}
+
+#[cfg(test)]
+mod splash_html_tests {
+    use super::*;
+
+    #[test]
+    fn splash_html_includes_hostname_and_something_for_ips() {
+        // Feature test (found from a real request: showing the totem's
+        // own hostname/IP directly on the splash screen, useful during
+        // initial setup and while waiting for CMS authorization,
+        // instead of requiring a separate SSH session to check).
+        let html = String::from_utf8(splash_html().to_vec()).unwrap();
+        // The real hostname will vary by machine/CI environment, but it
+        // must appear verbatim somewhere in the output.
+        let hostname = crate::util::get_display_name();
+        assert!(html.contains(&hostname),
+                "splash HTML must include the machine's own hostname ({hostname:?}) -- got:\n{html}");
+        // Either a real IP list, or the graceful fallback message when
+        // none could be determined -- either way, *something* readable,
+        // never a raw empty string silently missing from the page.
+        assert!(html.contains("no network address found")
+                || crate::util::get_local_ips().iter().any(|ip| html.contains(ip)),
+                "splash HTML must include either a real IP or the \
+                 no-address-found fallback message -- got:\n{html}");
+        // Still valid, well-formed HTML with the existing loading text
+        // and QWebChannel setup -- this is an *addition*, not a
+        // replacement of the pre-existing splash content.
+        assert!(html.contains("LOADING..."));
+        assert!(html.contains("jsLayoutInit(0, 1920, 1080)"));
+    }
+
+    #[test]
+    fn splash_html_is_computed_once_and_cached() {
+        // The whole point of OnceLock here is to avoid recomputing
+        // (and re-shelling-out to `hostname -I`) on every single
+        // request -- confirm two calls return the exact same bytes
+        // (trivially true if it's genuinely cached; would only differ
+        // if something were regenerating it fresh each time, which
+        // would still normally produce the same content anyway unless
+        // network state changed mid-test, but the *real* guarantee
+        // here is architectural: get_or_init only ever runs its
+        // closure once per process).
+        let first = splash_html();
+        let second = splash_html();
+        assert_eq!(first, second);
+        assert!(std::ptr::eq(first, second),
+                "splash_html() must return the exact same cached buffer \
+                 on repeated calls, not recompute it each time");
     }
 }

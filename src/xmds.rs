@@ -113,8 +113,32 @@ impl Cms {
                 }
             }
             // only try websocket if the CMS lets us use it
+            //
+            // Manual override (found from a real report: the CMS
+            // consistently wiped a manually-fixed WebSocket address on
+            // *every single* successful registration against a CMS
+            // 4.5.0 -- not a rare, transient hiccup as originally
+            // assumed in section 64's own fix/warning, but a
+            // reproducible pattern, reinforcing that the CMS's own
+            // isWebSocketXmrSupported() check (lib/Xmds/Soap5.php) is
+            // unreliable in practice for at least some real
+            // deployments on this CMS version -- consistent with it
+            // being a brand-new, narrowly-tested feature (merged March
+            // 2026, per the CMS's own PR history). Since we can't fix
+            // the CMS's own check from here, this gives an affected
+            // deployment a way to simply stop trusting it: if set, this
+            // always wins, regardless of what the CMS's xmrType says on
+            // any given registration -- the CMS can no longer silently
+            // wipe an address the operator has confirmed works.
+            let forced_ws = std::env::var("AREXIBO_FORCE_WS_ADDRESS").ok()
+                                      .filter(|s| !s.is_empty());
             let xmr_type: String = tree.def_child("xmrType", "zmq")?;
-            let xmr_web_socket_address = if &xmr_type == "ws" {
+            let xmr_web_socket_address = if let Some(forced) = forced_ws {
+                log::info!("using AREXIBO_FORCE_WS_ADDRESS override for XMR WebSocket \
+                            address, ignoring the CMS's own xmrType/xmrWebSocketAddress \
+                            for this registration");
+                forced
+            } else if &xmr_type == "ws" {
                 tree.def_child("xmrWebSocketAddress", "")?
             } else { String::new() };
 
@@ -456,3 +480,119 @@ pub struct Status<'s> {
 
 
 
+#[cfg(test)]
+mod force_ws_address_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    // Serializes access to the env var across tests in this module --
+    // std::env::set_var affects the whole process, and cargo test runs
+    // tests in parallel by default, so two tests touching this var at
+    // once could otherwise interfere with each other.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Minimal mock XMDS server, returning a controllable
+    /// RegisterDisplay response -- verified against the real generated
+    /// SOAP response parser (target/.../out/xmds_soap.rs), same
+    /// approach as mainloop.rs's own pending_auth_tests.
+    fn start_mock(xmr_type: &str, xmr_ws_address: &str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let activation = format!(
+            r#"<ActivationMessage code="READY"><xmrType>{xmr_type}</xmrType><xmrWebSocketAddress>{xmr_ws_address}</xmrWebSocketAddress></ActivationMessage>"#);
+        let escaped = activation.replace('&', "&amp;").replace('<', "&lt;")
+                                 .replace('>', "&gt;").replace('"', "&quot;");
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_force_ws_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn cms_reported_zmq_normally_clears_the_ws_address() {
+        // Baseline, confirming the existing (section 59/64) behavior
+        // is unaffected when no override is set: xmrType != "ws" means
+        // an empty WebSocket address, exactly as before.
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
+        let port = start_mock("zmq", "ws://192.168.2.10:8080");
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert_eq!(settings.xmr_web_socket_address, "",
+                   "must be empty when the CMS reports xmrType=zmq, matching existing behavior");
+    }
+
+    #[test]
+    fn force_override_wins_even_when_cms_reports_zmq() {
+        // The actual feature: a real report showed the CMS
+        // inconsistently/consistently reporting xmrType=zmq (wiping a
+        // manually-fixed WebSocket address on every single
+        // registration) -- this override must make the address stick
+        // regardless of what the CMS says on any given call.
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("AREXIBO_FORCE_WS_ADDRESS", "ws://forced.example:9999");
+        let port = start_mock("zmq", "ws://192.168.2.10:8080");
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
+        assert_eq!(settings.xmr_web_socket_address, "ws://forced.example:9999",
+                   "the override must win, ignoring the CMS's own xmrType=zmq entirely");
+    }
+
+    #[test]
+    fn force_override_also_wins_when_cms_reports_ws() {
+        // Even when the CMS *does* correctly report "ws" with some
+        // address, an explicit override should still take precedence
+        // -- consistent, predictable behavior regardless of what the
+        // CMS happens to say on any given call, not just when it's
+        // "wrong".
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("AREXIBO_FORCE_WS_ADDRESS", "ws://forced.example:9999");
+        let port = start_mock("ws", "ws://192.168.2.10:8080");
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
+        assert_eq!(settings.xmr_web_socket_address, "ws://forced.example:9999");
+    }
+
+    #[test]
+    fn empty_override_value_is_treated_as_unset() {
+        // AREXIBO_FORCE_WS_ADDRESS="" (set but empty -- e.g. from a
+        // shell script that exports an unfilled variable) must behave
+        // exactly as if it were never set at all, not as "force an
+        // empty address" (which would be indistinguishable from the
+        // CMS's own zmq case, but for a confusingly different reason).
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("AREXIBO_FORCE_WS_ADDRESS", "");
+        let port = start_mock("ws", "ws://192.168.2.10:8080");
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
+        assert_eq!(settings.xmr_web_socket_address, "ws://192.168.2.10:8080",
+                   "an empty override value must fall through to the CMS's own reported address");
+    }
+}

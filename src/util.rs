@@ -163,6 +163,27 @@ pub fn get_display_name() -> String {
                       .unwrap_or_else(|| "Arexibo Display".into())
 }
 
+/// Get this machine's non-loopback IPv4/IPv6 addresses, for display on
+/// the splash screen (found genuinely useful during initial totem
+/// setup: knowing the machine's own IP without needing to SSH in
+/// separately to check, especially while waiting for CMS authorization
+/// -- see mainloop.rs's own retry-while-showing-splash logic).
+/// Shells out to `hostname -I` rather than reimplementing interface
+/// enumeration natively -- `hostname` is part of Ubuntu Server's base
+/// install (essential, always present), and this is purely for display,
+/// not anything safety/correctness-critical, so a missing/failing
+/// command just means an empty result (handled gracefully by the
+/// caller), not a hard failure.
+pub fn get_local_ips() -> Vec<String> {
+    std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
+}
+
 
 const SS_SVC: &str   = "org.freedesktop.ScreenSaver";
 const SS_PATH: &str  = "/ScreenSaver";

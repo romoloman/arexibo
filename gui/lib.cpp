@@ -31,7 +31,22 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
     // through the Chromium command-line flag instead. Must be set via
     // env var before QApplication/QtWebEngine initializes below --
     // setting it later (e.g. as a runtime attribute) has no effect.
+    //
+    // BUG fix (found while writing the deployment guide, considering
+    // suggesting QTWEBENGINE_CHROMIUM_FLAGS=--use-gl=disabled as a
+    // workaround for a real GPU rendering quirk seen in testing --
+    // realized that advice wouldn't actually work): this used to
+    // qputenv() our own flags unconditionally, silently discarding any
+    // value already set externally (e.g. via a systemd unit's own
+    // Environment= line, exactly what a deployment guide would
+    // reasonably suggest for troubleshooting). Now appends to whatever
+    // is already present instead, so an externally-set value and our
+    // own required flags can coexist.
     QByteArray chromium_flags = "--disable-pinch";
+    QByteArray existing_flags = qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
+    if (!existing_flags.isEmpty()) {
+        chromium_flags = existing_flags + " " + chromium_flags;
+    }
     if (debug)
         chromium_flags += " --single-process --enable-logging --log-level=0 --v=1";
     qputenv("QTWEBENGINE_CHROMIUM_FLAGS", chromium_flags);

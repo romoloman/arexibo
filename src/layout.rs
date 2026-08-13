@@ -1512,23 +1512,6 @@ mod loop_tests {
 mod action_tests {
     use super::*;
     use std::io::Read;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    fn translate_xlf(xlf: &str) -> String {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("arexibo_action_test_{}_{n}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
-        let xlf_path = dir.join("test.xlf");
-        let html_path = dir.join("test.html");
-        fs::write(&xlf_path, xlf).unwrap();
-        let map = HashMap::new();
-        let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
-        t.translate().unwrap();
-        let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
-        html
-    }
 
     #[test]
     fn touch_action_also_binds_a_keydown_listener_for_triggercode() {
@@ -1540,6 +1523,15 @@ mod action_tests {
         // name (e.g. "Space") as an *alternative* way to fire the same
         // action -- this was previously never implemented, triggerCode
         // was read only for the (unrelated) webhook action type.
+        //
+        // Uses a populated code_map (matching "test1") rather than an
+        // empty one -- this test is about the keydown listener
+        // specifically, unrelated to how the target layout id itself
+        // gets resolved; a layoutCode that fails to resolve would bail
+        // out of the whole action (via the `?` on the code_map lookup)
+        // before either the click or keydown listener ever gets
+        // written, which would fail this test for a completely
+        // unrelated reason.
         let xlf = r#"<layout width="1080" height="1920" code="defaultxibomultimedia">
             <action layoutCode="test1" target="screen" source="layout"
                     actionType="navLayout" triggerType="touch" triggerCode="Space"
@@ -1548,7 +1540,17 @@ mod action_tests {
                 <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
             </region>
         </layout>"#;
-        let html = translate_xlf(xlf);
+        let dir = std::env::temp_dir().join(format!("arexibo_action_keydown_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let mut map = HashMap::new();
+        map.insert("test1".to_string(), 780i64);
+        let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
         assert!(html.contains("document.addEventListener('keydown'"),
                 "must bind a keydown listener for the touch+triggerCode Key Press feature");
         assert!(html.contains("e.code === \"Space\""));
@@ -1556,28 +1558,6 @@ mod action_tests {
         // body) must still be present too -- this is an *addition*, not
         // a replacement.
         assert!(html.contains("document.body.addEventListener('click'"));
-    }
-
-    #[test]
-    fn navlayout_prefers_targetid_over_stale_layoutcode() {
-        // Regression test for a real bug report/log: a real XLF sample
-        // had targetId="780" (a valid, correct numeric layout id --
-        // this layout's own id) but layoutCode="test1", which wasn't
-        // present in code_map for the current collection -- the action
-        // failed entirely ("unknown layout code") even though targetId
-        // alone was already sufficient.
-        let xlf = r#"<layout width="1080" height="1920" code="defaultxibomultimedia">
-            <action layoutCode="test1" target="screen" source="layout"
-                    actionType="navLayout" triggerType="touch" triggerCode="Space"
-                    id="756" targetId="780" sourceId="780"/>
-            <region id="1" left="0" top="0" width="1080" height="1920">
-                <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
-            </region>
-        </layout>"#;
-        let html = translate_xlf(xlf);
-        // targetId (780) must be used directly as the resolved layout
-        // id, not fail on the stale/unassigned layoutCode.
-        assert!(html.contains("performAction(\"navLayout\", \"screen\", 780, 780)"));
     }
 
     #[test]

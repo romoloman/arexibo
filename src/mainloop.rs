@@ -139,6 +139,24 @@ pub struct Handler {
     cms: CmsSettings,
     no_verify: bool,
     xmr_retry_key: Option<RsaPrivateKey>,
+    /// Feature (found from a real request: on first setup, or while
+    /// waiting for the CMS operator to authorize a new display, the
+    /// player used to just exit (a distinct exit code, 2, so a systemd
+    /// unit's own `Restart=` could patiently keep relaunching it -- but
+    /// nothing was ever visible on screen in the meantime, and every
+    /// relaunch redid the same setup from scratch). Now: `Handler::new`
+    /// constructs a Handler in this pending state instead of erroring
+    /// out -- with default (empty) settings/schedule, which naturally
+    /// means layout 0 (the splash screen, now showing this machine's
+    /// own hostname/IP -- see server.rs's `splash_html`) stays up, with
+    /// no real content to switch away to. `collect_once` retries
+    /// registration on every collection cycle exactly as it already did
+    /// for the "was authorized, lost it" case -- the only different
+    /// treatment `pending_auth` gives this state is a faster retry
+    /// interval (see `PENDING_AUTH_RETRY_INTERVAL`) and a clearer,
+    /// less alarming log message than "not authorized *anymore*" for
+    /// what's actually "not authorized *yet*".
+    pending_auth: bool,
     /// Timer that fires when the currently-shown overlay (whichever
     /// source -- see below) should be hidden/advanced. Moved here (was
     /// previously a local variable in `run()`) because `schedule_check()`
@@ -200,6 +218,11 @@ pub struct Handler {
 /// genuinely, permanently broken.
 const RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(20);
 const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
+/// See `Handler::pending_auth`'s own doc comment. 30s strikes a balance
+/// between responsiveness (someone actively watching for the display
+/// to come online after approving it) and not hammering the CMS with
+/// requests while genuinely just waiting.
+const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Handler {
     /// Create a new handler, with channels to the GUI thread.
@@ -250,7 +273,7 @@ impl Handler {
         };
 
         // if we got settings, we are registered and authorized
-        if let Some(settings) = res {
+        if let Some(mut settings) = res {
             // BUG fix (found from a real, well-documented upstream
             // report -- github.com/birkenfeld/arexibo/issues/33,
             // confirmed by multiple independent users): `--allow-offline`
@@ -299,34 +322,35 @@ impl Handler {
             // xmr_web_socket_address to an EMPTY string whenever
             // xmrType isn't exactly "ws", discarding whatever
             // xmrWebSocketAddress value the CMS might have also sent.
-            // If isWebSocketXmrSupported() ever returns false just
-            // *once* for what should be a normally-WebSocket-capable
-            // display (e.g. a transient CMS-side state/timing issue --
-            // exactly the kind of once-off external condition we can't
-            // fully diagnose or prevent from here), this silently and
-            // *permanently* overwrites a previously-good cached
-            // WebSocket address with an empty one, since we always
-            // write the freshest registration straight to disk with no
-            // comparison against what was there before. Rather than
-            // guessing whether an empty address is an intentional CMS
-            // reconfiguration (legitimate) or a transient hiccup (not),
-            // this can't safely be auto-corrected -- but it can, and
-            // should, be made loudly visible instead of failing silently.
+            //
+            // POLICY (revised after a follow-up GitHub report showed
+            // this happening *systematically*, not just as a rare
+            // transient hiccup as originally assumed): rather than
+            // trusting every single registration's address at face
+            // value, treat a previously-known-good address as sticky --
+            // a *new*, non-empty address from the CMS always replaces
+            // it (a genuine address change must still take effect), but
+            // an empty one no longer clears it. The CMS's own
+            // WebSocket-eligibility check has turned out to be
+            // unreliable often enough in practice that trusting its
+            // "no" answers as much as its "yes" answers was actively
+            // counterproductive -- and there is essentially never a
+            // legitimate reason to *not* have advertised the address at
+            // all if a previous registration genuinely had one working.
+            // `AREXIBO_FORCE_WS_ADDRESS` (see xmds.rs) remains available
+            // for pinning the address even against a *future* address
+            // change, for anyone who wants that stronger guarantee.
             if let Ok(prev) = PlayerSettings::from_file(&setting_file) {
                 if !prev.xmr_web_socket_address.is_empty()
-                    && settings.xmr_web_socket_address.is_empty() {
-                    log::warn!("XMR WebSocket address just disappeared: was \
-                                {:?} in the cached settings, but this \
-                                registration came back empty (CMS reported \
-                                xmrType != \"ws\" this time) -- falling back \
-                                to ZMQ. If this display should have WebSocket \
-                                XMR, check the CMS's own display record for \
-                                this display (Administration -> Displays) -- \
-                                this can happen if the CMS's \
-                                isWebSocketXmrSupported() check didn't \
-                                recognize this display as WebSocket-capable \
-                                on this specific registration.",
-                                prev.xmr_web_socket_address);
+                    && !ws_address_has_port(&settings.xmr_web_socket_address) {
+                    log::warn!("XMR WebSocket address from this registration is \
+                                either empty or missing an explicit port ({:?}) -- \
+                                keeping the previously-known-good address {:?} \
+                                instead. If this display should genuinely no \
+                                longer use WebSocket XMR, clear it explicitly \
+                                (e.g. --clear, or edit settings.json).",
+                                settings.xmr_web_socket_address, prev.xmr_web_socket_address);
+                    settings.xmr_web_socket_address = prev.xmr_web_socket_address;
                 }
             }
             settings.to_file(&setting_file).context("writing player settings")?;
@@ -344,12 +368,46 @@ impl Handler {
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
                                  resource_retry_timer: never(),
+                                 pending_auth: false,
                                  debug_override, xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
         } else {
-            Err(NotAuthorized.into())
+            // Feature (see `pending_auth`'s own doc comment on the
+            // struct): construct a Handler in the pending-authorization
+            // state instead of erroring out. Everything here is a
+            // placeholder default -- there is genuinely no real
+            // configuration to use yet, since the CMS hasn't approved
+            // this display. `xmr_retry_key: Some(privkey)` deliberately
+            // reuses the *existing* --allow-offline retry mechanism in
+            // `collect_once` (originally built for "network came back,
+            // try starting XMR now") for exactly the same purpose here
+            // ("just got authorized, try starting XMR now") -- no need
+            // for a second, separate mechanism to do the same job.
+            log::warn!("display is registered but not yet authorized in the CMS -- \
+                        showing the splash screen and retrying periodically \
+                        (see this machine's own hostname/IP on screen to help \
+                        find/approve it in Administration -> Displays)");
+            let mut slf = Self { to_gui, from_gui, settings: PlayerSettings::default(),
+                                 cache, xmds, xmr: never(), schedule: Schedule::default(),
+                                 layouts: vec![], envdir: envdir.into(), current_layout: 0,
+                                 override_layout: None, overlay_layout: None,
+                                 stats: StatCollector::default(),
+                                 faults: faults::FaultCollector::default(),
+                                 layout_playing_since: None,
+                                 criteria: CriteriaStore::default(),
+                                 shell_process: None, last_command_success: None,
+                                 duration_rx, overlay_expiry: never(),
+                                 schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
+                                 resource_retry_queue: Vec::new(),
+                                 dataupdate_retry_queue: Vec::new(),
+                                 resource_retry_timer: never(),
+                                 pending_auth: true,
+                                 debug_override, xmr_retry_key: Some(privkey),
+                                 cms: cms.clone(), no_verify };
+            slf.update_settings();
+            Ok(slf)
         }
     }
 
@@ -387,7 +445,17 @@ impl Handler {
                     if let Err(e) = self.collect_once() {
                         log::error!("during collect: {e:#}");
                     }
-                    collect = after(Duration::from_secs(self.settings.collect_interval));
+                    // While waiting for CMS authorization, retry much
+                    // sooner than the normal collect_interval (which
+                    // defaults to 900s/15min -- a long wait for someone
+                    // actively trying to approve a freshly-set-up
+                    // display and watching for it to come online).
+                    let interval = if self.pending_auth {
+                        PENDING_AUTH_RETRY_INTERVAL
+                    } else {
+                        Duration::from_secs(self.settings.collect_interval)
+                    };
+                    collect = after(interval);
                 },
                 // timer channel that fires when screenshot is needed
                 recv(screenshot) -> _ => {
@@ -746,29 +814,56 @@ impl Handler {
         log::info!("doing collection");
 
         // call register to get updated player settings
-        if let Some(settings) = self.xmds.register_display()? {
+        if let Some(mut settings) = self.xmds.register_display()? {
             // See the matching check + doc comment in `Handler::new`
-            // (section 63/64's own fix) -- same issue, but here it's
-            // the *in-memory* settings used for the XMR retry attempt
-            // right below that would silently end up with an empty
-            // WebSocket address, rather than the on-disk settings.json
-            // (which only gets written at startup, not on every
-            // ongoing collection cycle).
+            // (section 63/64/69's own fix, policy revised after a
+            // follow-up report showed this happening systematically) --
+            // same sticky-address policy, but here it's the *in-memory*
+            // settings used for the XMR retry attempt right below,
+            // rather than the on-disk settings.json (which only gets
+            // written at startup, not on every ongoing collection
+            // cycle).
             if !self.settings.xmr_web_socket_address.is_empty()
-                && settings.xmr_web_socket_address.is_empty() {
-                log::warn!("XMR WebSocket address just disappeared: was {:?}, \
-                            but this registration came back empty (CMS \
-                            reported xmrType != \"ws\" this time) -- falling \
-                            back to ZMQ. If this display should have \
-                            WebSocket XMR, check the CMS's own display \
-                            record for this display (Administration -> \
-                            Displays).",
-                            self.settings.xmr_web_socket_address);
+                && !ws_address_has_port(&settings.xmr_web_socket_address) {
+                log::warn!("XMR WebSocket address from this registration is \
+                            either empty or missing an explicit port ({:?}) -- \
+                            keeping the previously-known-good address {:?} \
+                            instead. If this display should genuinely no \
+                            longer use WebSocket XMR, clear it explicitly \
+                            (e.g. --clear, or edit settings.json).",
+                            settings.xmr_web_socket_address, self.settings.xmr_web_socket_address);
+                settings.xmr_web_socket_address = self.settings.xmr_web_socket_address.clone();
             }
             if settings != self.settings {
                 self.settings = settings;
                 self.update_settings();
             }
+            if self.pending_auth {
+                // Just got authorized -- this is the first real
+                // registration this Handler has ever seen (constructed
+                // in the pending state, see `Handler::new`'s own doc
+                // comment), so persist it now exactly as a normal
+                // startup registration would have (that write only
+                // happens once, at the point of first successful
+                // registration -- this *is* that point, just reached
+                // via a later collection cycle instead of `new` itself).
+                log::info!("display just got authorized in the CMS, proceeding \
+                            with normal operation");
+                self.pending_auth = false;
+                if let Err(e) = self.settings.to_file(&self.envdir.join("settings.json")) {
+                    log::warn!("writing player settings after authorization: {e:#}");
+                }
+            }
+        } else if self.pending_auth {
+            // Not an error -- still simply not authorized *yet*, exactly
+            // the state this Handler was constructed in. Nothing to
+            // collect (no real settings/schedule exist), so return early
+            // rather than plowing ahead into required_files()/etc. below
+            // with placeholder defaults that would only produce
+            // confusing, unrelated errors of their own.
+            log::info!("still waiting for authorization in the CMS, will check \
+                        again shortly");
+            return Ok(());
         } else {
             bail!("display is not authorized anymore");
         }
@@ -1223,6 +1318,62 @@ fn is_command_allowed(allow_list: &str, code: &str) -> bool {
     allow_list.split(',').map(str::trim).any(|entry| entry == code)
 }
 
+/// Whether a candidate XMR WebSocket address is actually usable to
+/// justify replacing a previously-known-good one -- specifically,
+/// whether it has an explicit port, not just whether the string is
+/// non-empty.
+///
+/// BUG fix (found from a direct correction of an earlier version of
+/// this sticky-address policy, section 70): checking only
+/// `.is_empty()` missed a real case the CMS can produce -- a non-empty
+/// address string *without* a port at all (e.g. "ws://192.168.2.10",
+/// the exact malformed address from section 62's own bug report). An
+/// address like that would have passed the old "non-empty, so it must
+/// be a genuine update" check, silently replacing a good
+/// "ws://192.168.2.10:8080" with a strictly worse, port-less version --
+/// exactly the kind of silent regression this whole sticky policy was
+/// meant to prevent in the first place, just for a different field
+/// within the same string. An address without an explicit port is
+/// never a legitimate replacement candidate, regardless of whether the
+/// string is otherwise non-empty.
+fn ws_address_has_port(addr: &str) -> bool {
+    if addr.is_empty() {
+        return false;
+    }
+    tungstenite::http::uri::Uri::try_from(addr)
+        .map(|uri| uri.port_u16().is_some())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod ws_address_has_port_tests {
+    use super::ws_address_has_port;
+
+    #[test]
+    fn empty_string_has_no_port() {
+        assert!(!ws_address_has_port(""));
+    }
+
+    #[test]
+    fn address_with_explicit_port_has_a_port() {
+        assert!(ws_address_has_port("ws://192.168.2.10:8080"));
+        assert!(ws_address_has_port("wss://example.com:443"));
+    }
+
+    #[test]
+    fn address_without_a_port_has_no_port() {
+        // The exact real, malformed address from section 62's own bug
+        // report -- confirming this is precisely the case that must be
+        // rejected here, not just an empty string.
+        assert!(!ws_address_has_port("ws://192.168.2.10"));
+    }
+
+    #[test]
+    fn unparseable_garbage_has_no_port() {
+        assert!(!ws_address_has_port("not a valid uri at all"));
+    }
+}
+
 #[cfg(test)]
 mod command_allow_list_tests {
     use super::is_command_allowed;
@@ -1246,5 +1397,319 @@ mod command_allow_list_tests {
     #[test]
     fn whitespace_around_entries_is_ignored() {
         assert!(is_command_allowed("  reboot  ,  shutdown  ", "shutdown"));
+    }
+}
+
+#[cfg(test)]
+mod pending_auth_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Minimal mock XMDS server: responds to every request with a
+    /// canned RegisterDisplay SOAP response, "not yet authorized" for
+    /// the first `not_ready_count` calls, then "READY" (with a mostly-
+    /// empty but validly-parseable settings payload) afterwards --
+    /// faithfully exercising the *real* SOAP response format (found by
+    /// inspecting the actual generated parser in
+    /// target/.../out/xmds_soap.rs), not a shortcut that bypasses the
+    /// real registration/parsing code path this feature depends on.
+    struct MockCms {
+        port: u16,
+        calls: std::sync::Arc<AtomicU32>,
+    }
+
+    impl MockCms {
+        fn start(not_ready_count: u32) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            let calls = std::sync::Arc::new(AtomicU32::new(0));
+            let calls_clone = calls.clone();
+            std::thread::spawn(move || {
+                for request in server.incoming_requests() {
+                    let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+                    let activation = if n < not_ready_count {
+                        r#"<ActivationMessage code="WAITING"/>"#.to_string()
+                    } else {
+                        // Deliberately minimal -- every field beyond
+                        // `code="READY"` has a graceful fallback default
+                        // (see section 59's own fixes), so this alone
+                        // must be enough to parse successfully.
+                        r#"<ActivationMessage code="READY"/>"#.to_string()
+                    };
+                    // The outer envelope's ActivationMessage element
+                    // carries the inner XML as escaped *text* (matching
+                    // the real protocol -- confirmed via the generated
+                    // parser calling `.text()`, not re-parsing a nested
+                    // element tree directly).
+                    let escaped = activation.replace('&', "&amp;").replace('<', "&lt;")
+                                             .replace('>', "&gt;").replace('"', "&quot;");
+                    let body = format!(
+                        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                    let _ = request.respond(tiny_http::Response::from_string(body));
+                }
+            });
+            Self { port, calls }
+        }
+
+        fn call_count(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_pending_auth_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn not_yet_authorized_constructs_pending_handler_instead_of_erroring() {
+        // Feature test for the change requested directly: instead of
+        // exiting (the old NotAuthorized error), a not-yet-authorized
+        // display must now construct successfully, in a clearly-marked
+        // pending state.
+        let mock = MockCms::start(u32::MAX);  // never becomes READY
+        let cms = test_cms_settings(mock.port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                    togui_tx, fromgui_rx, duration_rx)
+            .expect("must construct successfully, not error out, while pending authorization");
+        assert!(handler.pending_auth, "must be marked as pending authorization");
+        assert_eq!(handler.player_settings(), PlayerSettings::default(),
+                   "settings must be the placeholder default while pending");
+    }
+
+    #[test]
+    fn collect_once_transitions_out_of_pending_once_authorized() {
+        // The core end-to-end flow: starts pending, one collection
+        // cycle while still not authorized (no-op, stays pending), then
+        // a later cycle where the CMS finally says READY -- must
+        // transition cleanly, exactly like a real deployment being
+        // approved in Administration -> Displays while already running.
+        let mock = MockCms::start(2);  // READY starting from the 3rd call
+        let cms = test_cms_settings(mock.port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        // Call 1 (inside Handler::new itself).
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx)
+            .expect("must construct successfully while pending");
+        assert!(handler.pending_auth);
+        assert_eq!(mock.call_count(), 1);
+
+        // Call 2: still not ready -- must stay pending, and must NOT
+        // error (collect_once returning Err here would get logged by
+        // run()'s own select! loop as a scary "during collect: ..."
+        // error on every single retry, which is exactly the noisy
+        // behavior this whole feature is meant to avoid).
+        handler.collect_once().expect("must not error while still pending, just retry quietly");
+        assert!(handler.pending_auth, "must still be pending after the 2nd (still-not-ready) call");
+        assert_eq!(mock.call_count(), 2);
+
+        // Call 3: CMS now says READY -- must transition out of pending.
+        // (collect_once will likely error further down, on
+        // required_files()/etc., since the mock only implements
+        // RegisterDisplay, and that same call also hits this mock again
+        // -- that's fine and expected, this test only cares about the
+        // pending_auth transition itself, which happens *before* that
+        // point in the function.)
+        let _ = handler.collect_once();
+        assert!(!handler.pending_auth,
+                "must have transitioned out of pending authorization once the CMS said READY");
+    }
+}
+
+#[cfg(test)]
+mod sticky_ws_address_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Mock XMDS server returning a controllable sequence of WebSocket
+    /// addresses across successive calls -- call N (0-indexed) returns
+    /// `responses[N]` (clamped to the last entry once past the end).
+    /// Same real-response-format approach as the other mock servers in
+    /// this file (verified against the actual generated SOAP parser).
+    fn start_mock(responses: Vec<(&'static str, &'static str)>) -> (u16, std::sync::Arc<AtomicU32>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let calls = std::sync::Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let n = calls_clone.fetch_add(1, Ordering::SeqCst) as usize;
+                if n >= responses.len() {
+                    // Any call beyond RegisterDisplay (RequiredFiles,
+                    // Schedule, etc., which this mock doesn't implement)
+                    // gets a quick, definitive HTTP error instead of a
+                    // malformed 200 OK body -- found genuinely necessary:
+                    // returning a RegisterDisplayResponse-shaped body for
+                    // a call expecting a *different* response type was
+                    // triggering some slow path (500 (os error 111)... several
+                    // *minutes* per test) rather than failing fast, making
+                    // the whole test suite painfully slow to iterate on.
+                    let _ = request.respond(tiny_http::Response::from_string("error")
+                        .with_status_code(500));
+                    continue;
+                }
+                let (xmr_type, ws_addr) = responses[n];
+                let activation = format!(
+                    r#"<ActivationMessage code="READY"><xmrType>{xmr_type}</xmrType><xmrWebSocketAddress>{ws_addr}</xmrWebSocketAddress></ActivationMessage>"#);
+                let escaped = activation.replace('&', "&amp;").replace('<', "&lt;")
+                                         .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        (port, calls)
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_sticky_ws_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_previously_good_address_survives_a_later_empty_response() {
+        // The actual policy requested directly: registration 1 gets a
+        // real WebSocket address (xmrType=ws); registration 2 comes
+        // back empty (xmrType=zmq, matching the real, reproducible CMS
+        // 4.5.0 behavior reported on GitHub) -- the address must NOT
+        // be cleared, it must stick.
+        let (port, _calls) = start_mock(vec![
+            ("ws", "ws://127.0.0.1:1"),
+            ("zmq", ""),
+        ]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        // Call 1 (inside Handler::new): gets the real address.
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1");
+
+        // Call 2 (collect_once): CMS now says zmq/empty -- must NOT
+        // clear the address, must keep the one from call 1.
+        let _ = handler.collect_once();
+        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1",
+                   "a previously-good WebSocket address must survive a later empty response, not get cleared");
+    }
+
+    #[test]
+    fn a_genuinely_different_address_still_replaces_the_old_one() {
+        // The other half of the policy: sticky does NOT mean frozen
+        // forever -- a real, different, non-empty address from a later
+        // registration must still take effect (e.g. the CMS's XMR
+        // infrastructure genuinely moved to a new address).
+        let (port, _calls) = start_mock(vec![
+            ("ws", "ws://127.0.0.1:1"),
+            ("ws", "ws://127.0.0.1:2"),
+        ]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1");
+
+        let _ = handler.collect_once();
+        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:2",
+                   "a genuinely different, non-empty address from the CMS must still replace the old one");
+    }
+
+    #[test]
+    fn an_address_that_was_never_set_stays_empty_when_cms_says_zmq() {
+        // Sanity check: sticky-preservation must not manufacture an
+        // address out of nowhere -- if there was never a good address
+        // to begin with (a normal zmq-only display), staying empty is
+        // correct, not a bug.
+        let (port, _calls) = start_mock(vec![
+            ("zmq", ""),
+            ("zmq", ""),
+        ]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert_eq!(handler.settings.xmr_web_socket_address, "");
+
+        let _ = handler.collect_once();
+        assert_eq!(handler.settings.xmr_web_socket_address, "");
+    }
+
+    #[test]
+    fn a_non_empty_address_missing_its_port_does_not_replace_a_good_one() {
+        // The exact case pointed out directly: a response can be
+        // non-empty (xmrType="ws", so it would have passed the
+        // earlier, too-loose ".is_empty()" check) while still being
+        // useless -- the address itself is missing its port (matching
+        // section 62's own real bug report: the CMS's "XMR WebSocket
+        // Address" setting missing ":8080"). This must NOT be accepted
+        // as a "genuinely different, valid" replacement -- it must be
+        // rejected exactly like an empty response would be, keeping
+        // the previously-known-good, *complete* address instead.
+        let (port, _calls) = start_mock(vec![
+            ("ws", "ws://127.0.0.1:1"),
+            ("ws", "ws://127.0.0.1"),  // same host, but no port at all
+        ]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1");
+
+        let _ = handler.collect_once();
+        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1",
+                   "a non-empty but port-less address must not replace a good, complete one");
     }
 }

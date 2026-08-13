@@ -82,7 +82,19 @@ fn main() {
     log::set_logger(&logger::Logger).expect("failed to set logger");
     log::set_max_level(log::LevelFilter::Debug);
     if let Err(e) = main_inner() {
-        // Exit code 2: display not authorized yet (transient, keep retrying)
+        // Exit code 2: display not authorized yet.
+        //
+        // NOTE: as of the pending-authorization feature (see
+        // mainloop.rs's `Handler::pending_auth`), this specific error
+        // no longer occurs during normal operation -- an unauthorized
+        // display now stays running, showing the splash screen with
+        // this machine's own hostname/IP, and retries registration
+        // periodically on its own, rather than exiting for systemd's
+        // `Restart=` to relaunch it from scratch every time. This check
+        // is kept as a defensive fallback (harmless if never triggered)
+        // rather than removed outright, in case `NotAuthorized` is ever
+        // raised again for some other reason in the future.
+        //
         // Exit code 1: actual error (bad config, CMS unreachable, etc.)
         if e.root_cause().downcast_ref::<mainloop::NotAuthorized>().is_some() {
             log::warn!("{:#}", e);
