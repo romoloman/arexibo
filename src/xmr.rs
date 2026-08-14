@@ -128,7 +128,12 @@ impl WsConnector {
                         connections will fail with a confusing TCP-level error \
                         rather than an obviously-XMR-related one.");
         }
-        let socket = TcpStream::connect((host, port))
+        // BUG fix (found from a real, frequently-occurring report:
+        // "IO error: Interrupted system call (os error 4)" during
+        // connect, forcing an unnecessary 10s reconnect cycle) -- see
+        // `connect_retrying_eintr`'s own doc comment for the full
+        // explanation.
+        let socket = connect_retrying_eintr((host, port))
             .context("connecting XMR WebSocket TCP stream")?;
         socket.set_read_timeout(Some(READ_TMO))?;
         let stream = match uri.scheme_str() {
@@ -149,7 +154,7 @@ impl WsConnector {
         let init_msg = format!(
             "{{\"type\":\"init\",\"channel\":\"{}\",\"key\":\"{}\"}}",
             channel, cms_key);
-        socket.send(tungstenite::Message::text(init_msg))
+        retry_ws_on_eintr(|| socket.send(tungstenite::Message::text(init_msg.clone())))
               .context("sending XMR WebSocket init message")?;
         Ok(socket)
     }
@@ -174,7 +179,17 @@ impl WsConnector {
     }
 
     fn process_msg(&mut self) -> Result<()> {
-        let msg = self.socket.read()?;
+        // BUG fix (found from a real, still-recurring report after the
+        // earlier connect()-specific fix: the exact same "Interrupted
+        // system call (os error 4)" still showed up, just from a
+        // *different* syscall this time -- confirmed by the log's own
+        // "handling XMR message:" prefix, unique to *this* function,
+        // not the connection setup). tungstenite's own `read()` can
+        // likewise surface a raw `Error::Io` wrapping
+        // `ErrorKind::Interrupted` if the underlying socket read syscall
+        // gets hit by a signal at the wrong moment -- see
+        // `retry_ws_on_eintr`'s own doc comment.
+        let msg = retry_ws_on_eintr(|| self.socket.read())?;
         // BUG fix (found from a real report: XMR WebSocket connection
         // closing almost immediately after connecting, newly appearing
         // after a CMS 4.5 upgrade -- CONFIRMED via xibo-xmr's own real
@@ -194,7 +209,7 @@ impl WsConnector {
         // removes any ambiguity about timing, regardless of whether
         // this exact mechanism turns out to be the full explanation.
         if msg.is_ping() {
-            self.socket.send(tungstenite::Message::Pong(msg.into_data()))
+            retry_ws_on_eintr(|| self.socket.send(tungstenite::Message::Pong(msg.clone().into_data())))
                 .context("sending XMR WebSocket pong reply")?;
             return Ok(());
         }
@@ -407,6 +422,69 @@ fn decrypt_private_key(enc_key: &[u8], private_key: &RsaPrivateKey) -> Result<Ve
     Ok(dec_data)
 }
 
+/// Retry an IO operation transparently if it fails specifically with
+/// `ErrorKind::Interrupted` (EINTR -- interrupted by a signal), rather
+/// than propagating that as a genuine failure. See
+/// `connect_retrying_eintr`'s own doc comment for the full context of
+/// why this is needed.
+fn retry_on_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                log::debug!("IO operation interrupted by a signal (EINTR), retrying immediately");
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Connect a TCP stream, transparently retrying if the connect syscall
+/// itself is interrupted by a signal (EINTR) rather than propagating
+/// that as a connection failure.
+///
+/// BUG fix (found from a real, frequently-occurring report: "IO error:
+/// Interrupted system call (os error 4)" during connect, forcing an
+/// unnecessary reconnect cycle -- for both the WebSocket and this
+/// module's own hand-rolled ZMTP/ZMQ connect path, which shares the
+/// exact same underlying `TcpStream::connect` call and therefore the
+/// exact same gap). Confirmed via Rust's own internals discussion
+/// (internals.rust-lang.org/t/policy-for-io-errorkind-interrupted) that
+/// the standard library does NOT automatically retry EINTR for
+/// "trivial" single-syscall wrappers like TcpStream::connect (unlike
+/// some other, more complex IO operations) -- a signal arriving at
+/// exactly the wrong moment (plausible here: this runs inside an
+/// X11/xinit session, where window-manager-driven signals like
+/// SIGWINCH are common right around startup, matching this being
+/// reported as happening often specifically in that context) surfaces
+/// directly as a connection *failure* to us, even though the
+/// connection attempt itself was never actually rejected -- it just
+/// needs to be retried immediately, not treated as "the server said
+/// no" and waited out for a full reconnect delay.
+fn connect_retrying_eintr<A: std::net::ToSocketAddrs>(addr: A) -> std::io::Result<TcpStream> {
+    retry_on_eintr(|| TcpStream::connect(&addr))
+}
+
+/// Same as `retry_on_eintr`, but for tungstenite's own `Result<T,
+/// tungstenite::Error>` -- its `Error::Io` variant is what wraps the
+/// same underlying `ErrorKind::Interrupted` this whole EINTR fix is
+/// about, just needing to be unwrapped first before the same check
+/// applies.
+fn retry_ws_on_eintr<T>(mut f: impl FnMut() -> Result<T, tungstenite::Error>)
+    -> Result<T, tungstenite::Error> {
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+                log::debug!("WebSocket IO interrupted by a signal (EINTR), retrying immediately");
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 struct ZmqSubSocket(TcpStream);
 
 /// Implementation of ZMTP as far as we need it for XMR. We don't want to pull in the
@@ -418,28 +496,31 @@ impl ZmqSubSocket {
         let host = caps.get(1).expect("present").as_str();
         let port = caps[2].parse().expect("digits");
 
-        let mut stream = TcpStream::connect((host, port))?;
+        let mut stream = connect_retrying_eintr((host, port))?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
 
         // greeting: signature, version (3.0), security (none) and server flag (no),
         // then pad to 64 bytes
-        stream.write_all(b"\xff\x00\x00\x00\x00\x00\x00\x00\x01\x7f\
+        //
+        // BUG fix: same EINTR gap as connect_retrying_eintr above, for
+        // every direct write_all/read_exact call in this handshake.
+        retry_on_eintr(|| stream.write_all(b"\xff\x00\x00\x00\x00\x00\x00\x00\x01\x7f\
                            \x03\x00\
                            NULL\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
                            \x00\
                            \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\
-                           \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")?;
+                           \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))?;
         // read greeting from peer
         let mut buf = [0; 64];
-        stream.read_exact(&mut buf)?;
+        retry_on_eintr(|| stream.read_exact(&mut buf))?;
         if buf[0] != 0xff || buf[9] != 0x7f || buf[10] != 0x03 || &buf[12..16] != b"NULL" {
             bail!("ZMTP greeting not understood");
         }
 
         // send ready command
-        stream.write_all(b"\x04\x19\x05READY\x0bSocket-Type\x00\x00\x00\x03SUB")?;
+        retry_on_eintr(|| stream.write_all(b"\x04\x19\x05READY\x0bSocket-Type\x00\x00\x00\x03SUB"))?;
         // read ready command
-        stream.read_exact(&mut buf[..2])?;
+        retry_on_eintr(|| stream.read_exact(&mut buf[..2]))?;
         if buf[0] != 0x04 {
             bail!("ZMTP command frame not understood");
         }
@@ -447,7 +528,7 @@ impl ZmqSubSocket {
         if len >= 62 {
             bail!("ZMTP command frame too long");
         }
-        stream.read_exact(&mut buf[2..2+len])?;
+        retry_on_eintr(|| stream.read_exact(&mut buf[2..2+len]))?;
         if &buf[2..8] != b"\x05READY" {
             bail!("ZMTP READY command not understood");
         }
@@ -464,21 +545,27 @@ impl ZmqSubSocket {
         msg.push(1 + topic.len() as u8);  // length of msg
         msg.push(1);  // subscribe command
         msg.extend_from_slice(topic);
-        self.0.write_all(&msg)?;
+        retry_on_eintr(|| self.0.write_all(&msg))?;
         Ok(())
     }
 
     fn recv_frame(&mut self) -> Result<(Vec<u8>, bool)> {
-        let flags = self.0.read_u8()?;
+        // BUG fix: same EINTR gap as connect_retrying_eintr/process_msg's
+        // WebSocket read above, just for this hand-rolled ZMTP frame
+        // reader's own direct read_u8/read_u64/read_exact calls on the
+        // raw TcpStream -- each wrapped individually since they're
+        // separate reads, any one of which could individually get
+        // interrupted by a signal.
+        let flags = retry_on_eintr(|| self.0.read_u8())?;
         let more = flags & 1 != 0;
         let long_len = flags & 2 != 0;
         let len = if long_len {
-            self.0.read_u64::<BE>()? as usize
+            retry_on_eintr(|| self.0.read_u64::<BE>())? as usize
         } else {
-            self.0.read_u8()? as usize
+            retry_on_eintr(|| self.0.read_u8())? as usize
         };
         let mut result = vec![0; len];
-        self.0.read_exact(&mut result)?;
+        retry_on_eintr(|| self.0.read_exact(&mut result))?;
         Ok((result, more))
     }
 }
@@ -641,4 +728,97 @@ cwFD2YnuxuF9szIeWPTmHUl6aXRIByuKNexbHqTeNhY=
         b"TOwhZC5mz2N0GoQvUDXsXVDfC3A6Ov5I+raxOsBvvhOLgPFlpz2VxWTsvq5TX8JJ/b\
           gCSdfpe5DTA0bEvwXzDst1KtGjK1Nvdg==").unwrap();
     assert_eq!(msg.action, "screenShot");
+}
+
+#[cfg(test)]
+mod retry_on_eintr_tests {
+    use super::retry_on_eintr;
+    use std::io::{Error, ErrorKind};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn succeeds_immediately_if_no_error() {
+        let calls = AtomicU32::new(0);
+        let result = retry_on_eintr(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, Error>(42)
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "must not retry when there's no error at all");
+    }
+
+    #[test]
+    fn retries_transparently_on_interrupted_then_succeeds() {
+        // The actual bug scenario: EINTR a few times (a signal arriving
+        // at an inconvenient moment, matching the real report), then a
+        // genuine success -- must retry silently and return the
+        // eventual success, not the earlier interruptions.
+        let calls = AtomicU32::new(0);
+        let result = retry_on_eintr(|| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 3 {
+                Err(Error::new(ErrorKind::Interrupted, "simulated EINTR"))
+            } else {
+                Ok(99)
+            }
+        });
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "must retry exactly as many times as needed, no more");
+    }
+
+    #[test]
+    fn a_genuine_non_interrupted_error_propagates_immediately_without_retrying() {
+        // Must NOT retry on other error kinds (e.g. a real connection
+        // refused) -- only EINTR specifically gets this transparent
+        // retry treatment, anything else is a real failure that should
+        // surface to the caller right away.
+        let calls = AtomicU32::new(0);
+        let result: std::io::Result<i32> = retry_on_eintr(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::new(ErrorKind::ConnectionRefused, "simulated real failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionRefused);
+        assert_eq!(calls.load(Ordering::SeqCst), 1,
+                   "must not retry at all for a non-Interrupted error");
+    }
+}
+
+#[cfg(test)]
+mod retry_ws_on_eintr_tests {
+    use super::retry_ws_on_eintr;
+    use std::io::{Error, ErrorKind};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn retries_transparently_on_interrupted_tungstenite_io_error_then_succeeds() {
+        // Same scenario as retry_on_eintr's own test, but for
+        // tungstenite's own Error type (used by both the WebSocket
+        // init/pong sends and the message read, section 74) -- its
+        // Error::Io variant must be unwrapped to find the same
+        // underlying ErrorKind::Interrupted.
+        let calls = AtomicU32::new(0);
+        let result = retry_ws_on_eintr(|| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(tungstenite::Error::Io(Error::new(ErrorKind::Interrupted, "simulated EINTR")))
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_genuine_non_io_tungstenite_error_propagates_immediately() {
+        let calls = AtomicU32::new(0);
+        let result: Result<i32, tungstenite::Error> = retry_ws_on_eintr(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(tungstenite::Error::ConnectionClosed)
+        });
+        assert!(matches!(result, Err(tungstenite::Error::ConnectionClosed)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1,
+                   "must not retry for a non-Io tungstenite error");
+    }
 }
