@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use byteorder::{BE, ReadBytesExt};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use md5::{Md5, Digest};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Deserializer, de::Error};
 use serde_json::{from_slice, from_str};
@@ -29,6 +30,61 @@ const RECONNECT: std::time::Duration = std::time::Duration::from_secs(10);
 /// settings/address are current at that point, exactly what a full
 /// process restart achieves, without requiring one.
 const RECONNECT_MAX_ATTEMPTS: u32 = 6;
+/// BUG fix (found from a real reproduction: restarting the relay
+/// server caused every single reconnect *attempt* to succeed cleanly,
+/// but the relay then closed each new connection again immediately
+/// afterward -- WebSocket close code 1000 "normal closure", no error,
+/// no reason text -- in an endless cycle. A naive count of consecutive
+/// connect() *failures* alone (the original version of this fix) never
+/// triggers here, since every individual reconnect attempt succeeds;
+/// what actually needs bounding is the *rate* of full disconnect-
+/// reconnect cycles, not just outright connection failures. A
+/// connection that stays up for at least this long before failing
+/// again is treated as a fresh, unrelated problem -- resetting the
+/// consecutive-cycle counter -- rather than a continuation of a rapid
+/// reject loop.
+const RECONNECT_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Tracks consecutive disconnect-reconnect cycles for the bounded-
+/// give-up logic in both `run()` implementations below. Deliberately
+/// takes explicit `Instant` values rather than calling
+/// `Instant::now()` internally, so this can be tested with
+/// programmatically-advanced time instead of needing real sleeps
+/// (RECONNECT_MAX_ATTEMPTS x RECONNECT itself would make a real-time
+/// test take a full minute or more).
+struct ReconnectBudget {
+    consecutive_cycles: u32,
+    connected_since: std::time::Instant,
+}
+
+impl ReconnectBudget {
+    fn new(now: std::time::Instant) -> Self {
+        Self { consecutive_cycles: 0, connected_since: now }
+    }
+
+    /// Call once, right when `process_msg()` first fails (before
+    /// starting the reconnect-attempt loop) -- resets the cycle count
+    /// if the connection had actually been stable for a while first,
+    /// so this doesn't confuse "recovered fine, then failed again much
+    /// later for an unrelated reason" with a genuine rapid-fail loop.
+    fn on_disconnected(&mut self, now: std::time::Instant) {
+        if now.duration_since(self.connected_since) >= RECONNECT_STABILITY_WINDOW {
+            self.consecutive_cycles = 0;
+        }
+    }
+
+    /// Call once per individual reconnect attempt, whether it goes on
+    /// to succeed or fail. Returns whether the caller should give up
+    /// now, instead of trying again.
+    fn record_attempt_and_should_give_up(&mut self) -> bool {
+        self.consecutive_cycles += 1;
+        self.consecutive_cycles > RECONNECT_MAX_ATTEMPTS
+    }
+
+    fn record_reconnected(&mut self, now: std::time::Instant) {
+        self.connected_since = now;
+    }
+}
 
 /// Possible messages to forward to the collect thread.
 #[derive(Debug)]
@@ -62,7 +118,9 @@ pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKe
     let channel = cms.xmr_channel();
 
     if !settings.xmr_web_socket_address.is_empty() {
-        log::info!("Using WebSocket XMR at {}", settings.xmr_web_socket_address);
+        log::info!("Using WebSocket XMR at {} (channel {}, key fingerprint {})",
+                    settings.xmr_web_socket_address, channel,
+                    fingerprint(&settings.xmr_cms_key));
         let tls_config = cms.make_rustls_client_config(no_verify)?;
         match WsConnector::new(&channel, tls_config,
                                &settings.xmr_web_socket_address,
@@ -171,39 +229,44 @@ impl WsConnector {
         Ok(socket)
     }
 
-    /// BUG fix (see `RECONNECT_MAX_ATTEMPTS`'s own doc comment): used
-    /// to retry `connect()` here indefinitely, with the exact same
-    /// uri/channel/cms_key captured once at thread startup. Now gives
-    /// up after a bounded number of attempts, letting this function
-    /// return -- which drops `self.sender`, closing the channel from
-    /// the mainloop's own perspective. The mainloop's own handling of
-    /// that channel closing (see mainloop.rs's own `recv(self.xmr)`
-    /// match) is what actually restarts XMR via a fresh
-    /// `xmr::start()`, using its own always-current settings, rather
-    /// than this thread's own possibly-stale captured values.
+    /// BUG fix (see `RECONNECT_MAX_ATTEMPTS`'s and
+    /// `RECONNECT_STABILITY_WINDOW`'s own doc comments for the full
+    /// context, including a real reproduction that exposed a gap in
+    /// the original version of this fix). Gives up after a bounded
+    /// number of consecutive disconnect-reconnect *cycles* within a
+    /// short time (not just outright connect() failures) -- letting
+    /// this function return, which drops `self.sender`, closing the
+    /// channel from the mainloop's own perspective. The mainloop's own
+    /// handling of that channel closing (see mainloop.rs's own
+    /// `recv(self.xmr)` match) is what actually restarts XMR via a
+    /// fresh `xmr::start()`, using its own always-current settings,
+    /// rather than this thread's own possibly-stale captured values.
     fn run(mut self) {
+        let mut budget = ReconnectBudget::new(std::time::Instant::now());
         loop {
             if let Err(e) = self.process_msg() {
-                log::error!("handling XMR message: {:#}, reconnecting in 10s", e);
+                log::error!("handling XMR message: {:#}, reconnecting in 10s \
+                            (channel {}, key fingerprint {})",
+                            e, self.channel, fingerprint(&self.cms_key));
+                budget.on_disconnected(std::time::Instant::now());
                 thread::sleep(RECONNECT);
-                let mut attempt = 0;
                 loop {
+                    if budget.record_attempt_and_should_give_up() {
+                        log::error!("giving up on XMR WebSocket reconnection after \
+                                    {RECONNECT_MAX_ATTEMPTS} disconnect/reconnect cycles \
+                                    within a short time -- the mainloop will restart XMR \
+                                    with fresh settings instead");
+                        return;
+                    }
                     match Self::connect(&self.uri, self.tls_config.clone(),
                                         &self.channel, &self.cms_key) {
                         Ok(socket) => {
                             self.socket = socket;
+                            budget.record_reconnected(std::time::Instant::now());
                             break;
                         }
                         Err(e) => {
-                            attempt += 1;
-                            log::error!("failed to reconnect XMR socket (attempt \
-                                        {attempt}/{RECONNECT_MAX_ATTEMPTS}): {e:#}");
-                            if attempt >= RECONNECT_MAX_ATTEMPTS {
-                                log::error!("giving up on XMR WebSocket reconnection after \
-                                            {RECONNECT_MAX_ATTEMPTS} attempts -- the mainloop \
-                                            will restart XMR with fresh settings instead");
-                                return;
-                            }
+                            log::error!("failed to reconnect XMR socket: {e:#}");
                             thread::sleep(RECONNECT);
                         }
                     }
@@ -313,30 +376,32 @@ impl ZmqConnector {
     }
 
     /// See the WebSocket variant's own `run` for the full explanation
-    /// of this fix -- same bounded-retry-then-let-mainloop-restart
+    /// of this fix -- same bounded-cycle-then-let-mainloop-restart
     /// approach, for the ZMQ fallback path.
     fn run(mut self) {
+        let mut budget = ReconnectBudget::new(std::time::Instant::now());
         loop {
             if let Err(e) = self.process_msg() {
-                log::error!("handling XMR message: {:#}, reconnecting in 10s", e);
+                log::error!("handling XMR message: {:#}, reconnecting in 10s \
+                            (channel {})", e, self.channel);
+                budget.on_disconnected(std::time::Instant::now());
                 thread::sleep(RECONNECT);
-                let mut attempt = 0;
                 loop {
+                    if budget.record_attempt_and_should_give_up() {
+                        log::error!("giving up on XMR ZMQ reconnection after \
+                                    {RECONNECT_MAX_ATTEMPTS} disconnect/reconnect cycles \
+                                    within a short time -- the mainloop will restart XMR \
+                                    with fresh settings instead");
+                        return;
+                    }
                     match Self::connect(&self.channel, &self.uri) {
                         Ok(socket) => {
                             self.socket = socket;
+                            budget.record_reconnected(std::time::Instant::now());
                             break;
                         }
                         Err(e) => {
-                            attempt += 1;
-                            log::error!("failed to reconnect XMR socket (attempt \
-                                        {attempt}/{RECONNECT_MAX_ATTEMPTS}): {e:#}");
-                            if attempt >= RECONNECT_MAX_ATTEMPTS {
-                                log::error!("giving up on XMR ZMQ reconnection after \
-                                            {RECONNECT_MAX_ATTEMPTS} attempts -- the mainloop \
-                                            will restart XMR with fresh settings instead");
-                                return;
-                            }
+                            log::error!("failed to reconnect XMR socket: {e:#}");
                             thread::sleep(RECONNECT);
                         }
                     }
@@ -572,6 +637,27 @@ fn retry_ws_on_eintr<T>(mut f: impl FnMut() -> Result<T, tungstenite::Error>)
 /// specific reason the relay gives should now show up in arexibo's own
 /// log, without needing to correlate against a separate log on the
 /// CMS/relay side at all.
+/// A short, stable fingerprint of a secret value (e.g. the XMR CMS
+/// key), safe to log -- lets two log lines be compared to tell
+/// whether the *same* key was used both times, without ever printing
+/// the actual secret itself.
+///
+/// Added to help investigate a real, still-unexplained report: the
+/// user directly ruled out the relay itself restarting (confirmed via
+/// systemd uptime, 4 days), yet suspects the *client* somehow starts
+/// using a different/stale key after running for a while -- but
+/// nothing found in the code review suggests channel/cms_key should
+/// ever change (channel is a deterministic hash of static CmsSettings
+/// fields; cms_key comes from a global CMS-wide setting, confirmed in
+/// the real CMS source). Rather than continue reasoning abstractly,
+/// this lets a future occurrence be checked directly: log lines from
+/// a "working" connection and a "no longer working" one, for the same
+/// display, can now be compared for a genuine mismatch instead of
+/// assuming one way or the other.
+fn fingerprint(secret: &str) -> String {
+    hex::encode(Md5::digest(secret.as_bytes()))[..8].to_string()
+}
+
 fn describe_close(frame: &Option<tungstenite::protocol::CloseFrame>) -> String {
     match frame {
         Some(f) => format!("XMR WebSocket closed by the relay: {} (code {})", f.reason, f.code),
@@ -914,6 +1000,143 @@ mod retry_ws_on_eintr_tests {
         assert!(matches!(result, Err(tungstenite::Error::ConnectionClosed)));
         assert_eq!(calls.load(Ordering::SeqCst), 1,
                    "must not retry for a non-Io tungstenite error");
+    }
+}
+
+#[cfg(test)]
+mod reconnect_budget_tests {
+    use super::{ReconnectBudget, RECONNECT_MAX_ATTEMPTS, RECONNECT_STABILITY_WINDOW};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn gives_up_when_every_reconnect_succeeds_but_drops_again_immediately() {
+        // Regression test for a real reproduction: restarting the XMR
+        // relay caused every single reconnect *attempt* to succeed
+        // cleanly, but the relay then closed each new connection again
+        // immediately afterward (WebSocket close code 1000, no error) --
+        // in an endless cycle. The original version of this fix only
+        // counted consecutive connect() *failures*, which never
+        // triggered here, since every individual attempt succeeded.
+        let t0 = Instant::now();
+        let mut budget = ReconnectBudget::new(t0);
+        let mut now = t0;
+        let mut gave_up = false;
+        for _ in 0..(RECONNECT_MAX_ATTEMPTS + 2) {
+            // process_msg() just failed (closed again almost
+            // immediately after reconnecting) -- barely any time
+            // passed since the last successful reconnect.
+            now += Duration::from_millis(50);
+            budget.on_disconnected(now);
+            if budget.record_attempt_and_should_give_up() {
+                gave_up = true;
+                break;
+            }
+            // The reconnect itself succeeds right away every time --
+            // this is the crux of the real report.
+            now += Duration::from_millis(50);
+            budget.record_reconnected(now);
+        }
+        assert!(gave_up, "must give up after too many rapid disconnect/reconnect \
+                          cycles, even when every individual reconnect succeeds");
+    }
+
+    #[test]
+    fn does_not_give_up_prematurely_on_an_isolated_failure() {
+        let t0 = Instant::now();
+        let mut budget = ReconnectBudget::new(t0);
+        budget.on_disconnected(t0 + Duration::from_millis(50));
+        assert!(!budget.record_attempt_and_should_give_up(),
+                "a single disconnect/reconnect cycle must never trigger giving up");
+    }
+
+    #[test]
+    fn a_genuinely_stable_connection_resets_the_counter() {
+        // A connection that stayed up for a good while before failing
+        // again must be treated as a fresh, unrelated problem -- not
+        // silently accumulate toward the give-up threshold alongside
+        // an earlier, unrelated blip.
+        let t0 = Instant::now();
+        let mut budget = ReconnectBudget::new(t0);
+
+        // A few rapid cycles first (but not enough to give up).
+        let mut now = t0;
+        for _ in 0..(RECONNECT_MAX_ATTEMPTS - 1) {
+            now += Duration::from_millis(50);
+            budget.on_disconnected(now);
+            assert!(!budget.record_attempt_and_should_give_up());
+            now += Duration::from_millis(50);
+            budget.record_reconnected(now);
+        }
+
+        // Then it stays up for a genuinely long, stable while.
+        now += RECONNECT_STABILITY_WINDOW + Duration::from_secs(1);
+        budget.on_disconnected(now);
+
+        // The counter must have reset -- this single new cycle alone
+        // must not be enough to give up.
+        assert!(!budget.record_attempt_and_should_give_up(),
+                "a long stable period must reset the counter, not carry over \
+                 the earlier unrelated rapid-cycle count");
+    }
+
+    #[test]
+    fn mixes_genuine_connect_failures_into_the_same_budget() {
+        // A real connect() failure (not just "succeeded then dropped
+        // again") must count toward the exact same budget -- the two
+        // failure modes aren't tracked separately.
+        let t0 = Instant::now();
+        let mut budget = ReconnectBudget::new(t0);
+        let mut now = t0;
+        let mut gave_up = false;
+        for i in 0..(RECONNECT_MAX_ATTEMPTS + 2) {
+            now += Duration::from_millis(50);
+            if i == 0 {
+                budget.on_disconnected(now);
+            }
+            if budget.record_attempt_and_should_give_up() {
+                gave_up = true;
+                break;
+            }
+            // Every other attempt is a genuine connect() failure (no
+            // record_reconnected call at all) -- alternating with a
+            // successful-then-immediately-redropped one.
+            if i % 2 == 0 {
+                now += Duration::from_millis(50);
+                budget.record_reconnected(now);
+            }
+        }
+        assert!(gave_up, "genuine connect() failures must count toward the \
+                          same give-up budget as successful-but-immediately-\
+                          redropped cycles");
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::fingerprint;
+
+    #[test]
+    fn is_deterministic_for_the_same_secret() {
+        // The whole point: comparing two log lines from different
+        // points in time must reliably tell whether the *same* key was
+        // used both times.
+        assert_eq!(fingerprint("mysecretkey"), fingerprint("mysecretkey"));
+    }
+
+    #[test]
+    fn differs_for_different_secrets() {
+        assert_ne!(fingerprint("mysecretkey"), fingerprint("adifferentkey"));
+    }
+
+    #[test]
+    fn never_reveals_the_secret_itself() {
+        // Genuinely important, not just a nice-to-have: this gets
+        // logged, so the actual secret must never appear verbatim
+        // (or as an obvious substring) in the output.
+        let secret = "supersecretxmrcmskey12345";
+        let fp = fingerprint(secret);
+        assert!(!fp.contains(secret));
+        assert_eq!(fp.len(), 8, "expected a short, fixed-length fingerprint");
     }
 }
 
