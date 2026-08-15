@@ -305,27 +305,18 @@ impl Handler {
             // private key is kept in `xmr_retry_key` so `collect_once`
             // can retry the XMR connection on a later cycle, once
             // network genuinely returns, without needing a full restart.
-            let mut xmr_retry_key = None;
-            let xmr = match xmr::start(cms, &settings, privkey.clone(), no_verify) {
-                Ok(xmr) => xmr,
-                Err(e) if allow_offline => {
-                    log::warn!("could not set up XMR (will retry on a later collection \
-                                cycle instead of real-time push): {e:#}");
-                    xmr_retry_key = Some(privkey.clone());
-                    never()
-                }
-                Err(e) => return Err(e),
-            };
-
-            // BUG fix (found from a real report: "Arexibo player
-            // settings.json WS port gets deleted on startup when it
-            // detects CMS v4.5.0" -- combined with a real crash caused
-            // by the resulting --allow-offline retry, section 63).
-            // CONFIRMED via the CMS's own real source code
-            // (lib/Xmds/Soap5.php): `xmrType` is set to 'ws' or 'zmq'
-            // based on `$this->display->isWebSocketXmrSupported()`,
-            // evaluated fresh on *every* RegisterDisplay call -- and our
-            // own parsing (xmds.rs) unconditionally sets
+            // BUG fix (found from a real GitHub report: settings.json
+            // ended up with the correct, complete previously-known-good
+            // address, yet *this session's own* XMR connection still
+            // used the bad, port-less one from this fresh registration
+            // -- because the sticky-address check below used to run
+            // *after* `xmr::start()` was already called with the
+            // untouched, possibly-bad `settings`). CONFIRMED via the
+            // CMS's own real source code (lib/Xmds/Soap5.php): `xmrType`
+            // is set to 'ws' or 'zmq' based on
+            // `$this->display->isWebSocketXmrSupported()`, evaluated
+            // fresh on *every* RegisterDisplay call -- and our own
+            // parsing (xmds.rs) unconditionally sets
             // xmr_web_socket_address to an EMPTY string whenever
             // xmrType isn't exactly "ws", discarding whatever
             // xmrWebSocketAddress value the CMS might have also sent.
@@ -347,6 +338,12 @@ impl Handler {
             // `AREXIBO_FORCE_WS_ADDRESS` (see xmds.rs) remains available
             // for pinning the address even against a *future* address
             // change, for anyone who wants that stronger guarantee.
+            //
+            // Moved here (before xmr::start(), not after) so this
+            // *first* connection attempt of the session benefits from
+            // the same protection collect_once's own later cycles
+            // already had -- not just what gets persisted to
+            // settings.json for next time.
             if let Ok(prev) = PlayerSettings::from_file(&setting_file) {
                 if !prev.xmr_web_socket_address.is_empty()
                     && !ws_address_has_port(&settings.xmr_web_socket_address) {
@@ -360,6 +357,18 @@ impl Handler {
                     settings.xmr_web_socket_address = prev.xmr_web_socket_address;
                 }
             }
+
+            let mut xmr_retry_key = None;
+            let xmr = match xmr::start(cms, &settings, privkey.clone(), no_verify) {
+                Ok(xmr) => xmr,
+                Err(e) if allow_offline => {
+                    log::warn!("could not set up XMR (will retry on a later collection \
+                                cycle instead of real-time push): {e:#}");
+                    xmr_retry_key = Some(privkey.clone());
+                    never()
+                }
+                Err(e) => return Err(e),
+            };
             settings.to_file(&setting_file).context("writing player settings")?;
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
@@ -1834,5 +1843,109 @@ mod xmr_disconnected_tests {
         // something stale from before.
         assert!(handler.xmr.try_recv().is_err(),
                 "the channel must be replaced with an inert one, not left in its old state");
+    }
+}
+
+#[cfg(test)]
+mod sticky_address_applies_to_first_connection_tests {
+    use super::*;
+
+    /// A minimal mock WebSocket server: accepts one TCP connection,
+    /// completes the WS handshake, then just keeps it open (does
+    /// nothing else -- arexibo's own XMR client only needs the
+    /// handshake to succeed for xmr::start() to return Ok).
+    fn start_mock_ws() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                if let Ok(mut socket) = tungstenite::accept(stream) {
+                    // Keep the connection open for a bit so the test has
+                    // time to observe the outcome before it closes.
+                    let _ = socket.read();
+                }
+            }
+        });
+        port
+    }
+
+    fn start_mock_cms(ws_addr: String) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let activation = format!(
+                    r#"<ActivationMessage code="READY"><xmrType>ws</xmrType><xmrWebSocketAddress>{ws_addr}</xmrWebSocketAddress></ActivationMessage>"#);
+                let escaped = activation.replace('&', "&amp;").replace('<', "&lt;")
+                                         .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_sticky_first_conn_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_very_first_xmr_connection_uses_the_sticky_corrected_address_not_the_bad_one() {
+        // Regression test for a real GitHub report: settings.json ended
+        // up with the correct, complete previously-known-good address,
+        // yet *this session's own* XMR connection still used the bad,
+        // port-less one from the fresh registration -- because the
+        // sticky-address check used to run *after* xmr::start() was
+        // already called with the untouched settings. Moved the check
+        // earlier to fix this; this test would have failed before that
+        // fix (xmr::start() would have tried port 80, found nothing
+        // listening, and fallen back to ZMQ instead of succeeding here).
+        let ws_port = start_mock_ws();
+        let good_address = format!("ws://127.0.0.1:{ws_port}");
+        let envdir = test_envdir();
+
+        // Pre-populate settings.json with the good, complete address --
+        // simulating a previous, successful run.
+        let settings_path = envdir.join("settings.json");
+        let mut prev = PlayerSettings::default();
+        prev.xmr_web_socket_address = good_address.clone();
+        prev.to_file(&settings_path).unwrap();
+
+        // This fresh registration deliberately returns a *port-less*
+        // address (xmrType=ws, but no port) -- the exact real-world
+        // scenario from the report.
+        let cms_port = start_mock_cms("ws://127.0.0.1".to_string());
+        let cms = CmsSettings {
+            address: format!("http://127.0.0.1:{cms_port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                    togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        // The in-memory settings must reflect the corrected address...
+        assert_eq!(handler.settings.xmr_web_socket_address, good_address);
+        // ...and, crucially, no retry was armed -- meaning xmr::start()
+        // actually *succeeded* using that corrected address, rather
+        // than failing (with port 80) and falling back to offline/ZMQ
+        // retry mode. This is the part that would have failed before
+        // the ordering fix.
+        assert!(handler.xmr_retry_key.is_none(),
+                "xmr::start() should have succeeded directly against the corrected \
+                 address -- a retry being armed means it was actually attempted \
+                 against the bad, port-less one instead");
     }
 }
