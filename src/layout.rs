@@ -255,10 +255,70 @@ window.arexibo = {
 "##;
 
 
-/// (mid, duration expr, add_start, add_stop, fade_in, fade_out, transition_ms)
-/// -- see write_media's transition-resolution logic for fade_in/fade_out/
-/// transition_ms.
-type MediaInfo = (i32, String, String, String, bool, bool, u32);
+/// Compass direction for a "fly" transition -- matches the 8 values
+/// the CMS itself offers (confirmed in the real CMS source,
+/// lib/Controller/Widget.php's own compassPoints array: N/NE/E/SE/S/
+/// SW/W/NW).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FlyDir { N, Ne, E, Se, S, Sw, W, Nw }
+
+impl FlyDir {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "N" => Some(Self::N), "NE" => Some(Self::Ne), "E" => Some(Self::E),
+            "SE" => Some(Self::Se), "S" => Some(Self::S), "SW" => Some(Self::Sw),
+            "W" => Some(Self::W), "NW" => Some(Self::Nw),
+            _ => None,
+        }
+    }
+
+    /// (dx%, dy%) -- a CSS translate() offset, as a percentage of the
+    /// element's own size, that moves it fully off-screen in this
+    /// compass direction. Percentage-based (not absolute pixels) so
+    /// this works correctly regardless of the widget's actual
+    /// on-screen size.
+    ///
+    /// SEMANTICS NOTE: the CMS's own precise meaning of "which way N
+    /// moves content" isn't documented anywhere accessible (checked
+    /// the real CMS source, including its own minified Designer
+    /// preview JS -- found the 8 compass values themselves, not a
+    /// clear spec of the exact animation direction). This uses the
+    /// most intuitive, commonly-expected convention (matching how
+    /// other fly/slide transition libraries describe it, e.g. "fly in
+    /// from left"): for an in-transition, the widget arrives *from*
+    /// this direction; for an out-transition, it exits *toward* this
+    /// direction. N/S/E/W map to up/down/right/left respectively,
+    /// diagonals combine both axes. If a specific layout's fly
+    /// direction looks mirrored compared to the CMS Designer's own
+    /// preview, it's a difference in this specific convention, not a
+    /// sign the fly transition itself is broken -- worth revisiting if
+    /// ever confirmed against a real reference player.
+    fn offset(self) -> (i32, i32) {
+        match self {
+            Self::N  => (0, -100),
+            Self::S  => (0, 100),
+            Self::E  => (100, 0),
+            Self::W  => (-100, 0),
+            Self::Ne => (100, -100),
+            Self::Se => (100, 100),
+            Self::Sw => (-100, 100),
+            Self::Nw => (-100, -100),
+        }
+    }
+}
+
+/// What kind of enter/exit animation a widget uses -- `None` means an
+/// instant, non-animated show/hide.
+#[derive(Clone, Copy, PartialEq)]
+enum Trans {
+    None,
+    Fade,
+    Fly(FlyDir),
+}
+
+/// (mid, duration expr, add_start, add_stop, trans_in, ms_in, trans_out, ms_out)
+/// -- see write_media's transition-resolution logic.
+type MediaInfo = (i32, String, String, String, Trans, u32, Trans, u32);
 
 pub struct Translator<'a> {
     id: LayoutId,
@@ -565,37 +625,60 @@ impl<'a> Translator<'a> {
         // ("a region transition which allows exit transitions... Is
         // there a way to set the In and Out transitions to a specific
         // setting for all content in that region?").
-        let (region_type, region_ms, region_loop) = region.find("options").map(|opts| {
-            let ty = opts.find("transitionType").map(|e| e.text().trim().to_string())
-                .filter(|s| !s.is_empty());
-            let ms: u32 = opts.find("transitionDuration")
-                .and_then(|e| e.text().trim().parse().ok()).unwrap_or(0);
-            // BUG fix (found from a real report: playlists kept cycling
-            // forever regardless of this setting -- on reflection, most
-            // likely a single-item region case, or a layout/campaign-
-            // level cycle count, given the official docs confirm `loop`
-            // "is only applicable when there is only 1 media item in
-            // the region"): this was never read at all before. `<loop>`
-            // here is the REGION's own single-item loop -- whether,
-            // after showing its one media item once, it should reload/
-            // restart it (1) or freeze/hold on it until the layout
-            // itself finishes (0/absent) -- see region_switch's own
-            // handling above, which only applies this when the region
-            // has exactly one item; a region with more than one item
-            // always keeps cycling through them regardless of this
-            // setting, per the same documented semantics. Distinct from
-            // a video widget's own `<loop>` in its *own* `<options>`
-            // (see write_media's video branch), which governs native
-            // single-widget looping.
-            let lp = opts.find("loop").map(|e| e.text().trim() == "1").unwrap_or(false);
-            (ty, ms, lp)
-        }).unwrap_or((None, 0, false));
-        let region_fade_in = region_type.as_deref() == Some("fadeIn") && region_ms > 0;
-        let region_fade_out = region_type.as_deref() == Some("fadeOut") && region_ms > 0;
+        // Region-level fallback: `(in, out)`, each `(Trans, u32)`.
+        // Unlike the widget-level transIn/transOut (two independent
+        // fields), the region only has ONE `<transitionType>` -- its
+        // string value says which side it applies to: "fadeIn"/
+        // "fadeOut" unambiguously mean just the in/out side
+        // respectively (matching their name), while "fly" doesn't
+        // distinguish a side at all, so it's applied to BOTH (a single
+        // whole-region setting), using the same direction for both.
+        let (region_in, region_out): ((Trans, u32), (Trans, u32)) =
+            region.find("options").map(|opts| {
+                let ty = opts.find("transitionType").map(|e| e.text().trim().to_string())
+                    .filter(|s| !s.is_empty());
+                let ms: u32 = opts.find("transitionDuration")
+                    .and_then(|e| e.text().trim().parse().ok()).unwrap_or(0);
+                let dir = opts.find("transitionDirection").map(|e| e.text().trim().to_string())
+                    .filter(|s| !s.is_empty());
+                match ty.as_deref() {
+                    Some("fadeIn") if ms > 0 => ((Trans::Fade, ms), (Trans::None, 0)),
+                    Some("fadeOut") if ms > 0 => ((Trans::None, 0), (Trans::Fade, ms)),
+                    Some("fly") if ms > 0 => {
+                        let d = dir.as_deref().and_then(FlyDir::parse)
+                            // Matches the CMS's own default when a
+                            // direction isn't set (confirmed in the
+                            // real CMS source, Layout.php:
+                            // getOptionValue('transInDirection', 'E')).
+                            .unwrap_or(FlyDir::E);
+                        ((Trans::Fly(d), ms), (Trans::Fly(d), ms))
+                    }
+                    _ => ((Trans::None, 0), (Trans::None, 0)),
+                }
+            }).unwrap_or(((Trans::None, 0), (Trans::None, 0)));
+        // BUG fix (found from a real report: playlists kept cycling
+        // forever regardless of this setting -- on reflection, most
+        // likely a single-item region case, or a layout/campaign-
+        // level cycle count, given the official docs confirm `loop`
+        // "is only applicable when there is only 1 media item in
+        // the region"): this was never read at all before. `<loop>`
+        // here is the REGION's own single-item loop -- whether,
+        // after showing its one media item once, it should reload/
+        // restart it (1) or freeze/hold on it until the layout
+        // itself finishes (0/absent) -- see region_switch's own
+        // handling above, which only applies this when the region
+        // has exactly one item; a region with more than one item
+        // always keeps cycling through them regardless of this
+        // setting, per the same documented semantics. Distinct from
+        // a video widget's own `<loop>` in its *own* `<options>`
+        // (see write_media's video branch), which governs native
+        // single-widget looping.
+        let region_loop = region.find("options").and_then(|opts| opts.find("loop"))
+            .map(|e| e.text().trim() == "1").unwrap_or(false);
 
         let mut sequence = Vec::new();
         for media in region.find_all("media") {
-            match self.write_media(rid, geom, media, (region_fade_in, region_fade_out, region_ms)) {
+            match self.write_media(rid, geom, media, (region_in, region_out)) {
                 Err(e) => log::error!("layout: could not translate media: {:#}", e),
                 Ok(None) => continue,
                 Ok(Some(res)) => {
@@ -623,7 +706,7 @@ impl<'a> Translator<'a> {
         writeln!(self.out, "  media: [")?;
 
         // for each media, write functions to start/stop displaying it
-        for (mid, duration, add_start, add_stop, fade_in, fade_out, transition_ms) in sequence {
+        for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in sequence {
             writeln!(self.out, "    [function() {{")?;
             // Diagnostic log (found genuinely useful investigating a
             // real "content renders correctly inside its own iframe but
@@ -640,68 +723,105 @@ impl<'a> Translator<'a> {
             writeln!(self.out, "      if (window.arexiboDebug) console.log(\
                                 'arexibo-show: region {rid} widget {mid}');")?;
             let el = format!("document.getElementById('m{mid}')");
-            if fade_in {
-                // Per the documented semantics ("the media duration
-                // should include the in transition"), this animates
-                // *within* the widget's own already-scheduled duration
-                // countdown in region_switch -- no timing changes are
-                // needed there, only here in how "becoming visible" is
-                // actually performed.
-                writeln!(self.out, "      {{ let el = {el}; \
-                                    el.style.transition = 'opacity {transition_ms}ms'; \
-                                    el.style.opacity = '0'; \
-                                    el.style.visibility = 'visible'; \
-                                    void el.offsetWidth; \
-                                    el.style.opacity = '1'; }}")?;
-            } else {
-                writeln!(self.out, "      {el}.style.visibility = 'visible';")?;
+            match trans_in {
+                Trans::Fade => {
+                    // Per the documented semantics ("the media duration
+                    // should include the in transition"), this animates
+                    // *within* the widget's own already-scheduled duration
+                    // countdown in region_switch -- no timing changes are
+                    // needed there, only here in how "becoming visible" is
+                    // actually performed.
+                    writeln!(self.out, "      {{ let el = {el}; \
+                                        el.style.transition = 'opacity {ms_in}ms'; \
+                                        el.style.opacity = '0'; \
+                                        el.style.visibility = 'visible'; \
+                                        void el.offsetWidth; \
+                                        el.style.opacity = '1'; }}")?;
+                }
+                Trans::Fly(dir) => {
+                    // Arrives *from* this compass direction (see
+                    // FlyDir::offset's own doc comment for the
+                    // semantics/uncertainty note): starts translated
+                    // fully off-screen in that direction, then animates
+                    // to its natural position. Same "animate within the
+                    // widget's own duration countdown" timing as fadeIn.
+                    let (dx, dy) = dir.offset();
+                    writeln!(self.out, "      {{ let el = {el}; \
+                                        el.style.transition = 'none'; \
+                                        el.style.transform = 'translate({dx}%, {dy}%)'; \
+                                        el.style.visibility = 'visible'; \
+                                        void el.offsetWidth; \
+                                        el.style.transition = 'transform {ms_in}ms'; \
+                                        el.style.transform = 'translate(0%, 0%)'; }}")?;
+                }
+                Trans::None => {
+                    writeln!(self.out, "      {el}.style.visibility = 'visible';")?;
+                }
             }
             writeln!(self.out, "      {add_start}")?;
             writeln!(self.out, "    }}, function() {{")?;
             // if only one item is present, don't need to hide the others
             if nitems > 1 {
-                if fade_out {
-                    // Deliberately fire-and-forget: region_switch already
-                    // moves on to showing the *next* widget immediately
-                    // after calling this, so its own in-transition (if
-                    // any) overlaps with this fade-out -- a real
-                    // crossfade, rather than the old sequential
-                    // fade-to-background-then-fade-in behavior some very
-                    // old Xibo player versions were reported to have
-                    // (community forum, 2015). The next widget's own
-                    // duration countdown is *not* delayed by this timer,
-                    // matching "duration should... exclude the out
-                    // transition".
-                    //
-                    // z-index bump is essential, not cosmetic: `.media`
-                    // elements are `position: absolute` with no explicit
-                    // z-index (see LAYOUT_CSS), so they stack in DOM
-                    // order -- the *incoming* widget (written later in
-                    // the region's own media list, or simply shown
-                    // without any fade-in of its own if its `transIn`
-                    // isn't fadeIn) would otherwise paint immediately
-                    // on top of this one from the very first frame,
-                    // completely hiding the fade-out happening
-                    // underneath it -- a real bug found because the
-                    // fade was reported as "not happening" even though
-                    // the opacity animation itself was verified working
-                    // correctly (see this session's QtWebEngine
-                    // measurement). Bumping z-index keeps the
-                    // *fading-out* widget on top for the duration of its
-                    // own fade, so its decreasing opacity visibly
-                    // reveals whatever's now underneath, regardless of
-                    // DOM order. Not reset back afterwards: once
-                    // `visibility: hidden`, the element doesn't
-                    // participate in visible stacking at all regardless
-                    // of z-index, so there is nothing to clean up.
-                    writeln!(self.out, "      {{ let el = {el}; \
-                                        el.style.zIndex = '9999'; \
-                                        el.style.transition = 'opacity {transition_ms}ms'; \
-                                        el.style.opacity = '0'; \
-                                        setTimeout(() => {{ el.style.visibility = 'hidden'; }}, \
-                                                   {transition_ms}); }}")?;
-                } else {
-                    writeln!(self.out, "      {el}.style.visibility = 'hidden'; ")?;
+                match trans_out {
+                    Trans::Fade => {
+                        // Deliberately fire-and-forget: region_switch already
+                        // moves on to showing the *next* widget immediately
+                        // after calling this, so its own in-transition (if
+                        // any) overlaps with this fade-out -- a real
+                        // crossfade, rather than the old sequential
+                        // fade-to-background-then-fade-in behavior some very
+                        // old Xibo player versions were reported to have
+                        // (community forum, 2015). The next widget's own
+                        // duration countdown is *not* delayed by this timer,
+                        // matching "duration should... exclude the out
+                        // transition".
+                        //
+                        // z-index bump is essential, not cosmetic: `.media`
+                        // elements are `position: absolute` with no explicit
+                        // z-index (see LAYOUT_CSS), so they stack in DOM
+                        // order -- the *incoming* widget (written later in
+                        // the region's own media list, or simply shown
+                        // without any fade-in of its own if its `transIn`
+                        // isn't fadeIn) would otherwise paint immediately
+                        // on top of this one from the very first frame,
+                        // completely hiding the fade-out happening
+                        // underneath it -- a real bug found because the
+                        // fade was reported as "not happening" even though
+                        // the opacity animation itself was verified working
+                        // correctly (see this session's QtWebEngine
+                        // measurement). Bumping z-index keeps the
+                        // *fading-out* widget on top for the duration of its
+                        // own fade, so its decreasing opacity visibly
+                        // reveals whatever's now underneath, regardless of
+                        // DOM order. Not reset back afterwards: once
+                        // `visibility: hidden`, the element doesn't
+                        // participate in visible stacking at all regardless
+                        // of z-index, so there is nothing to clean up.
+                        writeln!(self.out, "      {{ let el = {el}; \
+                                            el.style.zIndex = '9999'; \
+                                            el.style.transition = 'opacity {ms_out}ms'; \
+                                            el.style.opacity = '0'; \
+                                            setTimeout(() => {{ el.style.visibility = 'hidden'; }}, \
+                                                       {ms_out}); }}")?;
+                    }
+                    Trans::Fly(dir) => {
+                        // Exits *toward* this compass direction -- same
+                        // z-index reasoning as the fade-out case above
+                        // (keeps the leaving widget visibly on top while
+                        // it flies away, rather than being instantly
+                        // hidden behind the incoming one).
+                        let (dx, dy) = dir.offset();
+                        writeln!(self.out, "      {{ let el = {el}; \
+                                            el.style.zIndex = '9999'; \
+                                            el.style.transition = 'transform {ms_out}ms'; \
+                                            el.style.transform = 'translate({dx}%, {dy}%)'; \
+                                            setTimeout(() => {{ el.style.visibility = 'hidden'; \
+                                                                 el.style.transform = ''; }}, \
+                                                       {ms_out}); }}")?;
+                    }
+                    Trans::None => {
+                        writeln!(self.out, "      {el}.style.visibility = 'hidden'; ")?;
+                    }
                 }
             }
             writeln!(self.out, "      {add_stop}")?;
@@ -714,7 +834,7 @@ impl<'a> Translator<'a> {
     }
 
     fn write_media(&mut self, rid: i32, [x, y, w, h]: [i32; 4],
-                   media: &Element, region_fallback: (bool, bool, u32)) -> Result<Option<MediaInfo>> {
+                   media: &Element, region_fallback: ((Trans, u32), (Trans, u32))) -> Result<Option<MediaInfo>> {
         let mid = media.parse_attr("id")?;
         let opts = media.find("options").context("no options")?;
         let mut duration = format!(
@@ -732,43 +852,42 @@ impl<'a> Translator<'a> {
         // `transitionDirection` trio (see write_region) -- this is the
         // one actually populated by the CMS/editor in practice, which is
         // exactly why transitions weren't working before this was added.
-        // Falls back to the region-level default (`region_fallback`,
-        // itself already reduced to (fade_in, fade_out, ms)) only if
-        // this widget doesn't specify its own transIn/transOut at all.
-        // Same scope limits as the region-level case: only fadeIn/
-        // fadeOut are implemented, "fly" logs a warning and falls back
-        // to an instant switch for whichever side (in/out) requested it.
-        let trans_in = opts.find("transIn").map(|e| e.text().trim().to_string())
+        // Falls back to the region-level default (`region_fallback`)
+        // independently for in/out -- only for whichever side this
+        // widget doesn't specify its own transIn/transOut for at all.
+        fn parse_trans(ty: Option<&str>, dir: Option<&str>, ms: u32) -> (Trans, u32) {
+            match ty {
+                Some("fadeIn") | Some("fadeOut") if ms > 0 => (Trans::Fade, ms),
+                Some("fly") if ms > 0 => {
+                    let d = dir.and_then(FlyDir::parse).unwrap_or(FlyDir::E);
+                    (Trans::Fly(d), ms)
+                }
+                _ => (Trans::None, 0),
+            }
+        }
+        let trans_in_ty = opts.find("transIn").map(|e| e.text().trim().to_string())
+            .filter(|s| !s.is_empty());
+        let trans_in_dir = opts.find("transInDirection").map(|e| e.text().trim().to_string())
             .filter(|s| !s.is_empty());
         let trans_in_ms: u32 = opts.find("transInDuration")
             .and_then(|e| e.text().trim().parse().ok()).unwrap_or(0);
-        let trans_out = opts.find("transOut").map(|e| e.text().trim().to_string())
+        let trans_out_ty = opts.find("transOut").map(|e| e.text().trim().to_string())
+            .filter(|s| !s.is_empty());
+        let trans_out_dir = opts.find("transOutDirection").map(|e| e.text().trim().to_string())
             .filter(|s| !s.is_empty());
         let trans_out_ms: u32 = opts.find("transOutDuration")
             .and_then(|e| e.text().trim().parse().ok()).unwrap_or(0);
 
-        if trans_in.as_deref() == Some("fly") {
-            log::warn!("media {mid}: \"fly\" in-transition requested but not implemented \
-                        (only fadeIn/fadeOut are) -- falling back to an instant show");
-        }
-        if trans_out.as_deref() == Some("fly") {
-            log::warn!("media {mid}: \"fly\" out-transition requested but not implemented \
-                        (only fadeIn/fadeOut are) -- falling back to an instant hide");
-        }
-
-        let (region_fade_in, region_fade_out, region_ms) = region_fallback;
-        let (fade_in, fade_out, transition_ms) = if trans_in.is_some() || trans_out.is_some() {
-            (trans_in.as_deref() == Some("fadeIn") && trans_in_ms > 0,
-             trans_out.as_deref() == Some("fadeOut") && trans_out_ms > 0,
-             // fadeIn/fadeOut never coexist on the same widget in
-             // practice (one governs showing, the other hiding), so
-             // using whichever of the two durations is actually
-             // associated with an implemented type is unambiguous; if
-             // somehow both ended up set, prefer the in-duration
-             // arbitrarily rather than silently pick 0.
-             if trans_in.as_deref() == Some("fadeIn") { trans_in_ms } else { trans_out_ms })
+        let ((region_trans_in, region_ms_in), (region_trans_out, region_ms_out)) = region_fallback;
+        let (trans_in, ms_in) = if trans_in_ty.is_some() {
+            parse_trans(trans_in_ty.as_deref(), trans_in_dir.as_deref(), trans_in_ms)
         } else {
-            (region_fade_in, region_fade_out, region_ms)
+            (region_trans_in, region_ms_in)
+        };
+        let (trans_out, ms_out) = if trans_out_ty.is_some() {
+            parse_trans(trans_out_ty.as_deref(), trans_out_dir.as_deref(), trans_out_ms)
+        } else {
+            (region_trans_out, region_ms_out)
         };
 
         writeln!(self.out, "  <!-- media {mid} -->")?;
@@ -1065,7 +1184,7 @@ impl<'a> Translator<'a> {
                 return Ok(None);
             }
         }
-        Ok(Some((mid, duration, add_start, add_stop, fade_in, fade_out, transition_ms)))
+        Ok(Some((mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out)))
     }
 }
 
@@ -1192,7 +1311,9 @@ mod transition_tests {
     }
 
     #[test]
-    fn fly_transition_falls_back_to_instant_and_does_not_error() {
+    fn fly_transition_is_now_implemented() {
+        // Was previously a fallback-to-instant test ("fly" wasn't
+        // implemented) -- now genuinely supported, requested directly.
         let xlf = r#"<layout width="1080" height="1920">
             <region id="1" left="0" top="0" width="500" height="500">
                 <options><transitionType>fly</transitionType><transitionDuration>500</transitionDuration>
@@ -1201,10 +1322,69 @@ mod transition_tests {
                 <media id="9002" type="image" duration="10"><options><uri>b.png</uri></options></media>
             </region>
         </layout>"#;
-        // Must not panic/error -- falls back gracefully to instant switch.
         let html = translate_xlf(xlf);
-        assert!(!html.contains("transition = 'opacity"));
-        assert!(html.contains("document.getElementById('m9001').style.visibility = 'visible';"));
+        // N => (0, -100): arrives from above.
+        assert!(html.contains("el.style.transform = 'translate(0%, -100%)'"));
+        assert!(html.contains("transition = 'transform 500ms'"));
+        assert!(html.contains("el.style.transform = 'translate(0%, 0%)';"));
+        // No plain "instant visible" line for m9001 -- it's animated.
+        assert!(!html.contains("document.getElementById('m9001').style.visibility = 'visible';"));
+    }
+
+    #[test]
+    fn all_eight_compass_directions_produce_distinct_offsets() {
+        for (dir, dx, dy) in [
+            ("N", 0, -100), ("S", 0, 100), ("E", 100, 0), ("W", -100, 0),
+            ("NE", 100, -100), ("SE", 100, 100), ("SW", -100, 100), ("NW", -100, -100),
+        ] {
+            let xlf = format!(r#"<layout width="1080" height="1920">
+                <region id="1" left="0" top="0" width="500" height="500">
+                    <media id="9001" type="image" duration="10">
+                        <options><uri>a.png</uri>
+                        <transIn>fly</transIn><transInDuration>300</transInDuration>
+                        <transInDirection>{dir}</transInDirection></options>
+                    </media>
+                </region>
+            </layout>"#);
+            let html = translate_xlf(&xlf);
+            let expected = format!("el.style.transform = 'translate({dx}%, {dy}%)'");
+            assert!(html.contains(&expected),
+                    "direction {dir} should produce offset ({dx}%, {dy}%) -- got:\n{html}");
+        }
+    }
+
+    #[test]
+    fn fly_out_exits_toward_the_direction_and_bumps_zindex() {
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="500" height="500">
+                <media id="9001" type="image" duration="10">
+                    <options><uri>a.png</uri>
+                    <transOut>fly</transOut><transOutDuration>400</transOutDuration>
+                    <transOutDirection>E</transOutDirection></options>
+                </media>
+                <media id="9002" type="image" duration="10"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("el.style.zIndex = '9999';"));
+        assert!(html.contains("transition = 'transform 400ms'"));
+        assert!(html.contains("el.style.transform = 'translate(100%, 0%)';"));
+    }
+
+    #[test]
+    fn fly_direction_defaults_to_east_when_missing() {
+        // Matches the CMS's own default (confirmed in the real CMS
+        // source, Layout.php: getOptionValue('transInDirection', 'E')).
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="500" height="500">
+                <media id="9001" type="image" duration="10">
+                    <options><uri>a.png</uri>
+                    <transIn>fly</transIn><transInDuration>300</transInDuration></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("el.style.transform = 'translate(100%, 0%)'"));
     }
 }
 
@@ -1239,8 +1419,8 @@ mod per_widget_transition_tests {
     #[test]
     fn per_widget_trans_out_fadeout_overrides_empty_region_level() {
         // Mirrors the real XLF the user shared: region-level transition
-        // options present but empty, widget carries its own
-        // transIn=fly (not implemented) / transOut=fadeOut (implemented).
+        // options present but empty, widget carries its own transIn=fly
+        // and transOut=fadeOut, both now implemented.
         let xlf = r#"<layout width="720" height="1280">
             <region id="3488" left="0" top="0" width="250" height="250">
                 <options><loop>0</loop><transitionDirection/><transitionDuration/><transitionType/></options>
@@ -1263,14 +1443,21 @@ mod per_widget_transition_tests {
         // despite the region-level trio being empty.
         assert!(html.contains("transition = 'opacity 10000ms'"));
         assert!(html.contains("setTimeout(() => { el.style.visibility = 'hidden'; }, 10000)"));
-        // "fly" in-transition is not implemented -- show stays instant.
-        assert!(html.contains("document.getElementById('m3045').style.visibility = 'visible';"));
+        // "fly" in-transition is now implemented -- E => (100%, 0%).
+        assert!(html.contains("transition = 'transform 10000ms'"));
+        assert!(html.contains("el.style.transform = 'translate(100%, 0%)'"));
+        assert!(!html.contains("document.getElementById('m3045').style.visibility = 'visible';"));
     }
 
     #[test]
     fn per_widget_overrides_region_level_default() {
         // Region has its own real fadeIn default; widget explicitly
-        // opts for fadeOut instead -- widget-level must win.
+        // opts for its own fadeOut on the *out* side only -- its own
+        // transOut must win for hiding, while its (unspecified) transIn
+        // correctly still falls back to the region's fadeIn default for
+        // showing -- the two sides are resolved independently, each
+        // falling back to the region's own matching side only when the
+        // widget itself doesn't specify that particular side.
         let xlf = r#"<layout width="720" height="1280">
             <region id="1" left="0" top="0" width="250" height="250">
                 <options><transitionType>fadeIn</transitionType><transitionDuration>2000</transitionDuration></options>
@@ -1285,20 +1472,17 @@ mod per_widget_transition_tests {
             </region>
         </layout>"#;
         let html = translate_xlf(xlf);
-        // widget 4001 has its own transOut -> uses 500ms fadeOut, NOT
-        // the region's 2000ms fadeIn. widget 4002 (no override) legitimately
-        // falls back to the region's 2000ms fadeIn -- so "opacity 2000ms"
-        // DOES appear in the file overall (for widget 4002's own block),
-        // just not within widget 4001's own generated function block
-        // specifically, which is what actually needs checking here.
-        // Widget 4001's tuple is generated first and ends distinctly in
-        // `4001],` -- slicing up to (and including) that marker isolates
-        // exactly its own block, and nothing from widget 4002's.
+        // widget 4001: its own 500ms fadeOut for hiding...
         assert!(html.contains("setTimeout(() => { el.style.visibility = 'hidden'; }, 500)"));
+        // ...but correctly still the region's 2000ms fadeIn for showing,
+        // since it doesn't specify its own transIn at all.
         let end = html.find("4001],").unwrap() + "4001],".len();
         let widget_4001_block = &html[..end];
-        assert!(!widget_4001_block.contains("opacity 2000ms"),
-                "widget 4001's own block should not use the region's fadeIn duration");
+        assert!(widget_4001_block.contains("opacity 2000ms"),
+                "widget 4001 doesn't override transIn, so it must still use \
+                 the region's fadeIn default for showing");
+        assert!(widget_4001_block.contains("opacity 500ms"),
+                "widget 4001's own transOut override must be used for hiding");
     }
 
     #[test]
@@ -1316,6 +1500,77 @@ mod per_widget_transition_tests {
         </layout>"#;
         let html = translate_xlf(xlf);
         assert!(html.contains("opacity 2000ms"));
+    }
+
+    #[test]
+    fn region_level_fadein_applies_only_to_show_not_hide() {
+        // Regression test for a real bug introduced (and caught) while
+        // adding fly-transition support in this same session: an
+        // earlier version of this refactor applied the region's single
+        // fadeIn/fadeOut setting to *both* the show and hide side of
+        // any widget falling back to it, when the region's own
+        // transitionType string unambiguously means only ONE side
+        // ("fadeIn" only ever describes showing, never hiding).
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <options><transitionType>fadeIn</transitionType><transitionDuration>2000</transitionDuration></options>
+                <media id="4001" type="image" duration="5"><options><uri>a.png</uri></options></media>
+                <media id="4002" type="image" duration="5"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("transition = 'opacity 2000ms'; \
+                                    el.style.opacity = '0'; \
+                                    el.style.visibility = 'visible';"),
+                "region fadeIn must apply to showing");
+        // Hiding must stay the plain instant line -- fadeIn never
+        // applies to the hide side, regardless of the region-level
+        // fallback.
+        assert!(html.contains("document.getElementById('m4001').style.visibility = 'hidden'; "));
+    }
+
+    #[test]
+    fn region_level_fadeout_applies_only_to_hide_not_show() {
+        // Mirror of the test above, for the fadeOut side.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <options><transitionType>fadeOut</transitionType><transitionDuration>1500</transitionDuration></options>
+                <media id="4001" type="image" duration="5"><options><uri>a.png</uri></options></media>
+                <media id="4002" type="image" duration="5"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("setTimeout(() => { el.style.visibility = 'hidden'; }, 1500)"),
+                "region fadeOut must apply to hiding");
+        // Showing must stay the plain instant line.
+        assert!(html.contains("document.getElementById('m4001').style.visibility = 'visible';"));
+    }
+
+    #[test]
+    fn region_level_fly_applies_to_both_show_and_hide() {
+        // Unlike fadeIn/fadeOut (each unambiguously one side only), a
+        // region-level "fly" doesn't have separate in/out fields at
+        // all -- a single whole-region setting, applied to both sides
+        // (same direction for both), per this session's own design
+        // decision (see the region-level parsing's own doc comment).
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <options><transitionType>fly</transitionType><transitionDuration>600</transitionDuration>
+                <transitionDirection>S</transitionDirection></options>
+                <media id="4001" type="image" duration="5"><options><uri>a.png</uri></options></media>
+                <media id="4002" type="image" duration="5"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        // S => (0, 100) -- both show (arrives from) and hide (exits
+        // toward) must use this same direction.
+        assert!(html.contains("transition = 'transform 600ms'; \
+                                    el.style.transform = 'translate(0%, 0%)';")
+                || html.contains("el.style.transform = 'translate(0%, 100%)'; \
+                                    el.style.visibility = 'visible';"),
+                "fly must apply to showing");
+        assert!(html.contains("el.style.transform = 'translate(0%, 100%)';"),
+                "fly must apply to hiding, exiting toward the same direction");
     }
 }
 
