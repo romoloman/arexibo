@@ -7,8 +7,7 @@
 Arexibo is an unofficial alternate Digital Signage Player for [Xibo](https://xibo.org.uk),
 implemented mostly in Rust but making use of Qt GUI components, for Linux platforms.
 
-It is currently still incomplete.  Don't expect more complex features to work
-unless tested.
+It is currently almost complete but there are still some features that can present errors or not perfectly working
 
 
 ## Installation
@@ -100,3 +99,23 @@ Environment=NO_AT_BRIDGE=1
 [Install]
 WantedBy=multi-user.target
 ```
+## Useful flags for development
+
+    --debug: verbose logging (SOAP calls, internal state transitions).
+    --web-debug: logs every JS console message and page error from the rendered content – useful when troubleshooting a specific widget that isn’t displaying correctly.
+    --allow-offline: tolerates the CMS being unreachable at startup, falling back to cached settings/content if available, instead of failing outright.
+    --clear: wipes the local file cache (downloaded media/widget pages), forcing a full re-download on next start. Does not affect cached CMS connection settings.
+    --no-verify: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
+
+## Some useful environment variables
+
+Normal use:
+
+    AREXIBO_FONT_SCALE: a numeric multiplier (e.g. 0.91) applied globally to font sizes, to correct for rendering differences compared to a reference client on a different platform. Leave unset for the default (no correction).
+    QTWEBENGINE_CHROMIUM_FLAGS: standard Qt/Chromium mechanism for passing extra Chromium command-line flags (e.g. GPU-related tuning for a specific graphics driver). arexibo appends its own required flag (--disable-pinch, needed to disable pinch-to-zoom on multitouch panels) to whatever you set here, rather than overwriting it – both apply together.
+    QTWEBENGINE_REMOTE_DEBUGGING: QTWEBENGINE_REMOTE_DEBUGGING=9222 as an environment variable lets you inspect the rendered page from another machine’s Chrome/Edge at http://<host>:9222 (via an SSH tunnel if not on the same network) – useful for confirming content renders correctly without needing eyes on the actual totem screen.
+
+Diagnostic only – not for production use:
+
+    AREXIBO_FAKE_USERAGENT: overrides the user agent string reported to the CMS/widgets (e.g. windows to masquerade as a Windows client). Added specifically to investigate a rendering bug that turned out to be unrelated to the user agent at all – misrepresents the player to anything checking it, don’t leave this set normally.
+    AREXIBO_FAKE_CLIENTTYPE: overrides the clientType reported to the CMS during registration (currently only windows is implemented as an override value; anything else falls back to the real linux type with a warning). Added to test a hypothesis about CMS-side behavior differing by client type – same caveat as above, this misrepresents the player to the CMS’s own registration logic, which can affect other clientType-conditional CMS behavior beyond whatever you’re specifically testing.
