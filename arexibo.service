@@ -1,0 +1,38 @@
+[Unit]
+Description=Start X with Arexibo player (standalone kiosk mode)
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+Type=simple
+# BEFORE enabling this service, you must register the display once
+# manually (this stores the CMS connection settings + RSA key in the
+# envdir below, so no --host/--key flags are needed here afterwards --
+# see /usr/share/doc/arexibo/README.md's "Standalone setup with X
+# server" section for the full explanation):
+#
+#   sudo -u arexibo arexibo --host <CMS URL> --key <CMS key> /var/lib/arexibo
+#
+# (--display-id is optional -- if omitted, arexibo derives a stable id
+# automatically from /etc/machine-id; only pass it explicitly to match
+# an existing display record with a specific hardware key already
+# assigned in the CMS)
+#
+# Screen rotation, touch calibration, and audio setup are configured
+# separately in /etc/arexibo/kiosk.conf -- edit that file for your
+# specific hardware (defaults to no rotation/calibration if left
+# blank). These can't just go in a ~/.xinitrc: xinit does NOT read
+# that file when a client command is given explicitly like this, so
+# arexibo-kiosk-start (which does read kiosk.conf) is used as the
+# client instead of arexibo directly.
+#
+# Adjust `vt1` below if virtual terminal 1 is already in use by
+# something else on this system (e.g. a login getty).
+ExecStart=/usr/bin/xinit /usr/bin/arexibo-kiosk-start -- :0 vt1 -s 0 -dpms
+User=arexibo
+Restart=always
+RestartSec=60
+Environment=NO_AT_BRIDGE=1
+
+[Install]
+WantedBy=multi-user.target

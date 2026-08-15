@@ -1,0 +1,98 @@
+#!/bin/bash
+# Kiosk X11 environment setup for arexibo -- this is the actual xinit
+# "client" the systemd service launches (see arexibo.service's own
+# comments). Unlike a normal interactive X session, xinit does NOT read
+# ~/.xinitrc when a client command is given explicitly on its own
+# command line, which is exactly what arexibo.service does -- so
+# anything a ~/.xinitrc would normally do (screen rotation, touch
+# calibration, disabling the screensaver/DPMS, audio setup) has to
+# happen in a script like this one instead, invoked as that client.
+set -e
+
+CONF=/etc/arexibo/kiosk.conf
+if [ -f "$CONF" ]; then
+    # shellcheck source=/etc/arexibo/kiosk.conf
+    . "$CONF"
+fi
+
+# BUG fix (found from a real report: repeating "Failed to connect to
+# the bus: /usr/bin/dbus-launch terminated abnormally" from Chromium's
+# own internal bus.cc, every ~10s -- and separately, PulseAudio itself
+# also failing with "Unable to contact D-Bus"). The `arexibo` system
+# user (no normal login session -- see postinst) has no D-Bus session
+# bus already running for it. Providing one explicitly via
+# dbus-run-session fixes this -- but it must wrap the *entire rest of
+# this script* via a self-re-exec here at the top, not just the final
+# `exec arexibo` line: PulseAudio (started further below) needs the
+# bus just as much as arexibo/Chromium does, and a `dbus-run-session --
+# arexibo` at the very end would only cover that one final command,
+# leaving everything started earlier in the script (PulseAudio) outside
+# the session it provides.
+#
+# SEEN STILL FAILING on a fresh/early boot despite this check (real log:
+# the same "Failed to connect to the bus" repeating for several
+# minutes, alongside signs of a very early boot -- network not yet up,
+# GPU device events still settling). Merely checking whether
+# DBUS_SESSION_BUS_ADDRESS is *set* isn't the same as confirming a bus
+# is actually *reachable* at that address -- systemd can set this
+# variable to a default value for a `User=` service even before any
+# real session bus is listening there yet, especially this early after
+# boot. Actively testing connectivity (a real dbus-send round-trip,
+# with a short timeout so a genuinely dead/hung bus doesn't block
+# startup indefinitely) is a stronger check than merely testing for a
+# non-empty string.
+bus_is_working() {
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 1
+    timeout 3 dbus-send --session --print-reply \
+        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.ListNames > /dev/null 2>&1
+}
+if ! bus_is_working; then
+    exec dbus-run-session -- "$0" "$@"
+fi
+
+# NOTE: screen rotation via xrandr used to be applied here, but was
+# removed for this hardware (Intel GPU) -- rotating at runtime via
+# xrandr caused non-smooth scrolling in some web content. Rotation is
+# applied instead at the Xorg driver level
+# (/etc/X11/xorg.conf.d/20-intel-tearfree.conf, see the deployment
+# guide's Intel GPU section). If a future deployment's hardware doesn't
+# have this issue and needs xrandr-based rotation instead, re-add a
+# block here reading XRANDR_OUTPUT/XRANDR_ROTATE from kiosk.conf and
+# calling `xrandr --output "$XRANDR_OUTPUT" --rotate "$XRANDR_ROTATE"`
+# -- just don't combine both approaches (double-rotation).
+
+if [ -n "${TOUCH_DEVICE:-}" ] && [ -n "${TOUCH_MATRIX:-}" ]; then
+    # shellcheck disable=SC2086 -- TOUCH_MATRIX is deliberately
+    # word-split into 9 separate numeric arguments here.
+    xinput set-prop "$TOUCH_DEVICE" "Coordinate Transformation Matrix" $TOUCH_MATRIX || \
+        echo "arexibo-kiosk-start: touch calibration failed, continuing anyway" >&2
+fi
+
+xset s off
+xset s noblank
+xset -dpms
+
+# PulseAudio isn't always already running this early in a minimal,
+# no-desktop-environment X session -- start it explicitly and give it a
+# moment before trying to configure the default sink (setting mute/
+# volume on a sink that doesn't exist yet would silently do nothing).
+pulseaudio --start || true
+sleep 1
+pactl set-sink-mute @DEFAULT_SINK@ "${AUDIO_MUTE:-0}" || true
+pactl set-sink-volume @DEFAULT_SINK@ "${AUDIO_VOLUME:-100}%" || true
+
+# Export any extra Chromium flags from kiosk.conf -- arexibo itself
+# (gui/lib.cpp) reads and appends to whatever is already set here
+# rather than overwriting it, so this and arexibo's own required
+# --disable-pinch flag both end up applied correctly.
+if [ -n "${EXTRA_CHROMIUM_FLAGS:-}" ]; then
+    export QTWEBENGINE_CHROMIUM_FLAGS="$EXTRA_CHROMIUM_FLAGS"
+fi
+
+# Export font scaling from kiosk.conf, read directly by arexibo itself.
+if [ -n "${FONT_SCALE:-}" ]; then
+    export AREXIBO_FONT_SCALE="$FONT_SCALE"
+fi
+
+exec /usr/bin/arexibo --allow-offline /var/lib/arexibo
