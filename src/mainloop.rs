@@ -139,6 +139,13 @@ pub struct Handler {
     cms: CmsSettings,
     no_verify: bool,
     xmr_retry_key: Option<RsaPrivateKey>,
+    /// Unlike `xmr_retry_key` (only `Some` while a retry is actually
+    /// pending), this is *always* populated -- kept specifically so
+    /// XMR can be restarted later even after it's already running
+    /// successfully. See the `recv(self.xmr)` channel-closed handling
+    /// in `run()`'s own select! loop, and `RECONNECT_MAX_ATTEMPTS`'s
+    /// own doc comment in xmr.rs for the full context this exists for.
+    xmr_privkey: RsaPrivateKey,
     /// Feature (found from a real request: on first setup, or while
     /// waiting for the CMS operator to authorize a new display, the
     /// player used to just exit (a distinct exit code, 2, so a systemd
@@ -304,7 +311,7 @@ impl Handler {
                 Err(e) if allow_offline => {
                     log::warn!("could not set up XMR (will retry on a later collection \
                                 cycle instead of real-time push): {e:#}");
-                    xmr_retry_key = Some(privkey);
+                    xmr_retry_key = Some(privkey.clone());
                     never()
                 }
                 Err(e) => return Err(e),
@@ -369,7 +376,8 @@ impl Handler {
                                  dataupdate_retry_queue: Vec::new(),
                                  resource_retry_timer: never(),
                                  pending_auth: false,
-                                 debug_override, xmr_retry_key, cms: cms.clone(), no_verify };
+                                 debug_override, xmr_privkey: privkey.clone(),
+                                 xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
@@ -404,7 +412,8 @@ impl Handler {
                                  dataupdate_retry_queue: Vec::new(),
                                  resource_retry_timer: never(),
                                  pending_auth: true,
-                                 debug_override, xmr_retry_key: Some(privkey),
+                                 debug_override, xmr_privkey: privkey.clone(),
+                                 xmr_retry_key: Some(privkey),
                                  cms: cms.clone(), no_verify };
             slf.update_settings();
             Ok(slf)
@@ -665,7 +674,34 @@ impl Handler {
                         }
                         self.schedule_check();
                     }
-                    Err(_) => ()
+                    // BUG fix (found from a real, still-unresolved
+                    // report: repeated "Connection closed normally,
+                    // reconnecting in 10s" that never recovered on its
+                    // own -- only a full process restart fixed it).
+                    // The XMR thread now gives up (see
+                    // RECONNECT_MAX_ATTEMPTS in xmr.rs) after a bounded
+                    // number of failed reconnection attempts, dropping
+                    // its Sender -- which is exactly what closes this
+                    // channel, landing here. Previously a no-op; now
+                    // triggers a proper restart via the *existing*
+                    // xmr_retry_key + collect_once mechanism (already
+                    // used for --allow-offline), which uses whatever
+                    // settings/address are current at the time it
+                    // actually runs -- the same fresh state a full
+                    // process restart would pick up, without requiring
+                    // one. Replacing `self.xmr` with `never()`
+                    // immediately (rather than leaving the now-
+                    // disconnected channel in place) is essential, not
+                    // cosmetic: recv() on an already-disconnected
+                    // channel returns immediately rather than blocking,
+                    // so leaving it as-is would make this same arm fire
+                    // repeatedly in a busy-loop on every iteration of
+                    // this select!, until collect_once() eventually
+                    // replaces it with a real, working channel.
+                    Err(_) => {
+                        self.xmr_disconnected();
+                        collect = after(Duration::from_secs(0));
+                    }
                 },
                 // channel for  from the GUI thread
                 recv(self.from_gui) -> data => match data {
@@ -1051,6 +1087,20 @@ impl Handler {
     }
 
     /// Check if need to update the layouts to show.
+    /// See the matching `Err(_)` arm's own doc comment in `run()`'s
+    /// select! loop for the full context -- extracted into its own
+    /// method specifically so this logic (distinct from resetting the
+    /// select!-local `collect` timer, which stays inline at the call
+    /// site) can be tested directly, without needing to drive the
+    /// full, otherwise-infinite `run()` loop itself.
+    fn xmr_disconnected(&mut self) {
+        log::warn!("XMR connection thread ended (gave up reconnecting) -- \
+                    will restart it with fresh settings on the next \
+                    collection cycle");
+        self.xmr = never();
+        self.xmr_retry_key = Some(self.xmr_privkey.clone());
+    }
+
     fn schedule_check(&mut self) {
         // Prune expired Schedule Criteria before every evaluation, so a
         // stale value doesn't keep a criteria-conditioned layout active
@@ -1711,5 +1761,78 @@ mod sticky_ws_address_tests {
         let _ = handler.collect_once();
         assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1",
                    "a non-empty but port-less address must not replace a good, complete one");
+    }
+}
+
+#[cfg(test)]
+mod xmr_disconnected_tests {
+    use super::*;
+
+    fn start_mock_ready() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_xmr_disconnected_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn replaces_the_channel_and_arms_a_retry_with_the_kept_private_key() {
+        // Regression test for the real, still-unresolved report this
+        // whole fix is about: repeated "Connection closed normally,
+        // reconnecting in 10s" that never recovered on its own, only a
+        // full process restart fixed it. Confirms the *mainloop side*
+        // of the fix -- xmr.rs's own bounded-retry-then-give-up
+        // behavior is tested separately, over there.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        // Sanity check: clear whatever xmr_retry_key ended up as from
+        // construction (e.g. if the mock's bare "READY" response, with
+        // no real XMR address, already left one set) -- so this test
+        // can tell whether xmr_disconnected() itself is what
+        // (re)populates it, not just leftover state from construction.
+        handler.xmr_retry_key = None;
+
+        handler.xmr_disconnected();
+
+        assert!(handler.xmr_retry_key.is_some(),
+                "must arm a retry using the kept private key after the XMR channel disconnects");
+        // The replaced channel must be genuinely empty/disconnected-style
+        // (never()) -- recv'ing on it must not immediately return
+        // something stale from before.
+        assert!(handler.xmr.try_recv().is_err(),
+                "the channel must be replaced with an inert one, not left in its old state");
     }
 }

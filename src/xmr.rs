@@ -17,6 +17,18 @@ use crate::config::{CmsSettings, PlayerSettings};
 
 const READ_TMO: std::time::Duration = std::time::Duration::from_secs(40);
 const RECONNECT: std::time::Duration = std::time::Duration::from_secs(10);
+/// BUG fix (found from a real, still-unresolved report: repeated
+/// "Connection closed normally, reconnecting in 10s" that never
+/// recovered on its own -- only a full process restart fixed it,
+/// suggesting the reconnect loop retrying with the *same* captured
+/// uri/channel/cms_key indefinitely was the problem, not a genuinely
+/// permanent rejection). Direct suggestion: rather than retrying the
+/// exact same connect() forever, give up after a bounded number of
+/// attempts and let the *mainloop* redo a fresh RegisterDisplay-based
+/// XMR restart instead (see `run`'s own doc comment) -- using whatever
+/// settings/address are current at that point, exactly what a full
+/// process restart achieves, without requiring one.
+const RECONNECT_MAX_ATTEMPTS: u32 = 6;
 
 /// Possible messages to forward to the collect thread.
 #[derive(Debug)]
@@ -159,11 +171,22 @@ impl WsConnector {
         Ok(socket)
     }
 
+    /// BUG fix (see `RECONNECT_MAX_ATTEMPTS`'s own doc comment): used
+    /// to retry `connect()` here indefinitely, with the exact same
+    /// uri/channel/cms_key captured once at thread startup. Now gives
+    /// up after a bounded number of attempts, letting this function
+    /// return -- which drops `self.sender`, closing the channel from
+    /// the mainloop's own perspective. The mainloop's own handling of
+    /// that channel closing (see mainloop.rs's own `recv(self.xmr)`
+    /// match) is what actually restarts XMR via a fresh
+    /// `xmr::start()`, using its own always-current settings, rather
+    /// than this thread's own possibly-stale captured values.
     fn run(mut self) {
         loop {
             if let Err(e) = self.process_msg() {
                 log::error!("handling XMR message: {:#}, reconnecting in 10s", e);
                 thread::sleep(RECONNECT);
+                let mut attempt = 0;
                 loop {
                     match Self::connect(&self.uri, self.tls_config.clone(),
                                         &self.channel, &self.cms_key) {
@@ -171,7 +194,18 @@ impl WsConnector {
                             self.socket = socket;
                             break;
                         }
-                        Err(e) => log::error!("failed to reconnect XMR socket: {:#}", e),
+                        Err(e) => {
+                            attempt += 1;
+                            log::error!("failed to reconnect XMR socket (attempt \
+                                        {attempt}/{RECONNECT_MAX_ATTEMPTS}): {e:#}");
+                            if attempt >= RECONNECT_MAX_ATTEMPTS {
+                                log::error!("giving up on XMR WebSocket reconnection after \
+                                            {RECONNECT_MAX_ATTEMPTS} attempts -- the mainloop \
+                                            will restart XMR with fresh settings instead");
+                                return;
+                            }
+                            thread::sleep(RECONNECT);
+                        }
                     }
                 }
             }
@@ -211,6 +245,26 @@ impl WsConnector {
         if msg.is_ping() {
             retry_ws_on_eintr(|| self.socket.send(tungstenite::Message::Pong(msg.clone().into_data())))
                 .context("sending XMR WebSocket pong reply")?;
+            return Ok(());
+        }
+        // BUG fix (found from a direct suggestion: log the relay's own
+        // close reason instead of losing it). Previously, a Close
+        // message fell through both the is_ping() and is_text() checks
+        // below with no explicit handling at all -- silently discarding
+        // whatever code/reason string the relay sent (e.g. "Invalid
+        // key", the exact detail this session spent a long time trying
+        // to correlate via separate CMS/relay-side logs instead). The
+        // *next* read() call then genuinely fails with
+        // `Error::ConnectionClosed` ("Connection closed normally" --
+        // tungstenite's own literal Display text for that variant),
+        // which is all we were ever logging -- by then, the actually
+        // useful information from the Close frame itself was already
+        // gone. Logging it directly here means whatever specific
+        // reason the relay gives should now show up in arexibo's own
+        // log, without needing to correlate against a separate log on
+        // the CMS/relay side at all.
+        if let tungstenite::Message::Close(frame) = &msg {
+            log::warn!("{}", describe_close(frame));
             return Ok(());
         }
         if msg.is_text() {
@@ -258,18 +312,33 @@ impl ZmqConnector {
         Ok(socket)
     }
 
+    /// See the WebSocket variant's own `run` for the full explanation
+    /// of this fix -- same bounded-retry-then-let-mainloop-restart
+    /// approach, for the ZMQ fallback path.
     fn run(mut self) {
         loop {
             if let Err(e) = self.process_msg() {
                 log::error!("handling XMR message: {:#}, reconnecting in 10s", e);
                 thread::sleep(RECONNECT);
+                let mut attempt = 0;
                 loop {
                     match Self::connect(&self.channel, &self.uri) {
                         Ok(socket) => {
                             self.socket = socket;
                             break;
                         }
-                        Err(e) => log::error!("failed to reconnect XMR socket: {:#}", e),
+                        Err(e) => {
+                            attempt += 1;
+                            log::error!("failed to reconnect XMR socket (attempt \
+                                        {attempt}/{RECONNECT_MAX_ATTEMPTS}): {e:#}");
+                            if attempt >= RECONNECT_MAX_ATTEMPTS {
+                                log::error!("giving up on XMR ZMQ reconnection after \
+                                            {RECONNECT_MAX_ATTEMPTS} attempts -- the mainloop \
+                                            will restart XMR with fresh settings instead");
+                                return;
+                            }
+                            thread::sleep(RECONNECT);
+                        }
                     }
                 }
             }
@@ -482,6 +551,31 @@ fn retry_ws_on_eintr<T>(mut f: impl FnMut() -> Result<T, tungstenite::Error>)
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Format a WebSocket Close message's own code/reason for logging.
+///
+/// BUG fix (found from a direct suggestion: log the relay's own close
+/// reason instead of losing it silently). Previously, a Close message
+/// fell through both the is_ping() and is_text() checks in
+/// process_msg() with no explicit handling at all -- silently
+/// discarding whatever code/reason string the relay sent (e.g.
+/// "Invalid key", the exact detail this session spent a long time
+/// trying to correlate via separate CMS/relay-side logs instead). The
+/// *next* read() call then genuinely fails with
+/// `Error::ConnectionClosed` ("Connection closed normally" --
+/// tungstenite's own literal Display text for that variant), which is
+/// all that was ever logged -- by then, the actually useful
+/// information from the Close frame itself was already gone. Logging
+/// it directly (see process_msg's own use of this) means whatever
+/// specific reason the relay gives should now show up in arexibo's own
+/// log, without needing to correlate against a separate log on the
+/// CMS/relay side at all.
+fn describe_close(frame: &Option<tungstenite::protocol::CloseFrame>) -> String {
+    match frame {
+        Some(f) => format!("XMR WebSocket closed by the relay: {} (code {})", f.reason, f.code),
+        None => "XMR WebSocket closed by the relay (no reason given)".to_string(),
     }
 }
 
@@ -820,5 +914,54 @@ mod retry_ws_on_eintr_tests {
         assert!(matches!(result, Err(tungstenite::Error::ConnectionClosed)));
         assert_eq!(calls.load(Ordering::SeqCst), 1,
                    "must not retry for a non-Io tungstenite error");
+    }
+}
+
+#[cfg(test)]
+mod describe_close_tests {
+    use super::describe_close;
+    use tungstenite::protocol::CloseFrame;
+    use tungstenite::protocol::frame::coding::CloseCode;
+
+    #[test]
+    fn includes_the_relays_own_reason_text_and_code() {
+        // The exact scenario this whole fix is about: the relay closes
+        // with a specific reason (e.g. "Invalid key") -- this must
+        // appear verbatim in the formatted message, not be silently
+        // discarded as it was before this fix.
+        let frame = Some(CloseFrame {
+            code: CloseCode::Protocol,
+            reason: "Invalid key".into(),
+        });
+        let msg = describe_close(&frame);
+        assert!(msg.contains("Invalid key"),
+                "the relay's own close reason must appear in the log message -- got: {msg}");
+        assert!(msg.contains("1002"), "the numeric close code must also appear -- got: {msg}");
+    }
+
+    #[test]
+    fn handles_a_close_with_no_frame_at_all() {
+        // A bare Close(None) -- no code/reason given at all -- must
+        // still produce a sensible message, not panic or produce an
+        // empty/confusing string.
+        let msg = describe_close(&None);
+        assert!(!msg.is_empty());
+        assert!(msg.contains("no reason given"));
+    }
+
+    #[test]
+    fn different_reasons_produce_distinguishable_messages() {
+        // Sanity check: two different real-world reasons must not
+        // collapse into the same generic message -- the whole point is
+        // being able to tell them apart in the log.
+        let invalid_key = describe_close(&Some(CloseFrame {
+            code: CloseCode::Protocol,
+            reason: "Invalid key".into(),
+        }));
+        let going_away = describe_close(&Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "Server restarting".into(),
+        }));
+        assert_ne!(invalid_key, going_away);
     }
 }
