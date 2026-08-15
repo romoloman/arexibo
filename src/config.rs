@@ -3,7 +3,7 @@
 
 //! Definitions for the player configuration.
 
-use std::{collections::HashMap, fs::File, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, fs::File, path::Path, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use md5::{Md5, Digest};
 use serde::{Serialize, Deserialize};
@@ -11,8 +11,9 @@ use rustls::client::danger;
 use rustls::crypto::aws_lc_rs;
 use rustls_pki_types::CertificateDer;
 use crate::command::Command;
+use crate::util::fingerprint;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PlayerSettings {
     #[serde(default = "default_collect_interval")]
     pub collect_interval: u64,
@@ -93,6 +94,46 @@ pub struct PlayerSettings {
     // configured, so only gated by enable_shell_commands itself).
     #[serde(default)]
     pub shell_command_allow_list: String,
+}
+
+/// Manual `Debug` impl -- deliberately *not* derived. `xmr_cms_key` is
+/// a secret credential (see its own doc comment and xmr.rs's own
+/// `fingerprint` doc comment for the full context); a naive derived
+/// Debug would print it in clear text through any `{:?}`/log::debug!
+/// dump anywhere in the codebase, now or in the future, without
+/// whoever writes that call site necessarily remembering to redact it
+/// specifically. Implementing this by hand instead makes that
+/// mistake structurally impossible -- every field prints normally
+/// except this one, which always shows a short fingerprint (safe to
+/// compare across two dumps, e.g. to answer "did the CMS send the
+/// same key both times") instead of the actual secret.
+impl fmt::Debug for PlayerSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlayerSettings")
+            .field("collect_interval", &self.collect_interval)
+            .field("stats_enabled", &self.stats_enabled)
+            .field("xmr_network_address", &self.xmr_network_address)
+            .field("xmr_web_socket_address", &self.xmr_web_socket_address)
+            .field("xmr_cms_key", &format_args!("<redacted, fingerprint {}>",
+                                                 fingerprint(&self.xmr_cms_key)))
+            .field("log_level", &self.log_level)
+            .field("screenshot_interval", &self.screenshot_interval)
+            .field("screenshot_size", &self.screenshot_size)
+            .field("is_adspace_enabled", &self.is_adspace_enabled)
+            .field("download_start_window", &self.download_start_window)
+            .field("download_end_window", &self.download_end_window)
+            .field("embedded_server_port", &self.embedded_server_port)
+            .field("prevent_sleep", &self.prevent_sleep)
+            .field("display_name", &self.display_name)
+            .field("size_x", &self.size_x)
+            .field("size_y", &self.size_y)
+            .field("pos_x", &self.pos_x)
+            .field("pos_y", &self.pos_y)
+            .field("commands", &self.commands)
+            .field("enable_shell_commands", &self.enable_shell_commands)
+            .field("shell_command_allow_list", &self.shell_command_allow_list)
+            .finish()
+    }
 }
 
 impl PlayerSettings {
@@ -370,6 +411,35 @@ impl danger::ServerCertVerifier for DisabledVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_impl_never_reveals_the_xmr_cms_key_in_clear() {
+        // Requested directly: a debug option to print the settings
+        // received from the CMS in full, to help investigate exactly
+        // this kind of issue. Must never leak the one genuinely
+        // sensitive field in the process.
+        let mut s = PlayerSettings::default();
+        s.xmr_cms_key = "supersecretxmrcmskey12345".to_string();
+        let dump = format!("{s:?}");
+        assert!(!dump.contains("supersecretxmrcmskey12345"),
+                "the raw XMR CMS key must never appear in a Debug dump -- got: {dump}");
+        assert!(dump.contains("redacted"), "should clearly indicate the field was redacted");
+    }
+
+    #[test]
+    fn debug_impl_still_shows_every_other_field_normally() {
+        // The redaction must be surgical -- everything else stays
+        // fully visible and useful for troubleshooting, not swept into
+        // the same "redacted" treatment as the one sensitive field.
+        let mut s = PlayerSettings::default();
+        s.xmr_web_socket_address = "ws://192.168.2.138:8080".to_string();
+        s.display_name = "Totem Ingresso".to_string();
+        s.collect_interval = 123;
+        let dump = format!("{s:?}");
+        assert!(dump.contains("ws://192.168.2.138:8080"));
+        assert!(dump.contains("Totem Ingresso"));
+        assert!(dump.contains("123"));
+    }
 
     #[test]
     fn player_settings_defaults() {

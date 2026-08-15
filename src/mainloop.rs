@@ -281,6 +281,19 @@ impl Handler {
 
         // if we got settings, we are registered and authorized
         if let Some(mut settings) = res {
+            // Debug aid, requested directly: print exactly what the CMS
+            // sent (before any sticky-address correction below), so an
+            // investigation like the one that found the ordering bug
+            // right below this doesn't have to reconstruct it after the
+            // fact from scattered warning messages about individual
+            // fields -- the *complete* picture is available directly,
+            // gated behind --debug since it's verbose and only useful
+            // when actively troubleshooting. Safe to print in full:
+            // PlayerSettings's own Debug impl (see config.rs) redacts
+            // the one genuinely sensitive field (xmr_cms_key) to a
+            // fingerprint automatically, not something this call site
+            // needs to remember to do itself.
+            log::debug!("player settings received from CMS (initial registration): {settings:?}");
             // BUG fix (found from a real, well-documented upstream
             // report -- github.com/birkenfeld/arexibo/issues/33,
             // confirmed by multiple independent users): `--allow-offline`
@@ -860,6 +873,10 @@ impl Handler {
 
         // call register to get updated player settings
         if let Some(mut settings) = self.xmds.register_display()? {
+            // See the matching debug log + doc comment in `Handler::new`
+            // for why this is safe to print in full (xmr_cms_key gets
+            // auto-redacted by PlayerSettings's own Debug impl).
+            log::debug!("player settings received from CMS (collection cycle): {settings:?}");
             // See the matching check + doc comment in `Handler::new`
             // (section 63/64/69's own fix, policy revised after a
             // follow-up report showed this happening systematically) --

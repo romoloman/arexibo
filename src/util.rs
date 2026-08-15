@@ -13,6 +13,31 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
 /// Common time format used by the CMS.
+
+/// A short, stable fingerprint of a secret value (e.g. the XMR CMS
+/// key), safe to log or display -- lets two values be compared to
+/// tell whether they're the *same* secret, without ever printing the
+/// actual value itself.
+///
+/// Added to help investigate a real, still-unexplained report: the
+/// user directly ruled out the relay itself restarting (confirmed via
+/// systemd uptime, 4 days), yet suspects the *client* somehow starts
+/// using a different/stale key after running for a while -- but
+/// nothing found in the code review suggests channel/cms_key should
+/// ever change (channel is a deterministic hash of static CmsSettings
+/// fields; cms_key comes from a global CMS-wide setting, confirmed in
+/// the real CMS source). Rather than continue reasoning abstractly,
+/// this lets a future occurrence be checked directly: log lines from
+/// a "working" connection and a "no longer working" one, for the same
+/// display, can now be compared for a genuine mismatch instead of
+/// assuming one way or the other. Shared (not private to xmr.rs)
+/// specifically so PlayerSettings's own Debug impl (config.rs) can
+/// reuse it too, for the exact same reason: never let a secret field
+/// leak in clear text through a debug dump, while still letting two
+/// dumps be compared for a genuine difference.
+pub fn fingerprint(secret: &str) -> String {
+    hex::encode(Md5::digest(secret.as_bytes()))[..8].to_string()
+}
 pub static TIME_FMT: Lazy<Vec<time::format_description::FormatItem>> = Lazy::new(|| {
     time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap()
 });
@@ -225,6 +250,30 @@ pub fn timezone() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_is_deterministic_for_the_same_secret() {
+        // The whole point: comparing two log lines/dumps from
+        // different points in time must reliably tell whether the
+        // *same* secret was used both times.
+        assert_eq!(fingerprint("mysecretkey"), fingerprint("mysecretkey"));
+    }
+
+    #[test]
+    fn fingerprint_differs_for_different_secrets() {
+        assert_ne!(fingerprint("mysecretkey"), fingerprint("adifferentkey"));
+    }
+
+    #[test]
+    fn fingerprint_never_reveals_the_secret_itself() {
+        // Genuinely important, not just a nice-to-have: this gets
+        // logged/displayed, so the actual secret must never appear
+        // verbatim (or as an obvious substring) in the output.
+        let secret = "supersecretxmrcmskey12345";
+        let fp = fingerprint(secret);
+        assert!(!fp.contains(secret));
+        assert_eq!(fp.len(), 8, "expected a short, fixed-length fingerprint");
+    }
 
     #[test]
     fn percent_decode_basic() {

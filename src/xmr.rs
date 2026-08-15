@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use byteorder::{BE, ReadBytesExt};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use md5::{Md5, Digest};
+use crate::util::fingerprint;
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Deserializer, de::Error};
 use serde_json::{from_slice, from_str};
@@ -637,27 +637,6 @@ fn retry_ws_on_eintr<T>(mut f: impl FnMut() -> Result<T, tungstenite::Error>)
 /// specific reason the relay gives should now show up in arexibo's own
 /// log, without needing to correlate against a separate log on the
 /// CMS/relay side at all.
-/// A short, stable fingerprint of a secret value (e.g. the XMR CMS
-/// key), safe to log -- lets two log lines be compared to tell
-/// whether the *same* key was used both times, without ever printing
-/// the actual secret itself.
-///
-/// Added to help investigate a real, still-unexplained report: the
-/// user directly ruled out the relay itself restarting (confirmed via
-/// systemd uptime, 4 days), yet suspects the *client* somehow starts
-/// using a different/stale key after running for a while -- but
-/// nothing found in the code review suggests channel/cms_key should
-/// ever change (channel is a deterministic hash of static CmsSettings
-/// fields; cms_key comes from a global CMS-wide setting, confirmed in
-/// the real CMS source). Rather than continue reasoning abstractly,
-/// this lets a future occurrence be checked directly: log lines from
-/// a "working" connection and a "no longer working" one, for the same
-/// display, can now be compared for a genuine mismatch instead of
-/// assuming one way or the other.
-fn fingerprint(secret: &str) -> String {
-    hex::encode(Md5::digest(secret.as_bytes()))[..8].to_string()
-}
-
 fn describe_close(frame: &Option<tungstenite::protocol::CloseFrame>) -> String {
     match frame {
         Some(f) => format!("XMR WebSocket closed by the relay: {} (code {})", f.reason, f.code),
@@ -1108,35 +1087,6 @@ mod reconnect_budget_tests {
         assert!(gave_up, "genuine connect() failures must count toward the \
                           same give-up budget as successful-but-immediately-\
                           redropped cycles");
-    }
-}
-
-#[cfg(test)]
-mod fingerprint_tests {
-    use super::fingerprint;
-
-    #[test]
-    fn is_deterministic_for_the_same_secret() {
-        // The whole point: comparing two log lines from different
-        // points in time must reliably tell whether the *same* key was
-        // used both times.
-        assert_eq!(fingerprint("mysecretkey"), fingerprint("mysecretkey"));
-    }
-
-    #[test]
-    fn differs_for_different_secrets() {
-        assert_ne!(fingerprint("mysecretkey"), fingerprint("adifferentkey"));
-    }
-
-    #[test]
-    fn never_reveals_the_secret_itself() {
-        // Genuinely important, not just a nice-to-have: this gets
-        // logged, so the actual secret must never appear verbatim
-        // (or as an obvious substring) in the output.
-        let secret = "supersecretxmrcmskey12345";
-        let fp = fingerprint(secret);
-        assert!(!fp.contains(secret));
-        assert_eq!(fp.len(), 8, "expected a short, fixed-length fingerprint");
     }
 }
 
