@@ -205,7 +205,7 @@ impl PlayerSettings {
         let (h, m) = s.trim().split_once(':')?;
         let h: u16 = h.parse().ok()?;
         let m: u16 = m.parse().ok()?;
-        (h < 24 && m < 60).then(|| h * 60 + m)
+        (h < 24 && m < 60).then_some(h * 60 + m)
     }
 
     /// Pure logic behind `is_within_download_window`, split out purely

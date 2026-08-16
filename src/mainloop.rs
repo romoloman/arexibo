@@ -37,7 +37,12 @@ impl std::error::Error for NotAuthorized {}
 
 /// Messages sent to the GUI thread
 pub enum ToGui {
-    Settings(PlayerSettings),
+    // Boxed per clippy's own large_enum_variant lint: PlayerSettings is
+    // by far the largest variant here (288+ bytes) -- boxing it keeps
+    // every ToGui value's own stack footprint small regardless of which
+    // variant is actually in use, rather than every value (even a bare
+    // `Screenshot`) paying for the largest possible payload.
+    Settings(Box<PlayerSettings>),
     Layouts(Vec<i64>),
     Screenshot,
     WebHook(String),
@@ -233,6 +238,18 @@ const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Handler {
     /// Create a new handler, with channels to the GUI thread.
+    // Deliberately not refactored into a bundled "options" struct to
+    // satisfy clippy's default threshold here: these 9 parameters are
+    // already loosely grouped by role (identity/settings, behavior
+    // flags, channels) and are read directly, in this same order, at
+    // every one of this function's 9 call sites (8 in this file's own
+    // tests, 1 in main.rs) -- bundling them would touch all of those
+    // call sites for a purely stylistic lint, not a functional one,
+    // with real risk of silently swapping two same-typed flags in the
+    // process. A constructor genuinely needing this many independent,
+    // unrelated pieces of configuration is a reasonable, common
+    // exception to this particular lint.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(cms: &CmsSettings, clear_cache: bool, envdir: &Path,
                no_verify: bool, allow_offline: bool, debug_override: bool,
                to_gui: Sender<ToGui>, from_gui: Receiver<FromGui>,
@@ -1359,7 +1376,7 @@ impl Handler {
         self.cache.adspace_enabled = self.settings.is_adspace_enabled;
 
         // let the GUI know to reconfigure itself
-        self.to_gui.send(ToGui::Settings(self.settings.clone())).unwrap();
+        self.to_gui.send(ToGui::Settings(Box::new(self.settings.clone()))).unwrap();
     }
 }
 
