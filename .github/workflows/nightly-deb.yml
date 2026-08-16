@@ -81,7 +81,11 @@ jobs:
 
       - name: Build .deb
         if: steps.check.outputs.skip != 'true'
-        run: ./deb/build-deb.sh "${{ steps.version.outputs.nightly_version }}"
+        # `bash deb/build-deb.sh` rather than `./deb/build-deb.sh`:
+        # deliberately doesn't rely on git having tracked this file's
+        # executable bit correctly (found from a real CI failure --
+        # "Permission denied", exit 126 -- on a fresh runner checkout).
+        run: bash deb/build-deb.sh "${{ steps.version.outputs.nightly_version }}"
 
       - name: Publish nightly release
         if: steps.check.outputs.skip != 'true'

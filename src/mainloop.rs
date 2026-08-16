@@ -1948,9 +1948,9 @@ mod sticky_address_applies_to_first_connection_tests {
         // Pre-populate settings.json with the good, complete address --
         // simulating a previous, successful run.
         let settings_path = envdir.join("settings.json");
-        let mut prev = PlayerSettings::default();
-        prev.xmr_web_socket_address = good_address.clone();
-        prev.to_file(&settings_path).unwrap();
+        let prev = PlayerSettings { xmr_web_socket_address: good_address.clone(),
+                                     ..Default::default() };
+        prev.to_file(settings_path).unwrap();
 
         // This fresh registration deliberately returns a *port-less*
         // address (xmrType=ws, but no port) -- the exact real-world

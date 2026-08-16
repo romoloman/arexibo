@@ -418,8 +418,8 @@ mod tests {
         // received from the CMS in full, to help investigate exactly
         // this kind of issue. Must never leak the one genuinely
         // sensitive field in the process.
-        let mut s = PlayerSettings::default();
-        s.xmr_cms_key = "supersecretxmrcmskey12345".to_string();
+        let s = PlayerSettings { xmr_cms_key: "supersecretxmrcmskey12345".to_string(),
+                                  ..Default::default() };
         let dump = format!("{s:?}");
         assert!(!dump.contains("supersecretxmrcmskey12345"),
                 "the raw XMR CMS key must never appear in a Debug dump -- got: {dump}");
@@ -431,10 +431,10 @@ mod tests {
         // The redaction must be surgical -- everything else stays
         // fully visible and useful for troubleshooting, not swept into
         // the same "redacted" treatment as the one sensitive field.
-        let mut s = PlayerSettings::default();
-        s.xmr_web_socket_address = "ws://192.168.2.138:8080".to_string();
-        s.display_name = "Totem Ingresso".to_string();
-        s.collect_interval = 123;
+        let s = PlayerSettings { xmr_web_socket_address: "ws://192.168.2.138:8080".to_string(),
+                                  display_name: "Totem Ingresso".to_string(),
+                                  collect_interval: 123,
+                                  ..Default::default() };
         let dump = format!("{s:?}");
         assert!(dump.contains("ws://192.168.2.138:8080"));
         assert!(dump.contains("Totem Ingresso"));
