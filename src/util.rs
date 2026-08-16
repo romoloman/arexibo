@@ -12,8 +12,6 @@ use nix::{sys::statvfs, unistd::gethostname};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
-/// Common time format used by the CMS.
-
 /// A short, stable fingerprint of a secret value (e.g. the XMR CMS
 /// key), safe to log or display -- lets two values be compared to
 /// tell whether they're the *same* secret, without ever printing the
@@ -38,6 +36,8 @@ use serde::{Deserialize, Deserializer, Serializer, de::Error};
 pub fn fingerprint(secret: &str) -> String {
     hex::encode(Md5::digest(secret.as_bytes()))[..8].to_string()
 }
+
+/// Common time format used by the CMS.
 pub static TIME_FMT: Lazy<Vec<time::format_description::FormatItem>> = Lazy::new(|| {
     time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]").unwrap()
 });

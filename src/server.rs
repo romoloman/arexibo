@@ -280,12 +280,12 @@ impl Server {
                 };
                 let ext = canonical_path.extension().and_then(|e| e.to_str());
 
-                let query_params = (!query.is_empty()).then(|| query.split('&').map(|p| {
+                let query_params = if !query.is_empty() { query.split('&').map(|p| {
                     let mut kv = p.split('=');
                     let k = percent_decode(kv.next().unwrap_or(""));
                     let v = percent_decode(kv.next().unwrap_or(""));
                     (k, v)
-                }).collect::<HashMap<_, _>>()).unwrap_or_default();
+                }).collect::<HashMap<_, _>>() } else { Default::default() };
 
                 if !canonical_path.is_file() {
                     log::warn!("processing HTTP req {}: 404 not found", req.url());

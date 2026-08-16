@@ -929,7 +929,7 @@ impl Handler {
                 log::info!("display just got authorized in the CMS, proceeding \
                             with normal operation");
                 self.pending_auth = false;
-                if let Err(e) = self.settings.to_file(&self.envdir.join("settings.json")) {
+                if let Err(e) = self.settings.to_file(self.envdir.join("settings.json")) {
                     log::warn!("writing player settings after authorization: {e:#}");
                 }
             }
