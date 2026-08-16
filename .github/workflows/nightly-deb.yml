@@ -1,0 +1,103 @@
+name: Nightly .deb build
+
+# Builds the kiosk .deb package (see deb/build-deb.sh) every night and
+# publishes it to a single, fixed "nightly" GitHub Release -- so there's
+# always one stable URL to grab the latest build from, rather than
+# having to dig through individual Actions run artifacts each time.
+#
+# Also runnable manually (workflow_dispatch) for on-demand builds
+# without waiting for the schedule, e.g. right after merging a fix
+# that needs testing on real hardware.
+
+on:
+  schedule:
+    # 02:00 UTC daily. Skips silently (no build, no release update) if
+    # master hasn't changed since the last nightly -- see the "check
+    # for changes" step below.
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  nightly-deb:
+    name: Build nightly .deb
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to create/update the release and its tag
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history for the "changed since last nightly" check
+
+      - name: Check for changes since the last nightly
+        id: check
+        run: |
+          # Skip the actual build entirely if master is exactly what the
+          # last nightly was already built from -- avoids a pointless
+          # rebuild-and-republish of byte-identical output every single
+          # night when nothing changed, and the noise of a new release
+          # timestamp with nothing new in it.
+          if git rev-parse refs/tags/nightly >/dev/null 2>&1; then
+            LAST=$(git rev-list -n 1 refs/tags/nightly 2>/dev/null || echo "")
+            CURRENT=$(git rev-parse HEAD)
+            if [ "$LAST" = "$CURRENT" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "No changes since the last nightly build ($LAST) -- skipping."
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            g++ \
+            libdbus-1-dev \
+            libzmq3-dev \
+            qt6-webengine-dev \
+            libudev-dev \
+            pkg-config
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        if: steps.check.outputs.skip != 'true'
+        with:
+          toolchain: stable
+
+      - name: Determine nightly version
+        if: steps.check.outputs.skip != 'true'
+        id: version
+        run: |
+          BASE_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          # `~nightly.YYYYMMDD` -- the `~` sorts *before* nothing at all
+          # in dpkg's own version comparison rules, so this nightly is
+          # correctly treated as "older" than the eventual real release
+          # of the same base version, exactly the right semantics for a
+          # pre-release build (e.g. `0.6.0~nightly.20260816` < `0.6.0`).
+          NIGHTLY_VERSION="${BASE_VERSION}~nightly.$(date -u +%Y%m%d)"
+          echo "nightly_version=${NIGHTLY_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${NIGHTLY_VERSION}"
+
+      - name: Build .deb
+        if: steps.check.outputs.skip != 'true'
+        run: ./deb/build-deb.sh "${{ steps.version.outputs.nightly_version }}"
+
+      - name: Publish nightly release
+        if: steps.check.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: nightly
+          name: "Nightly build (${{ steps.version.outputs.nightly_version }})"
+          body: |
+            Automated nightly build from commit ${{ github.sha }}.
+
+            **Not a stable release** -- built directly from the tip of
+            `master` every night, may include untested or in-progress
+            changes. Use a tagged release for production deployments.
+          prerelease: true
+          # Overwrites the previous nightly's assets/tag/body each time
+          # -- keeps a single, stable download URL rather than
+          # accumulating a new release every night.
+          make_latest: false
+          files: dist/arexibo_*.deb
