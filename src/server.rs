@@ -404,8 +404,8 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
             font-weight: 600; color: #333333; letter-spacing: 0.05em;">
   LOADING...
 </div>
-<div style="margin-top: 12px; font-family: sans-serif; font-size: 16px;
-            color: #888888;">
+<div style="margin-top: 16px; font-family: sans-serif; font-size: 32px;
+            font-weight: 500; color: #555555;">
   {hostname} &middot; {ips_display}
 </div>
 </body>
