@@ -24,7 +24,7 @@ jobs:
     permissions:
       contents: write  # needed to create/update the release and its tag
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0  # need full history for the "changed since last nightly" check
 
