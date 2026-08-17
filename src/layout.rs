@@ -718,7 +718,7 @@ impl<'a> Translator<'a> {
         // for why.
         let media_geom = [0, 0, w, h];
         for media in region.find_all("media") {
-            match self.write_media(rid, media_geom, media, (region_in, region_out)) {
+            match self.write_media(rid, media_geom, (x, y), media, (region_in, region_out)) {
                 Err(e) => log::error!("layout: could not translate media: {:#}", e),
                 Ok(None) => continue,
                 Ok(Some(res)) => {
@@ -880,7 +880,7 @@ impl<'a> Translator<'a> {
         Ok(())
     }
 
-    fn write_media(&mut self, rid: i32, [x, y, w, h]: [i32; 4],
+    fn write_media(&mut self, rid: i32, [x, y, w, h]: [i32; 4], (abs_x, abs_y): (i32, i32),
                    media: &Element, region_fallback: ((Trans, u32), (Trans, u32))) -> Result<Option<MediaInfo>> {
         let mid = media.parse_attr("id")?;
         let opts = media.find("options").context("no options")?;
@@ -1007,8 +1007,24 @@ impl<'a> Translator<'a> {
                     writeln!(self.out, "<div class='media r{rid}' id='m{mid}' \
                                         style='left: {x}px; top: {y}px; width: {w}px; \
                                         height: {h}px;'></div>")?;
+                    // Deliberately abs_x/abs_y here, NOT the (0,0)-
+                    // relative x/y used just above for the placeholder's
+                    // own CSS -- jsNativeWebShow drives a *separate*,
+                    // real Qt QWebEngineView positioned in native window
+                    // coordinates (see Window::jsNativeWebShowImpl in
+                    // gui/view.cpp), entirely outside this page's own
+                    // DOM/CSS -- it has no wrapper div to be relative
+                    // to at all, and needs this region's real on-screen
+                    // position directly. Regression found from a real
+                    // report: using the same (0,0)-relative x/y here
+                    // (matching a stale copy-paste from the CSS
+                    // placeholder above, after the fly-transition fix
+                    // introduced that relative geometry) made every
+                    // native webpage widget land at the same spot
+                    // (the base view's own top-left corner) regardless
+                    // of its own region's actual position.
                     add_start = format!(
-                        "window.arexiboGui.jsNativeWebShow({mid}, {url:?}, {x}, {y}, {w}, {h});");
+                        "window.arexiboGui.jsNativeWebShow({mid}, {url:?}, {abs_x}, {abs_y}, {w}, {h});");
                     add_stop = format!("window.arexiboGui.jsNativeWebHide({mid});");
                 } else {
                     writeln!(self.out, "<iframe class='media r{rid}' id='m{mid}' src='{url}' \
@@ -1492,6 +1508,68 @@ mod transition_tests {
         </layout>"#;
         let html = translate_xlf(xlf);
         assert!(html.contains("el.style.transform = 'translate(100%, 0%)'"));
+    }
+}
+
+#[cfg(test)]
+mod native_webpage_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn translate_xlf(xlf: &str) -> String {
+        let dir = tempdir();
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let map = HashMap::new();
+        let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        html
+    }
+
+    fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_native_webpage_test_{}_{n}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn native_webpage_js_call_uses_the_regions_real_absolute_position() {
+        // Regression test for a real report: after the fly-transition
+        // fix introduced a (0,0)-relative wrapper div (see
+        // transition_tests's own region_gets_a_fixed_overflow_hidden_
+        // wrapper test), the region-relative (0,0) geometry meant for
+        // that wrapper's CSS was mistakenly also reused for this
+        // widget's own jsNativeWebShow() call -- which drives a
+        // completely separate, real Qt QWebEngineView positioned in
+        // native window coordinates (gui/view.cpp), with no wrapper div
+        // to be relative to at all. That made every native webpage
+        // widget land at the same spot (the base view's own top-left
+        // corner) regardless of its own region's actual position.
+        let xlf = r#"<layout width="1920" height="1080">
+            <region id="7" left="150" top="250" width="400" height="300">
+                <media id="9001" type="webpage" render="native" duration="10">
+                    <options><uri>https://example.com</uri></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        // The JS call must use the region's real, absolute (150, 250)
+        // position -- not (0, 0), which is what the wrapper-relative
+        // geometry alone would produce.
+        assert!(html.contains(r#"window.arexiboGui.jsNativeWebShow(9001, "https://example.com", 150, 250, 400, 300);"#),
+                "native webpage JS call must use the real absolute region position -- got:\n{html}");
+        // Meanwhile the placeholder <div>'s own CSS must still be
+        // (0,0)-relative to its wrapper, same as every other widget --
+        // this widget type isn't exempt from that part of the fix.
+        assert!(html.contains("style='left: 0px; top: 0px; width: 400px; height: 300px;'></div>"),
+                "the placeholder div itself must still use wrapper-relative (0,0) CSS -- got:\n{html}");
     }
 }
 
