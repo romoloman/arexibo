@@ -10,6 +10,7 @@
 #include <QtWebEngineCore/QWebEngineScriptCollection>
 #include <QtWebChannel/QWebChannel>
 #include <iostream>
+#include <cstdlib>
 
 #include "lib.h"
 
@@ -43,7 +44,48 @@ class LoggingPage : public QWebEnginePage
 {
     Q_OBJECT
 public:
-    LoggingPage(QObject *parent = nullptr) : QWebEnginePage(parent) {}
+    LoggingPage(QObject *parent = nullptr) : QWebEnginePage(parent)
+    {
+        // BUG fix (found from a real report: a touch controller
+        // intermittently reporting more simultaneous touch points than
+        // Chromium's own hardcoded 16-point limit -- an out-of-bounds
+        // std::array access deep inside Blink's own touch event
+        // handling, std::array<blink::WebTouchPoint, 16>::operator[] --
+        // crashed the *renderer* process specifically, on only one
+        // totem, intermittently, consistent with a flaky touch
+        // controller/cable/grounding issue rather than a genuine
+        // 17-finger touch or a systemic software bug). Chromium's own
+        // multi-process architecture means this doesn't necessarily
+        // bring down arexibo's own top-level process at all -- the
+        // GUI's own event loop keeps running, but the QWebEngineView
+        // this page belongs to is left showing nothing further (a
+        // black screen, reported directly), with no built-in recovery
+        // of its own. Connecting to renderProcessTerminated here
+        // (rather than at each individual call site) covers every view
+        // that uses LoggingPage -- the main view, the overlay view, and
+        // every render="native" widget view -- uniformly, in one place.
+        //
+        // Deliberately exits the *entire* arexibo process outright,
+        // rather than trying to reload just the affected page/view in
+        // place: a renderer crash this deep inside Chromium's own
+        // internals isn't something we have any reliable way to
+        // recover from at our level (e.g. Chromium's own GPU/compositor
+        // state, shared across every view in the process, could easily
+        // be left in a similarly bad state too) -- and arexibo.service
+        // already has `Restart=always` (see arexibo.service itself),
+        // so a clean, deliberate exit here is picked up automatically,
+        // giving a genuinely fresh Xorg + arexibo + Chromium process
+        // tree rather than a totem stuck on a black screen indefinitely
+        // until someone manually intervenes on site.
+        connect(this, &QWebEnginePage::renderProcessTerminated,
+                [](QWebEnginePage::RenderProcessTerminationStatus status, int exitCode) {
+            std::cout << "ERROR: [arexibo::qt] renderer process terminated "
+                       << "(status=" << static_cast<int>(status) << ", exitCode=" << exitCode
+                       << ") -- exiting so systemd (Restart=always) can start a fresh instance"
+                       << std::endl;
+            std::exit(1);
+        });
+    }
 
 protected:
     void javaScriptConsoleMessage(JavaScriptConsoleMessageLevel level, const QString &message,
