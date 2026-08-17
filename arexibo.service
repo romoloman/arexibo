@@ -31,7 +31,7 @@ Type=simple
 ExecStart=/usr/bin/xinit /usr/bin/arexibo-kiosk-start -- :0 vt1 -s 0 -dpms
 User=arexibo
 Restart=always
-RestartSec=60
+RestartSec=3
 Environment=NO_AT_BRIDGE=1
 
 [Install]
