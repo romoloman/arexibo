@@ -7,7 +7,7 @@
 Arexibo is an unofficial alternate Digital Signage Player for [Xibo](https://xibo.org.uk),
 implemented mostly in Rust but making use of Qt GUI components, for Linux platforms.
 
-It is currently almost complete but there are still some features that can present errors or not perfectly working
+It is currently almost complete but there are still some features that may present errors or that maybe are not perfectly working
 
 
 ## Installation
