@@ -12,7 +12,7 @@ It is currently almost complete but there are still some features that can prese
 
 ## Installation
 
-A nigly build is provided but it's better to compile from source.
+A nightly build is provided but it's better to compile from source.
 
 To build from source, you need:
 
