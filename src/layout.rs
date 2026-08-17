@@ -605,6 +605,40 @@ impl<'a> Translator<'a> {
                                 </style>")?;
         }
 
+        // BUG fix (found from a real report: the incoming widget during
+        // a "fly" transition rendered outside its own region's visual
+        // area, then jumped into position rather than sliding in
+        // smoothly). Root cause: previously each widget WAS its own
+        // absolutely-positioned element (left/top/width/height set
+        // directly, matching the region's own geometry) -- transform-
+        // translating it for "fly" moved that entire box, with nothing
+        // left behind to clip where it travelled *through* on its way
+        // in/out. This wrapper is the region's own fixed, stationary
+        // "window" (real geometry + overflow: hidden); each widget
+        // inside it now uses relative (0,0,100%,100%) coordinates (see
+        // the `media_geom` passed to write_media below) instead of the
+        // absolute region position, so a fly transform moves the widget
+        // only *within* this fixed, clipped viewport -- visible sliding
+        // in from just outside the region's own edge, not anywhere else
+        // on the whole page.
+        //
+        // MUST be opened here, before the write_media() loop below --
+        // an earlier version of this fix opened it *after* that loop
+        // instead (to avoid an unclosed div for an empty region), which
+        // meant every widget's own HTML (written *during* the loop) was
+        // emitted as a preceding *sibling* of the wrapper, not nested
+        // inside it at all -- so its "left:0; top:0" ended up relative
+        // to <body> itself (the whole page's own top-left corner)
+        // rather than to this wrapper, a real, visible bug found on a
+        // real totem (widget appearing at the screen's top-left instead
+        // of its correct position). An empty region now gets an empty,
+        // harmless open+close wrapper pair instead of no wrapper at all
+        // (see the nitems==0 check below) -- far simpler than deferring
+        // this decision, and has no visible or functional effect.
+        writeln!(self.out, "<div class='r{rid}' style='position: absolute; \
+                            left: {x}px; top: {y}px; width: {w}px; height: {h}px; \
+                            overflow: hidden;'>")?;
+
         // Confirmed real schema (account.xibosignage.com/docs/developer/
         // creating-a-player/xlf, fetched and read during development):
         // a region's own <options> can carry <transitionType>
@@ -677,8 +711,14 @@ impl<'a> Translator<'a> {
             .map(|e| e.text().trim() == "1").unwrap_or(false);
 
         let mut sequence = Vec::new();
+        // [0, 0, w, h] rather than the real [x, y, w, h] geom -- each
+        // widget is now positioned *relative to the wrapper div* above
+        // (which already carries the real region position), not
+        // relative to the whole page. See the wrapper's own doc comment
+        // for why.
+        let media_geom = [0, 0, w, h];
         for media in region.find_all("media") {
-            match self.write_media(rid, geom, media, (region_in, region_out)) {
+            match self.write_media(rid, media_geom, media, (region_in, region_out)) {
                 Err(e) => log::error!("layout: could not translate media: {:#}", e),
                 Ok(None) => continue,
                 Ok(Some(res)) => {
@@ -693,6 +733,12 @@ impl<'a> Translator<'a> {
         let nitems = sequence.len();
 
         if nitems == 0 {
+            // Empty, harmless wrapper (opened above, before this
+            // function knew whether there'd be anything to show) --
+            // still needs its matching close so the HTML stays
+            // balanced. See the wrapper's own doc comment above for why
+            // this is simpler than deferring whether to open it at all.
+            writeln!(self.out, "</div> <!-- end region {rid} wrapper (empty) -->")?;
             return Ok(());
         }
 
@@ -829,6 +875,7 @@ impl<'a> Translator<'a> {
         }
         writeln!(self.out, "  ],")?;
         writeln!(self.out, "}};\n</script>")?;
+        writeln!(self.out, "</div> <!-- end region {rid} wrapper -->")?;
         self.regions.push(rid);
         Ok(())
     }
@@ -1218,6 +1265,66 @@ fn object_pos(el: &Element) -> &'static str {
 mod transition_tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn region_gets_a_fixed_overflow_hidden_wrapper_with_widgets_positioned_relatively() {
+        // Regression test for a real report: during a "fly" transition,
+        // the incoming widget rendered outside its own region's visual
+        // area, then jumped into position, instead of sliding in
+        // smoothly clipped to the region -- because each widget used to
+        // be its own absolutely-positioned element (matching the
+        // region's real geometry directly), so a transform-translate
+        // moved the whole box with nothing clipping where it travelled
+        // through. Confirms the fix: a real geometry + overflow:hidden
+        // wrapper div exists, and the widget inside it uses relative
+        // (0,0,100%,100%) coordinates instead of the absolute region
+        // position.
+        let xlf = r#"<layout width="1920" height="1080">
+            <region id="42" left="100" top="200" width="300" height="400">
+                <media id="9001" type="image" duration="10"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("class='r42' style='position: absolute; \
+                                left: 100px; top: 200px; width: 300px; height: 400px; \
+                                overflow: hidden;'"),
+                "region wrapper must carry the real geometry and overflow:hidden -- got:\n{html}");
+        // The widget itself must use relative (0,0,100%->300px/400px)
+        // coordinates, not the absolute region position (100,200) --
+        // width/height stay the same (that's the widget's own real
+        // size), only the offset changes.
+        assert!(html.contains("left: 0px; top: 0px; width: 300px; height: 400px;"),
+                "widget must be positioned relative to its wrapper, not the whole page -- got:\n{html}");
+        // Critical check, not redundant with the two above: the wrapper
+        // must actually come *before* the widget in the real HTML/DOM
+        // order, not just exist somewhere in the output -- this is
+        // exactly the real bug found on a real totem (the wrapper
+        // existed, but the widget's own HTML had already been written
+        // as a preceding sibling by the time the wrapper opened).
+        let div_pos = html.find("class='r42' style='position: absolute;")
+            .expect("wrapper div must exist");
+        let img_pos = html.find("<img class='media r42'")
+            .expect("widget img must exist");
+        assert!(div_pos < img_pos,
+                "the wrapper div must open BEFORE the widget's own HTML, so the \
+                 widget ends up nested inside it, not as a preceding sibling -- \
+                 div at {div_pos}, img at {img_pos}");
+    }
+
+    #[test]
+    fn an_empty_region_gets_a_harmless_empty_wrapper() {
+        // A region with no displayable media still gets its wrapper
+        // (opened before knowing whether there'd be anything inside,
+        // see write_region's own doc comment on why) -- but it must be
+        // empty and properly closed, not left unbalanced.
+        let xlf = r#"<layout width="1920" height="1080">
+            <region id="42" left="0" top="0" width="300" height="400">
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("class='r42'"), "the wrapper itself is still emitted");
+        assert!(html.contains("end region 42 wrapper (empty)"));
+    }
 
     fn translate_xlf(xlf: &str) -> String {
         let dir = tempdir();
