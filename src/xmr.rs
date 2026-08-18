@@ -228,9 +228,25 @@ impl WsConnector {
         let stream = match uri.scheme_str() {
             Some("ws") => MaybeTlsStream::Plain(socket),
             Some("wss") => {
+                // BUG fix (found from a real, live test against a real
+                // CMS with a genuine TLS certificate: "invalid peer
+                // certificate: certificate not valid for name
+                // 'localhost'; certificate is only valid for
+                // DnsName('xibotest.tmaxlab.it')"). This was hardcoded
+                // to the literal string "localhost" regardless of the
+                // actual host being connected to -- meaning a properly
+                // *verified* wss:// connection to any real host (i.e.
+                // without --no-verify, which bypasses this check
+                // entirely and had been masking this bug) could never
+                // have worked at all, ever, for any deployment. Uses
+                // this connection's own real host instead, exactly
+                // matching what any TLS client is supposed to validate
+                // the presented certificate against.
+                let host = uri.host().context("XMR WebSocket URI missing host")?
+                              .to_string();
                 let connector = rustls::ClientConnection::new(
                     tls_config,
-                    "localhost".try_into()?
+                    host.try_into()?
                 ).context("negotiating TLS connection for XMR WebSocket")?;
                 let stream = rustls::StreamOwned::new(connector, socket);
                 MaybeTlsStream::Rustls(stream)
@@ -1144,6 +1160,118 @@ mod reconnect_budget_tests {
         assert!(gave_up, "genuine connect() failures must count toward the \
                           same give-up budget as successful-but-immediately-\
                           redropped cycles");
+    }
+}
+
+#[cfg(test)]
+mod wss_tls_hostname_tests {
+    use super::*;
+
+    /// Runs a minimal, real TLS server on 127.0.0.1 (random port),
+    /// presenting a genuine self-signed certificate valid *only* for
+    /// the IP address 127.0.0.1 (via rcgen's IP SAN support) -- not
+    /// "localhost". Accepts exactly one connection, does the TLS
+    /// handshake, then just keeps it open briefly (this test only
+    /// needs the handshake itself to succeed or fail, not any actual
+    /// WebSocket traffic afterward).
+    fn start_tls_server_for_ip(ip: std::net::IpAddr)
+        -> (u16, rustls::pki_types::CertificateDer<'static>) {
+        // Must happen before the server thread below tries to build
+        // its own ServerConfig -- install_default() can only succeed
+        // once per process, and thread execution order isn't
+        // guaranteed, so this could otherwise race against the test's
+        // own later call to make_rustls_client_config (which installs
+        // the same provider on the client side).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::IpAddress(ip)];
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().clone();
+        let cert_der_for_client = cert_der.clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let server_config = Arc::new(server_config);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let conn = rustls::ServerConnection::new(server_config);
+                if let Ok(conn) = conn {
+                    let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+                    // Drive the handshake -- a real client's ClientHello
+                    // needs a byte written back for the handshake to
+                    // actually complete/fail visibly on the client side.
+                    let mut buf = [0u8; 1];
+                    let _ = tls_stream.read(&mut buf);
+                    let _ = conn;
+                }
+            }
+        });
+        (port, cert_der_for_client)
+    }
+
+    #[test]
+    fn wss_connect_validates_against_the_uris_own_host_not_a_hardcoded_localhost() {
+        // Regression test for a real, live report against a genuine
+        // CMS with a real TLS certificate: "invalid peer certificate:
+        // certificate not valid for name 'localhost'; certificate is
+        // only valid for DnsName('xibotest.tmaxlab.it')" -- the SNI/
+        // certificate-validation hostname was hardcoded to the literal
+        // string "localhost" regardless of the actual host being
+        // connected to, meaning a properly *verified* wss:// connection
+        // to any real host could never have worked, ever, for any
+        // deployment (only masked by --no-verify, which skips this
+        // check entirely).
+        //
+        // This uses a real, live TLS handshake (not just a unit check
+        // of some extracted string) against a certificate that is
+        // genuinely valid *only* for IP 127.0.0.1 -- not "localhost" --
+        // so the old hardcoded value would have caused this exact
+        // validation failure. Uses an IP SAN specifically (rather than
+        // a DNS name) so the connection can be made to a real local
+        // listener (127.0.0.1) without needing DNS or /etc/hosts.
+        let (port, test_cert_der) = start_tls_server_for_ip(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let uri: Uri = format!("wss://127.0.0.1:{port}/xmr").parse().unwrap();
+
+        // A custom client config that trusts *specifically* this
+        // test's own self-signed certificate -- not the real, public
+        // CA roots make_rustls_client_config would use (which would
+        // otherwise correctly, but besides the point for this test,
+        // reject the self-signed cert as UnknownIssuer regardless of
+        // any hostname check at all).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(test_cert_der.clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let tls_config = Arc::new(client_config);
+
+        let result = WsConnector::connect(&uri, tls_config, "test-channel", "test-key");
+        // Note: this test server only implements the raw TLS handshake,
+        // not a full WebSocket-protocol response on top of it -- so a
+        // *later*, WebSocket-level failure (e.g. the connection closing
+        // once tungstenite's own handshake proceeds) is an expected
+        // limitation of this minimal test server, not a sign of a real
+        // problem. What actually matters for this specific fix is
+        // narrower and precise: the error must NOT be a certificate/
+        // hostname validation failure -- if the old hardcoded
+        // "localhost" bug were still present, THIS is exactly the kind
+        // of error that would appear instead of (or before) any
+        // WebSocket-level one.
+        if let Err(e) = &result {
+            let msg = format!("{e:#}");
+            assert!(!msg.to_lowercase().contains("certificate"),
+                    "must not be a certificate/hostname validation failure -- the old bug \
+                     hardcoded \"localhost\" regardless of the real host -- got: {msg}");
+        }
     }
 }
 
