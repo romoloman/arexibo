@@ -23,6 +23,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write  # needed to create/update the release and its tag
+    env:
+      # Suppresses a widely-reported, benign Node.js runtime warning
+      # ("DEP0040: the `punycode` module is deprecated") that shows up
+      # on actions/checkout and softprops/action-gh-release -- it comes
+      # from a still-unfixed transitive dependency deep in the GitHub
+      # Actions toolkit's own shared libraries (not from our own
+      # workflow config), affecting many unrelated projects the same
+      # way (Jest, Yarn, setup-python, setup-node, ...). Targeted to
+      # this one specific warning code so other, potentially useful
+      # deprecation warnings still show up normally.
+      NODE_OPTIONS: --disable-warning=DEP0040
     steps:
       - uses: actions/checkout@v5
         with:
