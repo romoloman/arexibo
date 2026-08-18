@@ -279,6 +279,51 @@ impl CmsSettings {
         hex::encode(Md5::digest(to_hash))
     }
 
+    /// Derives a default XMR WebSocket address (`ws://`/`wss://` +
+    /// this CMS's own host:port + `/xmr`) from this CMS's own address,
+    /// to try when the CMS sends an empty `xmrWebSocketAddress` (with
+    /// `xmrType` still "ws", meaning it *does* expect WebSocket XMR to
+    /// be used -- just hasn't said exactly where).
+    ///
+    /// CONFIRMED necessary via the real CMS source
+    /// (lib/Xmds/Soap5.php): an empty `xmrWebSocketAddress` setting
+    /// value gets overridden with the CMS-wide `XMR_WS_ADDRESS`
+    /// setting -- which, if *that* is also left empty (the documented
+    /// Docker default, per
+    /// account.xibosignage.com/docs/setup/xibo-for-docker: "The XMR
+    /// web socket address of the CMS defaults to empty, which means
+    /// players will try to connect to your CMS at /xmr"), is sent to
+    /// the player as a genuinely empty string either way -- the CMS
+    /// itself never computes this default server-side; it's an
+    /// expectation placed on the *player* to know this convention.
+    /// Previously, arexibo had no such fallback at all: an empty
+    /// address here always meant falling straight to the (deliberately
+    /// last-resort) ZMQ path, never attempting WebSocket XMR at all
+    /// for a CMS relying on this documented default.
+    ///
+    /// Deliberately only a *fallback candidate*, tried in addition to
+    /// (not instead of) the existing ZMQ fallback path -- this
+    /// specific `/xmr`-via-the-CMS's-own-Apache convention is
+    /// documented for the Docker-provided deployment specifically
+    /// ("The Apache container provided will handle web socket
+    /// requests at that URL"), not guaranteed for every possible
+    /// hosting setup (e.g. a custom Apache/PHP install without an
+    /// equivalent reverse-proxy rule configured) -- if this guess
+    /// doesn't correspond to anything real, the connection attempt
+    /// simply fails, and the existing ZMQ fallback still applies
+    /// exactly as before, same as if this fallback didn't exist at
+    /// all.
+    pub fn default_xmr_websocket_address(&self) -> Option<String> {
+        let uri: tungstenite::http::uri::Uri = self.address.parse().ok()?;
+        let ws_scheme = match uri.scheme_str() {
+            Some("https") => "wss",
+            Some("http") => "ws",
+            _ => return None,
+        };
+        let authority = uri.authority()?;
+        Some(format!("{ws_scheme}://{authority}/xmr"))
+    }
+
     pub fn make_agent(&self, no_verify: bool) -> Result<ureq::Agent> {
         let tls_config = ureq::tls::TlsConfig::builder()
             .disable_verification(no_verify)
@@ -411,6 +456,40 @@ impl danger::ServerCertVerifier for DisabledVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cms(address: &str) -> CmsSettings {
+        CmsSettings { address: address.to_string(), key: "k".into(), display_id: "d".into(),
+                      display_name: None, proxy: None }
+    }
+
+    #[test]
+    fn derives_ws_from_http_with_explicit_port() {
+        let cms = test_cms("http://192.168.2.138:9092");
+        assert_eq!(cms.default_xmr_websocket_address().as_deref(),
+                   Some("ws://192.168.2.138:9092/xmr"));
+    }
+
+    #[test]
+    fn derives_wss_from_https_and_upgrades_the_scheme() {
+        // Regression-relevant: must switch scheme (http->ws, https->wss),
+        // never just prefix the existing scheme string.
+        let cms = test_cms("https://cms.example.com");
+        assert_eq!(cms.default_xmr_websocket_address().as_deref(),
+                   Some("wss://cms.example.com/xmr"));
+    }
+
+    #[test]
+    fn derives_ws_from_http_without_an_explicit_port() {
+        let cms = test_cms("http://cms.example.com");
+        assert_eq!(cms.default_xmr_websocket_address().as_deref(),
+                   Some("ws://cms.example.com/xmr"));
+    }
+
+    #[test]
+    fn returns_none_for_an_unparseable_or_unrecognized_scheme() {
+        let cms = test_cms("not a url at all");
+        assert_eq!(cms.default_xmr_websocket_address(), None);
+    }
 
     #[test]
     fn debug_impl_never_reveals_the_xmr_cms_key_in_clear() {

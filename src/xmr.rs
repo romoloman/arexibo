@@ -178,7 +178,7 @@ impl WsConnector {
         let port = uri.port_u16().unwrap_or(
             if uri.scheme_str() == Some("wss") { 443 } else { 80 }
         );
-        // Diagnostic warning (found from a real report on GitHub: a
+        // Diagnostic context (found from a real report on GitHub: a
         // Docker-based CMS correctly exposed its WebSocket XMR service
         // on :8080, but the CMS's own "XMR WebSocket Address" setting
         // was missing the port -- resulting in a silent, confusing
@@ -186,25 +186,44 @@ impl WsConnector {
         // (80/443) instead, since nothing runs XMR there. A missing
         // port is virtually always a CMS misconfiguration for this
         // specific address (real XMR WebSocket services essentially
-        // never run on 80/443 by convention) -- flagging it explicitly
-        // here should save the next person from re-deriving this from
-        // scratch via the TCP-level error alone.
-        if uri.port_u16().is_none() {
-            log::warn!("XMR WebSocket address {uri:?} has no explicit port -- \
-                        defaulting to {port} per URI scheme convention. This is \
-                        almost always a CMS misconfiguration (Administration -> \
-                        Settings -> Displays -> \"XMR WebSocket Address\") rather \
-                        than an intentional address -- if this address is wrong, \
-                        connections will fail with a confusing TCP-level error \
-                        rather than an obviously-XMR-related one.");
-        }
+        // never run on 80/443 by convention) -- attaching this
+        // explicitly to the error should save the next person from
+        // re-deriving this from scratch via the TCP-level error alone.
+        //
+        // BUG fix (found from a direct report, right after adding
+        // CmsSettings::default_xmr_websocket_address's own fallback,
+        // AND a second, follow-up report on this same diagnostic): two
+        // separate problems, fixed together --
+        // 1. That fallback *deliberately* constructs a port-less
+        //    address (relying on the scheme's own default port,
+        //    matching the documented Docker convention) -- for exactly
+        //    that address, "this is almost always a CMS
+        //    misconfiguration" is simply wrong. See
+        //    missing_port_warning's own doc comment for how the two
+        //    cases are told apart.
+        // 2. This was logged *unconditionally*, before even attempting
+        //    the connection -- meaning it showed up on every single
+        //    startup for a CMS relying on the derived-default
+        //    convention, even when the connection went on to succeed
+        //    just fine. Only relevant if the connection actually
+        //    *fails* -- moved from an unconditional log::warn to
+        //    `.with_context()` on the connection attempt itself
+        //    (lazily evaluated, so it costs nothing on the success
+        //    path), surfacing only as part of the resulting error's
+        //    own message when there's an actual problem to explain.
+        let port_missing = uri.port_u16().is_none();
         // BUG fix (found from a real, frequently-occurring report:
         // "IO error: Interrupted system call (os error 4)" during
         // connect, forcing an unnecessary 10s reconnect cycle) -- see
         // `connect_retrying_eintr`'s own doc comment for the full
         // explanation.
-        let socket = connect_retrying_eintr((host, port))
-            .context("connecting XMR WebSocket TCP stream")?;
+        let socket = connect_retrying_eintr((host, port)).with_context(|| {
+            if port_missing {
+                missing_port_warning(uri, port)
+            } else {
+                "connecting XMR WebSocket TCP stream".to_string()
+            }
+        })?;
         socket.set_read_timeout(Some(READ_TMO))?;
         let stream = match uri.scheme_str() {
             Some("ws") => MaybeTlsStream::Plain(socket),
@@ -637,6 +656,44 @@ fn retry_ws_on_eintr<T>(mut f: impl FnMut() -> Result<T, tungstenite::Error>)
 /// specific reason the relay gives should now show up in arexibo's own
 /// log, without needing to correlate against a separate log on the
 /// CMS/relay side at all.
+/// Builds the diagnostic warning for a port-less XMR WebSocket
+/// address -- extracted as its own pure function (no network needed)
+/// specifically so the two distinct message variants can be tested
+/// directly, without needing a real connection attempt.
+///
+/// Distinguishes "this is our own derived default"
+/// (CmsSettings::default_xmr_websocket_address's own fallback,
+/// deliberately port-less) from "this looks like a genuine CMS
+/// misconfiguration" by path alone: the derived default always ends
+/// in exactly "/xmr" -- a real, manually-configured "XMR WebSocket
+/// Address" CMS setting essentially never happens to end in that
+/// exact path by coincidence (admins configure a bare host:port, not
+/// a full URL with a specific path) -- so this stays a reliable
+/// signal without needing to plumb through *why* this particular
+/// address ended up port-less all the way from xmds.rs.
+fn missing_port_warning(uri: &Uri, default_port: u16) -> String {
+    if uri.path() == "/xmr" {
+        format!("XMR WebSocket address {uri:?} has no explicit port -- \
+                defaulting to {default_port} per URI scheme convention. This is \
+                this player's own derived default (CMS sent an empty \
+                \"XMR WebSocket Address\", see \
+                account.xibosignage.com/docs/setup/xibo-for-docker for \
+                the convention it follows) -- deliberately relying on \
+                the scheme's own default port. If nothing is actually \
+                listening for XMR on that port, this is likely a \
+                deployment/reverse-proxy gap rather than a CMS \
+                configuration mistake.")
+    } else {
+        format!("XMR WebSocket address {uri:?} has no explicit port -- \
+                defaulting to {default_port} per URI scheme convention. This is \
+                almost always a CMS misconfiguration (Administration -> \
+                Settings -> Displays -> \"XMR WebSocket Address\") rather \
+                than an intentional address -- if this address is wrong, \
+                connections will fail with a confusing TCP-level error \
+                rather than an obviously-XMR-related one.")
+    }
+}
+
 fn describe_close(frame: &Option<tungstenite::protocol::CloseFrame>) -> String {
     match frame {
         Some(f) => format!("XMR WebSocket closed by the relay: {} (code {})", f.reason, f.code),
@@ -1087,6 +1144,83 @@ mod reconnect_budget_tests {
         assert!(gave_up, "genuine connect() failures must count toward the \
                           same give-up budget as successful-but-immediately-\
                           redropped cycles");
+    }
+}
+
+#[cfg(test)]
+mod missing_port_warning_tests {
+    use super::{missing_port_warning, WsConnector};
+    use tungstenite::http::uri::Uri;
+
+    #[test]
+    fn recognizes_our_own_derived_default_by_its_xmr_path() {
+        // The exact real report this distinction exists for: our own
+        // default_xmr_websocket_address() fallback produces a
+        // deliberately port-less address ending in "/xmr" -- must NOT
+        // be described as "almost always a CMS misconfiguration",
+        // which would be actively misleading for this specific case.
+        let uri: Uri = "ws://192.168.1.11/xmr".parse().unwrap();
+        let msg = missing_port_warning(&uri, 80);
+        assert!(msg.contains("this player's own derived default"),
+                "must recognize its own derived default -- got: {msg}");
+        assert!(!msg.contains("almost always a CMS misconfiguration"),
+                "must not blame a CMS misconfiguration for its own derived default");
+    }
+
+    #[test]
+    fn treats_any_other_path_as_a_likely_cms_misconfiguration() {
+        // A genuine CMS-configured address (no path, or a path that
+        // isn't the exact /xmr convention) must keep the original,
+        // more direct guidance -- this is the actual GitHub-reported
+        // scenario this warning was originally added for.
+        let uri: Uri = "ws://192.168.2.138".parse().unwrap();
+        let msg = missing_port_warning(&uri, 80);
+        assert!(msg.contains("almost always a CMS misconfiguration"),
+                "must keep blaming a likely CMS misconfiguration -- got: {msg}");
+        assert!(!msg.contains("this player's own derived default"));
+    }
+
+    #[test]
+    fn a_path_that_merely_resembles_xmr_is_not_falsely_recognized() {
+        // Guards against a too-loose match (e.g. substring matching
+        // instead of an exact path comparison) -- only the *exact*
+        // "/xmr" path should be recognized as our own convention.
+        let uri: Uri = "ws://192.168.2.138/xmr-something-else".parse().unwrap();
+        let msg = missing_port_warning(&uri, 80);
+        assert!(msg.contains("almost always a CMS misconfiguration"),
+                "a merely-similar path must not be falsely recognized -- got: {msg}");
+    }
+
+    #[test]
+    fn the_diagnostic_only_surfaces_when_the_connection_actually_fails() {
+        // Regression test for a real report, right after adding the
+        // /xmr-path distinction above: this used to be logged
+        // *unconditionally*, before even attempting the connection --
+        // showing up on every single startup for a CMS relying on the
+        // derived-default convention, even when the connection went on
+        // to succeed just fine. Now it's attached as error *context*
+        // instead, so it only ever surfaces as part of a genuine
+        // connection failure's own message.
+        //
+        // Port 80 is unused in this sandbox (confirmed separately) --
+        // connecting there is expected to reliably fail with
+        // "connection refused", letting this test check the resulting
+        // *error's own message* directly, without needing a real
+        // listener (avoiding the same CI-fragility concern as
+        // mainloop.rs's own sticky-address tests around binding to
+        // port 80).
+        let uri: Uri = "ws://127.0.0.1/xmr".parse().unwrap();
+        let cms = crate::config::CmsSettings {
+            address: "http://127.0.0.1".into(), key: "k".into(), display_id: "d".into(),
+            display_name: None, proxy: None,
+        };
+        let tls_config = std::sync::Arc::new(cms.make_rustls_client_config(true).unwrap());
+        let result = WsConnector::connect(&uri, tls_config, "test-channel", "test-key");
+        let err = result.expect_err("connecting to an unused port must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("this player's own derived default"),
+                "the diagnostic must appear in the error's own message when the \
+                 connection genuinely fails -- got: {msg}");
     }
 }
 

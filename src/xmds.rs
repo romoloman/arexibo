@@ -30,6 +30,11 @@ pub struct Cms {
     cms_key: String,
     hw_key: String,
     pub_key: String,
+    /// Precomputed once at construction (see CmsSettings's own
+    /// `default_xmr_websocket_address` doc comment for why this
+    /// exists) -- used as a fallback candidate in register_display()
+    /// when the CMS sends an empty xmrWebSocketAddress.
+    default_ws_address: Option<String>,
 }
 
 impl Cms {
@@ -44,6 +49,7 @@ impl Cms {
             cms_key: cms.key.clone(),
             hw_key: cms.display_id.clone(),
             pub_key,
+            default_ws_address: cms.default_xmr_websocket_address(),
             xml_dir,
         })
     }
@@ -139,7 +145,32 @@ impl Cms {
                             for this registration");
                 forced
             } else if &xmr_type == "ws" {
-                tree.def_child("xmrWebSocketAddress", "")?
+                let from_cms: String = tree.def_child("xmrWebSocketAddress", "")?;
+                if !from_cms.is_empty() {
+                    from_cms
+                } else if let Some(default) = &self.default_ws_address {
+                    // BUG fix (found from a real user's own suspicion,
+                    // confirmed against the real CMS source AND the
+                    // official Docker docs -- see
+                    // CmsSettings::default_xmr_websocket_address's own
+                    // doc comment for the full context): the CMS never
+                    // computes this default server-side, despite
+                    // documenting the convention -- it's on the player
+                    // to know it. Previously, an empty address here
+                    // meant falling straight to ZMQ, never trying
+                    // WebSocket XMR at all for a CMS relying on this
+                    // documented default (e.g. a fresh Docker install
+                    // with XMR_WS_ADDRESS left at its own default,
+                    // empty, value).
+                    log::debug!("CMS sent an empty XMR WebSocket address (xmrType=ws) -- \
+                                trying the documented default convention ({default}, same \
+                                host as the CMS itself, path /xmr) before falling back to \
+                                ZMQ. See account.xibosignage.com/docs/setup/xibo-for-docker \
+                                for the convention this follows.");
+                    default.clone()
+                } else {
+                    String::new()
+                }
             } else { String::new() };
 
             Ok(Some(PlayerSettings {
@@ -594,5 +625,91 @@ mod force_ws_address_tests {
         std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
         assert_eq!(settings.xmr_web_socket_address, "ws://192.168.2.10:8080",
                    "an empty override value must fall through to the CMS's own reported address");
+    }
+}
+
+#[cfg(test)]
+mod default_ws_address_fallback_tests {
+    use super::*;
+
+    /// Same mock pattern as force_ws_address_tests, duplicated locally
+    /// (not shared) so this module's own tests read standalone.
+    fn start_mock(xmr_type: &str, xmr_ws_address: &str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let activation = format!(
+            r#"<ActivationMessage code="READY"><xmrType>{xmr_type}</xmrType><xmrWebSocketAddress>{xmr_ws_address}</xmrWebSocketAddress></ActivationMessage>"#);
+        let escaped = activation.replace('&', "&amp;").replace('<', "&lt;")
+                                 .replace('>', "&gt;").replace('"', "&quot;");
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_default_ws_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn empty_address_with_ws_type_falls_back_to_the_derived_default() {
+        // The actual feature this module tests: found from a real
+        // user's own suspicion, confirmed against the real CMS source
+        // (lib/Xmds/Soap5.php) AND the official Docker docs -- an
+        // empty xmrWebSocketAddress with xmrType=ws (matching, e.g., a
+        // fresh Docker install with XMR_WS_ADDRESS left at its own
+        // documented default, empty, value) must fall back to
+        // ws://<same host:port as the CMS>/xmr, not straight to empty
+        // (which previously meant giving up on WebSocket XMR entirely,
+        // falling straight to ZMQ).
+        let port = start_mock("ws", "");
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert_eq!(settings.xmr_web_socket_address, format!("ws://127.0.0.1:{port}/xmr"),
+                   "must fall back to the derived default when the CMS sends an empty \
+                    address with xmrType=ws");
+    }
+
+    #[test]
+    fn a_real_non_empty_address_from_the_cms_always_wins_over_the_default() {
+        // The derived default must never override a genuine, non-empty
+        // address the CMS actually sends -- it's strictly a last-resort
+        // fallback for the empty case specifically.
+        let port = start_mock("ws", "ws://192.168.2.10:8080");
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert_eq!(settings.xmr_web_socket_address, "ws://192.168.2.10:8080",
+                   "a real address from the CMS must always win over the derived default");
+    }
+
+    #[test]
+    fn zmq_type_never_triggers_the_default_even_if_address_is_empty() {
+        // The derived default is specifically for xmrType=ws -- if the
+        // CMS says zmq, an empty address must stay empty exactly as
+        // before (section 59/64's own existing behavior), not suddenly
+        // start trying a derived WebSocket URL the CMS never asked for.
+        let port = start_mock("zmq", "");
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert_eq!(settings.xmr_web_socket_address, "",
+                   "must stay empty for xmrType=zmq, regardless of the derived default \
+                    being available");
     }
 }

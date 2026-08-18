@@ -374,8 +374,26 @@ impl Handler {
             // the same protection collect_once's own later cycles
             // already had -- not just what gets persisted to
             // settings.json for next time.
+            //
+            // BUG fix (found from a real report, right after adding
+            // the default_xmr_websocket_address() fallback itself):
+            // that fallback deliberately produces a *port-less* address
+            // (ws://<cms host>/xmr, relying on the scheme's own default
+            // port, matching how the CMS's own documented Docker
+            // convention expects the same port as its own HTTP/HTTPS
+            // traffic to be reused) -- which the check below would
+            // otherwise treat as exactly the kind of suspicious,
+            // incomplete address it exists to guard against, keeping a
+            // stale cached one instead of ever letting this
+            // *deliberately* port-less default through. Comparing
+            // against what this same fallback would produce right now
+            // distinguishes "this is our own intentional derived
+            // default" from "the CMS sent something that merely looks
+            // similarly incomplete" -- only the latter should ever be
+            // protected against.
+            let is_own_derived_default = is_own_derived_ws_default(cms, &settings.xmr_web_socket_address);
             if let Ok(prev) = PlayerSettings::from_file(&setting_file) {
-                if !prev.xmr_web_socket_address.is_empty()
+                if !prev.xmr_web_socket_address.is_empty() && !is_own_derived_default
                     && !ws_address_has_port(&settings.xmr_web_socket_address) {
                     log::warn!("XMR WebSocket address from this registration is \
                                 either empty or missing an explicit port ({:?}) -- \
@@ -902,7 +920,13 @@ impl Handler {
             // rather than the on-disk settings.json (which only gets
             // written at startup, not on every ongoing collection
             // cycle).
-            if !self.settings.xmr_web_socket_address.is_empty()
+            //
+            // Same is_own_derived_default exemption as Handler::new's
+            // own copy of this check -- see its own doc comment for
+            // the full context (found from a real report right after
+            // adding default_xmr_websocket_address() itself).
+            let is_own_derived_default = is_own_derived_ws_default(&self.cms, &settings.xmr_web_socket_address);
+            if !self.settings.xmr_web_socket_address.is_empty() && !is_own_derived_default
                 && !ws_address_has_port(&settings.xmr_web_socket_address) {
                 log::warn!("XMR WebSocket address from this registration is \
                             either empty or missing an explicit port ({:?}) -- \
@@ -1438,6 +1462,23 @@ fn ws_address_has_port(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `candidate` is exactly what `cms`'s own
+/// `default_xmr_websocket_address()` fallback would produce right now
+/// -- see both sticky-check call sites' own doc comments for why this
+/// matters: that fallback deliberately produces a port-less address
+/// (relying on the scheme's own default port), which `ws_address_
+/// has_port` alone would otherwise flag as suspiciously incomplete,
+/// keeping a stale cached address instead of ever accepting our own
+/// intentional derived default. Extracted as its own pure function
+/// (no network needed) specifically so this can be unit-tested
+/// directly with a genuinely port-less `cms.address` -- a real mock
+/// HTTP server's own `cms.address` necessarily has an explicit port
+/// (needing one to be reachable at all), which would otherwise mask
+/// exactly the port-less case this exists to handle.
+fn is_own_derived_ws_default(cms: &CmsSettings, candidate: &str) -> bool {
+    cms.default_xmr_websocket_address().as_deref() == Some(candidate)
+}
+
 #[cfg(test)]
 mod ws_address_has_port_tests {
     use super::ws_address_has_port;
@@ -1804,6 +1845,92 @@ mod sticky_ws_address_tests {
         let _ = handler.collect_once();
         assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1",
                    "a non-empty but port-less address must not replace a good, complete one");
+    }
+
+    #[test]
+    fn our_own_derived_default_fallback_wins_over_a_cached_good_address_end_to_end() {
+        // End-to-end confirmation that the exemption mechanism is
+        // actually wired into both call sites and does the right thing
+        // in a real Handler::new()+collect_once() flow. Note: this
+        // mock CMS's own address necessarily has an explicit port (a
+        // real server needs one to be reachable at all) -- so the
+        // derived default here happens to *also* carry a port, meaning
+        // this specific test would technically still pass even
+        // without the exemption (ws_address_has_port alone would
+        // already accept it). The genuinely port-less case this fix
+        // exists for -- the exact scenario reported directly, where
+        // the CMS's own address had no explicit port at all -- is
+        // covered in isolation just below, in
+        // is_own_derived_ws_default_tests, without needing a real
+        // network listener on a port-less address (not practical to
+        // set up reliably in a test).
+        let (port, _calls) = start_mock(vec![
+            ("ws", "ws://127.0.0.1:8080"),
+            ("ws", ""),  // empty -- triggers xmds.rs's own derived-default fallback
+        ]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:8080");
+
+        let _ = handler.collect_once();
+        assert_eq!(handler.settings.xmr_web_socket_address, format!("ws://127.0.0.1:{port}/xmr"),
+                   "our own derived /xmr default must win, even though it's port-shaped \
+                    differently than the previously-cached address -- it's our own \
+                    intentional fallback, not a suspicious CMS inconsistency");
+    }
+}
+
+#[cfg(test)]
+mod is_own_derived_ws_default_tests {
+    use super::*;
+
+    fn test_cms_settings(address: &str) -> CmsSettings {
+        CmsSettings { address: address.to_string(), key: "k".into(), display_id: "d".into(),
+                      display_name: None, proxy: None }
+    }
+
+    #[test]
+    fn recognizes_its_own_genuinely_port_less_derived_default() {
+        // The exact real scenario reported directly: CMS address with
+        // NO explicit port at all (http://192.168.1.11, relying on
+        // port 80 implicitly) -- the derived default
+        // (ws://192.168.1.11/xmr) is therefore *itself* genuinely
+        // port-less too, exactly the case ws_address_has_port alone
+        // would flag as suspicious. Deliberately not using a real mock
+        // HTTP server here (unlike the end-to-end test above) -- one
+        // would necessarily have an explicit port to be reachable at
+        // all, masking exactly this port-less case.
+        let cms = test_cms_settings("http://192.168.1.11");
+        assert!(is_own_derived_ws_default(&cms, "ws://192.168.1.11/xmr"),
+                "must recognize this as its own derived default, despite having no port");
+    }
+
+    #[test]
+    fn does_not_falsely_match_an_unrelated_port_less_address() {
+        // Guards against the exemption being too loose -- a port-less
+        // address that *isn't* what this CMS's own fallback would
+        // produce (wrong host, or missing the /xmr suffix) must still
+        // be treated as a genuine, suspicious CMS inconsistency, not
+        // waved through just because it happens to lack a port too.
+        let cms = test_cms_settings("http://192.168.1.11");
+        assert!(!is_own_derived_ws_default(&cms, "ws://some-other-host/xmr"));
+        assert!(!is_own_derived_ws_default(&cms, "ws://192.168.1.11"),
+                "missing the /xmr suffix -- not what the fallback actually produces");
+    }
+
+    #[test]
+    fn recognizes_its_own_default_when_the_cms_address_does_have_a_port() {
+        // The other shape this can take (matching the end-to-end test
+        // above) -- same mechanism, just confirming it also works when
+        // the CMS's own address happens to carry an explicit port.
+        let cms = test_cms_settings("http://192.168.2.138:9092");
+        assert!(is_own_derived_ws_default(&cms, "ws://192.168.2.138:9092/xmr"));
     }
 }
 
