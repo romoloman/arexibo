@@ -139,15 +139,26 @@ impl Cms {
             let forced_ws = std::env::var("AREXIBO_FORCE_WS_ADDRESS").ok()
                                       .filter(|s| !s.is_empty());
             let xmr_type: String = tree.def_child("xmrType", "zmq")?;
-            let xmr_web_socket_address = if let Some(forced) = forced_ws {
+            // The CMS's own raw, verbatim value -- empty if the CMS
+            // didn't send WebSocket XMR support at all (xmrType != ws)
+            // or sent an empty address either way. Deliberately
+            // independent of AREXIBO_FORCE_WS_ADDRESS and the /xmr
+            // fallback below -- neither of those came from the CMS
+            // itself, so neither belongs in this field. See
+            // PlayerSettings::xmr_web_socket_address_in_use's own doc
+            // comment for why this distinction exists as two separate
+            // fields rather than one.
+            let xmr_web_socket_address = if &xmr_type == "ws" {
+                tree.def_child("xmrWebSocketAddress", "")?
+            } else { String::new() };
+            let xmr_web_socket_address_in_use = if let Some(forced) = forced_ws {
                 log::info!("using AREXIBO_FORCE_WS_ADDRESS override for XMR WebSocket \
                             address, ignoring the CMS's own xmrType/xmrWebSocketAddress \
                             for this registration");
                 forced
             } else if &xmr_type == "ws" {
-                let from_cms: String = tree.def_child("xmrWebSocketAddress", "")?;
-                if !from_cms.is_empty() {
-                    from_cms
+                if !xmr_web_socket_address.is_empty() {
+                    xmr_web_socket_address.clone()
                 } else if let Some(default) = &self.default_ws_address {
                     // BUG fix (found from a real user's own suspicion,
                     // confirmed against the real CMS source AND the
@@ -188,6 +199,7 @@ impl Cms {
                 // not having a ZMQ fallback available.
                 xmr_network_address: tree.def_child("xmrNetworkAddress", "")?,
                 xmr_web_socket_address,
+                xmr_web_socket_address_in_use,
                 xmr_cms_key: tree.def_child("xmrCmsKey", "")?,
                 // BUG fix (found while testing a diagnostic clientType
                 // override, "windows" -- the CMS's real ActivationMessage
@@ -590,8 +602,11 @@ mod force_ws_address_tests {
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
         std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
-        assert_eq!(settings.xmr_web_socket_address, "ws://forced.example:9999",
+        assert_eq!(settings.xmr_web_socket_address_in_use, "ws://forced.example:9999",
                    "the override must win, ignoring the CMS's own xmrType=zmq entirely");
+        assert_eq!(settings.xmr_web_socket_address, "",
+                   "the raw field must still reflect the CMS's own xmrType=zmq (empty), \
+                    independent of the override -- it never came from the CMS itself");
     }
 
     #[test]
@@ -607,7 +622,10 @@ mod force_ws_address_tests {
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
         std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
-        assert_eq!(settings.xmr_web_socket_address, "ws://forced.example:9999");
+        assert_eq!(settings.xmr_web_socket_address_in_use, "ws://forced.example:9999");
+        assert_eq!(settings.xmr_web_socket_address, "ws://192.168.2.10:8080",
+                   "the raw field must still reflect what the CMS actually sent, \
+                    independent of the override winning for the in-use address");
     }
 
     #[test]
@@ -623,7 +641,7 @@ mod force_ws_address_tests {
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
         std::env::remove_var("AREXIBO_FORCE_WS_ADDRESS");
-        assert_eq!(settings.xmr_web_socket_address, "ws://192.168.2.10:8080",
+        assert_eq!(settings.xmr_web_socket_address_in_use, "ws://192.168.2.10:8080",
                    "an empty override value must fall through to the CMS's own reported address");
     }
 }
@@ -682,9 +700,12 @@ mod default_ws_address_fallback_tests {
         let port = start_mock("ws", "");
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
-        assert_eq!(settings.xmr_web_socket_address, format!("ws://127.0.0.1:{port}/xmr"),
+        assert_eq!(settings.xmr_web_socket_address_in_use, format!("ws://127.0.0.1:{port}/xmr"),
                    "must fall back to the derived default when the CMS sends an empty \
                     address with xmrType=ws");
+        assert_eq!(settings.xmr_web_socket_address, "",
+                   "the raw field must stay empty -- the CMS genuinely sent nothing, \
+                    the derived default is a local fallback, not something the CMS itself sent");
     }
 
     #[test]
@@ -695,8 +716,10 @@ mod default_ws_address_fallback_tests {
         let port = start_mock("ws", "ws://192.168.2.10:8080");
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
-        assert_eq!(settings.xmr_web_socket_address, "ws://192.168.2.10:8080",
+        assert_eq!(settings.xmr_web_socket_address_in_use, "ws://192.168.2.10:8080",
                    "a real address from the CMS must always win over the derived default");
+        assert_eq!(settings.xmr_web_socket_address, "ws://192.168.2.10:8080",
+                   "the raw field must match exactly what the CMS actually sent");
     }
 
     #[test]
@@ -708,7 +731,7 @@ mod default_ws_address_fallback_tests {
         let port = start_mock("zmq", "");
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
-        assert_eq!(settings.xmr_web_socket_address, "",
+        assert_eq!(settings.xmr_web_socket_address_in_use, "",
                    "must stay empty for xmrType=zmq, regardless of the derived default \
                     being available");
     }

@@ -117,13 +117,21 @@ pub fn start(cms: &CmsSettings, settings: &PlayerSettings, privkey: RsaPrivateKe
              no_verify: bool) -> Result<Receiver<Message>> {
     let channel = cms.xmr_channel();
 
-    if !settings.xmr_web_socket_address.is_empty() {
+    // Deliberately xmr_web_socket_address_in_use, not the raw
+    // xmr_web_socket_address -- see PlayerSettings's own doc comment
+    // for why these are two separate fields: this one reflects the
+    // final, resolved address (after AREXIBO_FORCE_WS_ADDRESS, the
+    // /xmr-derived default, or the sticky-address correction in
+    // mainloop.rs), which is what a connection attempt actually needs
+    // to use -- the raw field may be empty or incomplete even when
+    // this one holds a perfectly good address to try.
+    if !settings.xmr_web_socket_address_in_use.is_empty() {
         log::info!("Using WebSocket XMR at {} (channel {}, key fingerprint {})",
-                    settings.xmr_web_socket_address, channel,
+                    settings.xmr_web_socket_address_in_use, channel,
                     fingerprint(&settings.xmr_cms_key));
         let tls_config = cms.make_rustls_client_config(no_verify)?;
         match WsConnector::new(&channel, tls_config,
-                               &settings.xmr_web_socket_address,
+                               &settings.xmr_web_socket_address_in_use,
                                &settings.xmr_cms_key) {
             Ok((connector, receiver)) => {
                 thread::spawn(move || connector.run());

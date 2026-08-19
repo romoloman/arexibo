@@ -23,6 +23,21 @@ pub struct PlayerSettings {
     pub xmr_network_address: String,
     #[serde(default)]
     pub xmr_web_socket_address: String,
+    // Deliberately a *separate* field from xmr_web_socket_address above,
+    // not just a differently-named alias -- found from a direct report
+    // that a debug log claiming to show "settings received from CMS"
+    // was actually showing a *locally-derived* value (the /xmr-fallback
+    // default, see xmds.rs's own register_display()) whenever the raw
+    // CMS response was empty, misleadingly implying the CMS itself had
+    // sent that value. xmr_web_socket_address above now always holds
+    // the CMS's own raw, verbatim value (empty if the CMS sent
+    // nothing) -- safe to print directly as "received from CMS" without
+    // any caveat. This field holds whatever address actually gets used
+    // for the connection attempt (the raw value if it was usable, or a
+    // locally-derived/sticky-corrected one otherwise) -- xmr::start()
+    // reads *this* field, never the raw one directly.
+    #[serde(default)]
+    pub xmr_web_socket_address_in_use: String,
     #[serde(default)]
     pub xmr_cms_key: String,
     #[serde(default = "default_log_level")]
@@ -114,6 +129,7 @@ impl fmt::Debug for PlayerSettings {
             .field("stats_enabled", &self.stats_enabled)
             .field("xmr_network_address", &self.xmr_network_address)
             .field("xmr_web_socket_address", &self.xmr_web_socket_address)
+            .field("xmr_web_socket_address_in_use", &self.xmr_web_socket_address_in_use)
             .field("xmr_cms_key", &format_args!("<redacted, fingerprint {}>",
                                                  fingerprint(&self.xmr_cms_key)))
             .field("log_level", &self.log_level)

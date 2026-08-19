@@ -298,19 +298,32 @@ impl Handler {
 
         // if we got settings, we are registered and authorized
         if let Some(mut settings) = res {
-            // Debug aid, requested directly: print exactly what the CMS
-            // sent (before any sticky-address correction below), so an
-            // investigation like the one that found the ordering bug
-            // right below this doesn't have to reconstruct it after the
-            // fact from scattered warning messages about individual
-            // fields -- the *complete* picture is available directly,
-            // gated behind --debug since it's verbose and only useful
-            // when actively troubleshooting. Safe to print in full:
-            // PlayerSettings's own Debug impl (see config.rs) redacts
-            // the one genuinely sensitive field (xmr_cms_key) to a
-            // fingerprint automatically, not something this call site
-            // needs to remember to do itself.
-            log::debug!("player settings received from CMS (initial registration): {settings:?}");
+            // Debug aid, requested directly: print the settings this
+            // registration resolved to, so an investigation like the
+            // one that found the ordering bug right below this doesn't
+            // have to reconstruct it after the fact from scattered
+            // warning messages about individual fields -- the
+            // *complete* picture is available directly, gated behind
+            // --debug since it's verbose and only useful when actively
+            // troubleshooting.
+            //
+            // BUG (found from a direct report, right after adding
+            // xmds.rs's own /xmr-derived-default fallback for an empty
+            // xmrWebSocketAddress): this is NOT necessarily a verbatim
+            // copy of what the CMS itself sent over the wire --
+            // xmds.rs's own register_display() may have *already*
+            // derived a fallback value for xmr_web_socket_address
+            // specifically (see its own adjacent debug log, printed
+            // just before this one, explaining exactly when that
+            // happens) before this function ever sees `settings` here.
+            // Renamed from the original "received from CMS" wording,
+            // which read as a direct quote of the CMS's own response --
+            // misleading specifically when that fallback kicks in. Safe
+            // to print in full regardless: PlayerSettings's own Debug
+            // impl (see config.rs) redacts the one genuinely sensitive
+            // field (xmr_cms_key) to a fingerprint automatically, not
+            // something this call site needs to remember to do itself.
+            log::debug!("player settings resolved from this registration (initial): {settings:?}");
             // BUG fix (found from a real, well-documented upstream
             // report -- github.com/birkenfeld/arexibo/issues/33,
             // confirmed by multiple independent users): `--allow-offline`
@@ -391,18 +404,18 @@ impl Handler {
             // default" from "the CMS sent something that merely looks
             // similarly incomplete" -- only the latter should ever be
             // protected against.
-            let is_own_derived_default = is_own_derived_ws_default(cms, &settings.xmr_web_socket_address);
+            let is_own_derived_default = is_own_derived_ws_default(cms, &settings.xmr_web_socket_address_in_use);
             if let Ok(prev) = PlayerSettings::from_file(&setting_file) {
-                if !prev.xmr_web_socket_address.is_empty() && !is_own_derived_default
-                    && !ws_address_has_port(&settings.xmr_web_socket_address) {
+                if !prev.xmr_web_socket_address_in_use.is_empty() && !is_own_derived_default
+                    && !ws_address_has_port(&settings.xmr_web_socket_address_in_use) {
                     log::warn!("XMR WebSocket address from this registration is \
                                 either empty or missing an explicit port ({:?}) -- \
                                 keeping the previously-known-good address {:?} \
                                 instead. If this display should genuinely no \
                                 longer use WebSocket XMR, clear it explicitly \
                                 (e.g. --clear, or edit settings.json).",
-                                settings.xmr_web_socket_address, prev.xmr_web_socket_address);
-                    settings.xmr_web_socket_address = prev.xmr_web_socket_address;
+                                settings.xmr_web_socket_address_in_use, prev.xmr_web_socket_address_in_use);
+                    settings.xmr_web_socket_address_in_use = prev.xmr_web_socket_address_in_use;
                 }
             }
 
@@ -910,8 +923,11 @@ impl Handler {
         if let Some(mut settings) = self.xmds.register_display()? {
             // See the matching debug log + doc comment in `Handler::new`
             // for why this is safe to print in full (xmr_cms_key gets
-            // auto-redacted by PlayerSettings's own Debug impl).
-            log::debug!("player settings received from CMS (collection cycle): {settings:?}");
+            // auto-redacted by PlayerSettings's own Debug impl) and for
+            // why it's named "resolved from this registration" rather
+            // than "received from CMS" (not necessarily a verbatim copy
+            // of the CMS's own raw response -- see that same comment).
+            log::debug!("player settings resolved from this registration (collection cycle): {settings:?}");
             // See the matching check + doc comment in `Handler::new`
             // (section 63/64/69's own fix, policy revised after a
             // follow-up report showed this happening systematically) --
@@ -925,17 +941,17 @@ impl Handler {
             // own copy of this check -- see its own doc comment for
             // the full context (found from a real report right after
             // adding default_xmr_websocket_address() itself).
-            let is_own_derived_default = is_own_derived_ws_default(&self.cms, &settings.xmr_web_socket_address);
-            if !self.settings.xmr_web_socket_address.is_empty() && !is_own_derived_default
-                && !ws_address_has_port(&settings.xmr_web_socket_address) {
+            let is_own_derived_default = is_own_derived_ws_default(&self.cms, &settings.xmr_web_socket_address_in_use);
+            if !self.settings.xmr_web_socket_address_in_use.is_empty() && !is_own_derived_default
+                && !ws_address_has_port(&settings.xmr_web_socket_address_in_use) {
                 log::warn!("XMR WebSocket address from this registration is \
                             either empty or missing an explicit port ({:?}) -- \
                             keeping the previously-known-good address {:?} \
                             instead. If this display should genuinely no \
                             longer use WebSocket XMR, clear it explicitly \
                             (e.g. --clear, or edit settings.json).",
-                            settings.xmr_web_socket_address, self.settings.xmr_web_socket_address);
-                settings.xmr_web_socket_address = self.settings.xmr_web_socket_address.clone();
+                            settings.xmr_web_socket_address_in_use, self.settings.xmr_web_socket_address_in_use);
+                settings.xmr_web_socket_address_in_use = self.settings.xmr_web_socket_address_in_use.clone();
             }
             if settings != self.settings {
                 self.settings = settings;
@@ -1759,12 +1775,12 @@ mod sticky_ws_address_tests {
         // Call 1 (inside Handler::new): gets the real address.
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx).unwrap();
-        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1");
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         // Call 2 (collect_once): CMS now says zmq/empty -- must NOT
         // clear the address, must keep the one from call 1.
         let _ = handler.collect_once();
-        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1",
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1",
                    "a previously-good WebSocket address must survive a later empty response, not get cleared");
     }
 
@@ -1786,10 +1802,10 @@ mod sticky_ws_address_tests {
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx).unwrap();
-        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1");
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
-        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:2",
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:2",
                    "a genuinely different, non-empty address from the CMS must still replace the old one");
     }
 
@@ -1811,10 +1827,10 @@ mod sticky_ws_address_tests {
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx).unwrap();
-        assert_eq!(handler.settings.xmr_web_socket_address, "");
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "");
 
         let _ = handler.collect_once();
-        assert_eq!(handler.settings.xmr_web_socket_address, "");
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "");
     }
 
     #[test]
@@ -1840,10 +1856,10 @@ mod sticky_ws_address_tests {
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx).unwrap();
-        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1");
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
-        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:1",
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1",
                    "a non-empty but port-less address must not replace a good, complete one");
     }
 
@@ -1876,10 +1892,10 @@ mod sticky_ws_address_tests {
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx).unwrap();
-        assert_eq!(handler.settings.xmr_web_socket_address, "ws://127.0.0.1:8080");
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:8080");
 
         let _ = handler.collect_once();
-        assert_eq!(handler.settings.xmr_web_socket_address, format!("ws://127.0.0.1:{port}/xmr"),
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, format!("ws://127.0.0.1:{port}/xmr"),
                    "our own derived /xmr default must win, even though it's port-shaped \
                     differently than the previously-cached address -- it's our own \
                     intentional fallback, not a suspicious CMS inconsistency");
@@ -2075,7 +2091,7 @@ mod sticky_address_applies_to_first_connection_tests {
         // Pre-populate settings.json with the good, complete address --
         // simulating a previous, successful run.
         let settings_path = envdir.join("settings.json");
-        let prev = PlayerSettings { xmr_web_socket_address: good_address.clone(),
+        let prev = PlayerSettings { xmr_web_socket_address_in_use: good_address.clone(),
                                      ..Default::default() };
         prev.to_file(settings_path).unwrap();
 
@@ -2098,7 +2114,7 @@ mod sticky_address_applies_to_first_connection_tests {
                                     togui_tx, fromgui_rx, duration_rx).unwrap();
 
         // The in-memory settings must reflect the corrected address...
-        assert_eq!(handler.settings.xmr_web_socket_address, good_address);
+        assert_eq!(handler.settings.xmr_web_socket_address_in_use, good_address);
         // ...and, crucially, no retry was armed -- meaning xmr::start()
         // actually *succeeded* using that corrected address, rather
         // than failing (with port 80) and falling back to offline/ZMQ
