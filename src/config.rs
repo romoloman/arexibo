@@ -23,19 +23,11 @@ pub struct PlayerSettings {
     pub xmr_network_address: String,
     #[serde(default)]
     pub xmr_web_socket_address: String,
-    // Deliberately a *separate* field from xmr_web_socket_address above,
-    // not just a differently-named alias -- found from a direct report
-    // that a debug log claiming to show "settings received from CMS"
-    // was actually showing a *locally-derived* value (the /xmr-fallback
-    // default, see xmds.rs's own register_display()) whenever the raw
-    // CMS response was empty, misleadingly implying the CMS itself had
-    // sent that value. xmr_web_socket_address above now always holds
-    // the CMS's own raw, verbatim value (empty if the CMS sent
-    // nothing) -- safe to print directly as "received from CMS" without
-    // any caveat. This field holds whatever address actually gets used
-    // for the connection attempt (the raw value if it was usable, or a
-    // locally-derived/sticky-corrected one otherwise) -- xmr::start()
-    // reads *this* field, never the raw one directly.
+    // xmr_web_socket_address above always holds the CMS's own raw
+    // value (empty if the CMS sent nothing). This field holds whatever
+    // address actually gets used for the connection (raw, or a
+    // locally-derived/sticky-corrected one) -- xmr::start() reads
+    // *this* field, never the raw one.
     #[serde(default)]
     pub xmr_web_socket_address_in_use: String,
     #[serde(default)]
@@ -59,16 +51,9 @@ pub struct PlayerSettings {
     // the CMS explicitly turns it on for this display).
     #[serde(default)]
     pub is_adspace_enabled: bool,
-    // BUG fix (found from a real report, confirmed via a real
-    // RegisterDisplay XML response the user shared): these are
-    // "HH:MM" strings (e.g. "12:00"/"15:00"), NOT plain integers --
-    // an earlier version of this code wrongly assumed a bare hour
-    // number based on a *different*, local config-file representation
-    // (a real XiboClient.config dump showing
-    // `<DownloadStartWindow>0</DownloadStartWindow>`), which turned out
-    // to not match the actual XMDS wire format at all. See
-    // `PlayerSettings::is_within_download_window` for how these
-    // actually get enforced.
+    // "HH:MM" strings (e.g. "12:00"), confirmed from a real
+    // RegisterDisplay XML response -- not plain integers. See
+    // is_within_download_window for enforcement.
     #[serde(default)]
     pub download_start_window: String,
     #[serde(default)]
@@ -296,39 +281,21 @@ impl CmsSettings {
     }
 
     /// Derives a default XMR WebSocket address (`ws://`/`wss://` +
-    /// this CMS's own host:port + `/xmr`) from this CMS's own address,
-    /// to try when the CMS sends an empty `xmrWebSocketAddress` (with
-    /// `xmrType` still "ws", meaning it *does* expect WebSocket XMR to
-    /// be used -- just hasn't said exactly where).
+    /// this CMS's own host:port + `/xmr`), tried when the CMS sends an
+    /// empty `xmrWebSocketAddress` with `xmrType` still "ws".
     ///
-    /// CONFIRMED necessary via the real CMS source
-    /// (lib/Xmds/Soap5.php): an empty `xmrWebSocketAddress` setting
-    /// value gets overridden with the CMS-wide `XMR_WS_ADDRESS`
-    /// setting -- which, if *that* is also left empty (the documented
-    /// Docker default, per
-    /// account.xibosignage.com/docs/setup/xibo-for-docker: "The XMR
-    /// web socket address of the CMS defaults to empty, which means
-    /// players will try to connect to your CMS at /xmr"), is sent to
-    /// the player as a genuinely empty string either way -- the CMS
-    /// itself never computes this default server-side; it's an
-    /// expectation placed on the *player* to know this convention.
-    /// Previously, arexibo had no such fallback at all: an empty
-    /// address here always meant falling straight to the (deliberately
-    /// last-resort) ZMQ path, never attempting WebSocket XMR at all
-    /// for a CMS relying on this documented default.
+    /// The CMS never computes this itself (lib/Xmds/Soap5.php falls
+    /// back to the CMS-wide XMR_WS_ADDRESS setting, which is also
+    /// empty by default on Docker installs per
+    /// account.xibosignage.com/docs/setup/xibo-for-docker) -- it's a
+    /// documented convention the player is expected to know.
     ///
-    /// Deliberately only a *fallback candidate*, tried in addition to
-    /// (not instead of) the existing ZMQ fallback path -- this
-    /// specific `/xmr`-via-the-CMS's-own-Apache convention is
-    /// documented for the Docker-provided deployment specifically
-    /// ("The Apache container provided will handle web socket
-    /// requests at that URL"), not guaranteed for every possible
-    /// hosting setup (e.g. a custom Apache/PHP install without an
-    /// equivalent reverse-proxy rule configured) -- if this guess
-    /// doesn't correspond to anything real, the connection attempt
-    /// simply fails, and the existing ZMQ fallback still applies
-    /// exactly as before, same as if this fallback didn't exist at
-    /// all.
+    /// Only a fallback *candidate*, tried in addition to (not instead
+    /// of) the existing ZMQ fallback -- the `/xmr`-via-Apache
+    /// convention is specific to the Docker-provided deployment, not
+    /// guaranteed for every hosting setup. If the guess doesn't
+    /// correspond to anything real, the connection simply fails and
+    /// ZMQ still applies exactly as before.
     pub fn default_xmr_websocket_address(&self) -> Option<String> {
         let uri: tungstenite::http::uri::Uri = self.address.parse().ok()?;
         let ws_scheme = match uri.scheme_str() {
@@ -351,31 +318,12 @@ impl CmsSettings {
         };
         Ok(ureq::config::Config::builder()
             .timeout_connect(Some(Duration::from_secs(3)))
-            // BUG fix (found from a real report: after several
-            // "Cache not ready" SOAP faults and retries -- section 33
-            // -- the whole player appeared to stop responding to
-            // *everything*, not just dataset updates: no more XMR
-            // messages processed, no more periodic layout refresh
-            // either). `timeout_connect` alone only bounds how long
-            // establishing the connection itself can take -- once
-            // connected, if the CMS is slow to respond (plausibly
-            // exactly when it's already struggling enough to return
-            // "Cache not ready" in the first place) or the connection
-            // simply hangs after that point, ureq would wait
-            // indefinitely for a response, with no timeout at all
-            // protecting against it. Since every network call this
-            // agent makes runs synchronously on the mainloop's own
-            // single thread (shared with XMR message handling and the
-            // periodic schedule_check tick, see mainloop.rs's `run()`
-            // select! loop), one such hang blocks literally everything
-            // else the player does, indefinitely -- exactly the
-            // reported symptom. `timeout_global` is end-to-end (DNS
-            // lookup through finishing reading the response body) and
-            // therefore covers this case regardless of *where* in the
-            // request lifecycle something goes wrong; 30s is generous
-            // enough for a normal SOAP round-trip (including a slow
-            // GetResource render) while still bounding the worst case
-            // to something the player can recover from on its own.
+            // timeout_global (not just timeout_connect) bounds the
+            // whole request end-to-end -- every network call runs
+            // synchronously on the mainloop's single thread (shared
+            // with XMR/schedule_check), so a hung response after
+            // connecting (e.g. CMS struggling to reply) would otherwise
+            // block everything else the player does, indefinitely.
             .timeout_global(Some(Duration::from_secs(30)))
             .tls_config(tls_config)
             .proxy(proxy)
@@ -383,23 +331,10 @@ impl CmsSettings {
     }
 
     pub fn make_rustls_client_config(&self, no_verify: bool) -> Result<rustls::ClientConfig> {
-        // BUG fix (found from a real crash report on GitHub: "Player now
-        // freeze on splash screen", panicking at this exact line).
-        // `install_default()` can only ever *succeed* once per process --
-        // this function gets called every time `xmr::start()` runs
-        // (src/xmr.rs), and that happens not just once at startup but
-        // also from the `--allow-offline` retry path (mainloop.rs,
-        // section 50's own fix: if the initial XMR setup fails and
-        // `--allow-offline` is set, a retry happens later once network
-        // connectivity is confirmed). On that second call, the crypto
-        // provider is already installed -- `install_default()` correctly
-        // returns `Err(Arc<CryptoProvider>)` in that case (simply handing
-        // back the *already-installed* provider, not signaling a genuine
-        // failure), but treating that as fatal via `.expect(...)` crashed
-        // the entire player the moment a real-world retry actually fired.
-        // Ignoring the Err case here is exactly what should happen: some
-        // provider (ours or otherwise) is already active either way, and
-        // that's perfectly fine for our purposes.
+        // install_default() can only succeed once per process -- this
+        // runs on every xmr::start() call, including --allow-offline
+        // retries after the first. A later call's Err(already-
+        // installed) is fine, not fatal; must not .expect() it.
         let _ = aws_lc_rs::default_provider().install_default();
         let mut root_store = rustls::RootCertStore::empty();
         if !no_verify {

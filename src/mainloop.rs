@@ -238,17 +238,8 @@ const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Handler {
     /// Create a new handler, with channels to the GUI thread.
-    // Deliberately not refactored into a bundled "options" struct to
-    // satisfy clippy's default threshold here: these 9 parameters are
-    // already loosely grouped by role (identity/settings, behavior
-    // flags, channels) and are read directly, in this same order, at
-    // every one of this function's 9 call sites (8 in this file's own
-    // tests, 1 in main.rs) -- bundling them would touch all of those
-    // call sites for a purely stylistic lint, not a functional one,
-    // with real risk of silently swapping two same-typed flags in the
-    // process. A constructor genuinely needing this many independent,
-    // unrelated pieces of configuration is a reasonable, common
-    // exception to this particular lint.
+    // Not bundled into an options struct: purely a clippy style lint,
+    // not worth touching all 9 call sites for.
     #[allow(clippy::too_many_arguments)]
     pub fn new(cms: &CmsSettings, clear_cache: bool, envdir: &Path,
                no_verify: bool, allow_offline: bool, debug_override: bool,
@@ -298,112 +289,28 @@ impl Handler {
 
         // if we got settings, we are registered and authorized
         if let Some(mut settings) = res {
-            // Debug aid, requested directly: print the settings this
-            // registration resolved to, so an investigation like the
-            // one that found the ordering bug right below this doesn't
-            // have to reconstruct it after the fact from scattered
-            // warning messages about individual fields -- the
-            // *complete* picture is available directly, gated behind
-            // --debug since it's verbose and only useful when actively
-            // troubleshooting.
-            //
-            // BUG (found from a direct report, right after adding
-            // xmds.rs's own /xmr-derived-default fallback for an empty
-            // xmrWebSocketAddress): this is NOT necessarily a verbatim
-            // copy of what the CMS itself sent over the wire --
-            // xmds.rs's own register_display() may have *already*
-            // derived a fallback value for xmr_web_socket_address
-            // specifically (see its own adjacent debug log, printed
-            // just before this one, explaining exactly when that
-            // happens) before this function ever sees `settings` here.
-            // Renamed from the original "received from CMS" wording,
-            // which read as a direct quote of the CMS's own response --
-            // misleading specifically when that fallback kicks in. Safe
-            // to print in full regardless: PlayerSettings's own Debug
-            // impl (see config.rs) redacts the one genuinely sensitive
-            // field (xmr_cms_key) to a fingerprint automatically, not
-            // something this call site needs to remember to do itself.
+            // Verbose, gated behind --debug. Note: xmr_web_socket_address
+            // may already reflect xmds.rs's own /xmr fallback, not
+            // necessarily the CMS's raw value -- see
+            // xmr_web_socket_address_in_use's own doc comment.
             log::debug!("player settings resolved from this registration (initial): {settings:?}");
-            // BUG fix (found from a real, well-documented upstream
-            // report -- github.com/birkenfeld/arexibo/issues/33,
-            // confirmed by multiple independent users): `--allow-offline`
-            // correctly tolerated the *first* network-dependent step
-            // above (RegisterDisplay) by falling back to cached
-            // settings/schedule -- but this *second* one (setting up the
-            // XMR connection, itself needing DNS resolution/a live
-            // socket) was NOT given the same tolerance, and used `?` to
-            // propagate any failure unconditionally. On a genuinely
-            // offline network (the exact reported scenario: "Network is
-            // unreachable" / DNS resolution failure), this meant
-            // `--allow-offline` was completely defeated by the very next
-            // step after the one it was specifically designed to
-            // tolerate -- the whole process would exit instead of
-            // starting up with cached content as intended. Now: if
-            // allow_offline is set, an XMR setup failure logs a warning
-            // and falls back to `never()` (the same "no channel active
-            // right now" placeholder already used elsewhere in this file
-            // for optional timers) instead of aborting startup entirely
-            // -- the player still starts and shows whatever's already
-            // cached, which is the whole point of this flag. The cloned
-            // private key is kept in `xmr_retry_key` so `collect_once`
-            // can retry the XMR connection on a later cycle, once
-            // network genuinely returns, without needing a full restart.
-            // BUG fix (found from a real GitHub report: settings.json
-            // ended up with the correct, complete previously-known-good
-            // address, yet *this session's own* XMR connection still
-            // used the bad, port-less one from this fresh registration
-            // -- because the sticky-address check below used to run
-            // *after* `xmr::start()` was already called with the
-            // untouched, possibly-bad `settings`). CONFIRMED via the
-            // CMS's own real source code (lib/Xmds/Soap5.php): `xmrType`
-            // is set to 'ws' or 'zmq' based on
-            // `$this->display->isWebSocketXmrSupported()`, evaluated
-            // fresh on *every* RegisterDisplay call -- and our own
-            // parsing (xmds.rs) unconditionally sets
-            // xmr_web_socket_address to an EMPTY string whenever
-            // xmrType isn't exactly "ws", discarding whatever
-            // xmrWebSocketAddress value the CMS might have also sent.
+            // --allow-offline (issue #33) tolerated RegisterDisplay
+            // failing, but not XMR setup failing right after -- an
+            // offline network would still abort startup entirely. Now
+            // falls back to never() and retries via xmr_retry_key on a
+            // later collect_once() cycle instead.
+            // Sticky WS address policy: a new, non-empty address from
+            // the CMS always replaces the cached one, but an empty/
+            // port-less one doesn't clear it -- the CMS's own
+            // WebSocket-eligibility check (isWebSocketXmrSupported())
+            // is unreliable across registrations. Must run here, before
+            // xmr::start(), not after -- otherwise this session's first
+            // connection attempt would still use the bad address even
+            // though settings.json ends up correct for next time.
+            // AREXIBO_FORCE_WS_ADDRESS overrides this entirely.
             //
-            // POLICY (revised after a follow-up GitHub report showed
-            // this happening *systematically*, not just as a rare
-            // transient hiccup as originally assumed): rather than
-            // trusting every single registration's address at face
-            // value, treat a previously-known-good address as sticky --
-            // a *new*, non-empty address from the CMS always replaces
-            // it (a genuine address change must still take effect), but
-            // an empty one no longer clears it. The CMS's own
-            // WebSocket-eligibility check has turned out to be
-            // unreliable often enough in practice that trusting its
-            // "no" answers as much as its "yes" answers was actively
-            // counterproductive -- and there is essentially never a
-            // legitimate reason to *not* have advertised the address at
-            // all if a previous registration genuinely had one working.
-            // `AREXIBO_FORCE_WS_ADDRESS` (see xmds.rs) remains available
-            // for pinning the address even against a *future* address
-            // change, for anyone who wants that stronger guarantee.
-            //
-            // Moved here (before xmr::start(), not after) so this
-            // *first* connection attempt of the session benefits from
-            // the same protection collect_once's own later cycles
-            // already had -- not just what gets persisted to
-            // settings.json for next time.
-            //
-            // BUG fix (found from a real report, right after adding
-            // the default_xmr_websocket_address() fallback itself):
-            // that fallback deliberately produces a *port-less* address
-            // (ws://<cms host>/xmr, relying on the scheme's own default
-            // port, matching how the CMS's own documented Docker
-            // convention expects the same port as its own HTTP/HTTPS
-            // traffic to be reused) -- which the check below would
-            // otherwise treat as exactly the kind of suspicious,
-            // incomplete address it exists to guard against, keeping a
-            // stale cached one instead of ever letting this
-            // *deliberately* port-less default through. Comparing
-            // against what this same fallback would produce right now
-            // distinguishes "this is our own intentional derived
-            // default" from "the CMS sent something that merely looks
-            // similarly incomplete" -- only the latter should ever be
-            // protected against.
+            // is_own_derived_ws_default() exempts our own /xmr fallback
+            // (deliberately port-less) from being treated as suspicious.
             let is_own_derived_default = is_own_derived_ws_default(cms, &settings.xmr_web_socket_address_in_use);
             if let Ok(prev) = PlayerSettings::from_file(&setting_file) {
                 if !prev.xmr_web_socket_address_in_use.is_empty() && !is_own_derived_default
@@ -616,36 +523,17 @@ impl Handler {
                         // bumped it; that's a harmless redundant fetch,
                         // not a correctness issue.
                         match self.cache.refresh_resource(widget_id, &mut self.xmds) {
-                            // BUG fix (found from a real report: a
-                            // dataUpdate for a widget nested inside
-                            // another resource's combined HTML --
-                            // section 39's own fallback -- correctly
-                            // refreshed the *container* resource, but
-                            // this then reloaded the wrong DOM element,
-                            // searching for `#m{widget_id}` (the nested
-                            // widget's own id) which never exists as an
-                            // iframe of its own; only the container's
-                            // `#m{fetch_id}` does. Reloading the
-                            // *returned* id (which is only ever
-                            // different from `widget_id` in exactly that
-                            // nested case) fixes this silently-failing
-                            // reload.
+                            // Reload the *returned* id, not widget_id --
+                            // they differ for a widget nested inside
+                            // another resource's combined HTML, where
+                            // only the container has its own iframe.
                             Ok(fetch_id) => {
                                 self.to_gui.send(ToGui::ReloadWidget(fetch_id)).unwrap();
                             }
                             Err(e) => {
-                                // BUG fix (found from a real report: a
-                                // widget refreshed via dataUpdate hit
-                                // the same real, confirmed transient CMS
-                                // fault as a normal bulk collection
-                                // ("Cache not ready" for a widget it
-                                // hadn't finished rendering yet), but
-                                // this path -- unlike a normal bulk
-                                // download failure -- was never retried
-                                // at all, leaving the widget stuck
-                                // blank/stale until an unrelated full
-                                // collection or layout switch happened
-                                // to refresh it anyway.
+                                // Retry on transient CMS faults (e.g.
+                                // "Cache not ready") -- this path wasn't
+                                // retried before, unlike bulk collection.
                                 log::error!("refreshing widget {widget_id} \
                                             after dataUpdate: {e:#}");
                                 self.dataupdate_retry_queue.push((widget_id, 0));
@@ -744,30 +632,14 @@ impl Handler {
                         }
                         self.schedule_check();
                     }
-                    // BUG fix (found from a real, still-unresolved
-                    // report: repeated "Connection closed normally,
-                    // reconnecting in 10s" that never recovered on its
-                    // own -- only a full process restart fixed it).
-                    // The XMR thread now gives up (see
-                    // RECONNECT_MAX_ATTEMPTS in xmr.rs) after a bounded
-                    // number of failed reconnection attempts, dropping
-                    // its Sender -- which is exactly what closes this
-                    // channel, landing here. Previously a no-op; now
-                    // triggers a proper restart via the *existing*
-                    // xmr_retry_key + collect_once mechanism (already
-                    // used for --allow-offline), which uses whatever
-                    // settings/address are current at the time it
-                    // actually runs -- the same fresh state a full
-                    // process restart would pick up, without requiring
-                    // one. Replacing `self.xmr` with `never()`
-                    // immediately (rather than leaving the now-
-                    // disconnected channel in place) is essential, not
-                    // cosmetic: recv() on an already-disconnected
-                    // channel returns immediately rather than blocking,
-                    // so leaving it as-is would make this same arm fire
-                    // repeatedly in a busy-loop on every iteration of
-                    // this select!, until collect_once() eventually
-                    // replaces it with a real, working channel.
+                    // The XMR thread gives up (RECONNECT_MAX_ATTEMPTS in
+                    // xmr.rs) after too many failed reconnects, dropping
+                    // its Sender -- this closes the channel, landing
+                    // here. Triggers a restart via xmr_retry_key +
+                    // collect_once (same mechanism as --allow-offline).
+                    // Must replace self.xmr with never() immediately --
+                    // a disconnected channel's recv() returns instantly,
+                    // so leaving it would busy-loop this select! arm.
                     Err(_) => {
                         self.xmr_disconnected();
                         collect = after(Duration::from_secs(0));
@@ -839,21 +711,9 @@ impl Handler {
 
     /// Run a shell command, triggered from layout.
     fn run_shell(&mut self, code: &str, with_shell: bool) {
-        // BUG fix (found via a real log the user shared): the XLF's own
-        // `globalCommand`/`linuxCommand` text is percent-/form-encoded
-        // by the CMS (confirmed from real values like
-        // "%2Fusr%2Fbin%2Ftouch+%2Ftmp%2F..." and a pipe-delimited HTTP
-        // command whose own URL/JSON body were themselves
-        // percent-encoded) -- this was never decoded before being
-        // logged *or* run, so even with shell commands enabled the
-        // literal garbled string would have been what actually executed
-        // (or, for the HTTP case below, would have made this whole
-        // command unrecognizable as one). Decoded here, first thing,
-        // so *every* log line below (including the disabled/not-allowed
-        // ones) shows the real, human-meaningful command text -- which
-        // is also what an administrator configuring
-        // ShellCommandAllowList would actually be looking at, not its
-        // encoded form.
+        // The CMS sends globalCommand/linuxCommand percent-encoded --
+        // decode before logging/running, or the literal encoded string
+        // would be what actually executed.
         let code = percent_decode(code);
         let code = code.as_str();
 
@@ -928,19 +788,9 @@ impl Handler {
             // than "received from CMS" (not necessarily a verbatim copy
             // of the CMS's own raw response -- see that same comment).
             log::debug!("player settings resolved from this registration (collection cycle): {settings:?}");
-            // See the matching check + doc comment in `Handler::new`
-            // (section 63/64/69's own fix, policy revised after a
-            // follow-up report showed this happening systematically) --
-            // same sticky-address policy, but here it's the *in-memory*
-            // settings used for the XMR retry attempt right below,
-            // rather than the on-disk settings.json (which only gets
-            // written at startup, not on every ongoing collection
-            // cycle).
-            //
-            // Same is_own_derived_default exemption as Handler::new's
-            // own copy of this check -- see its own doc comment for
-            // the full context (found from a real report right after
-            // adding default_xmr_websocket_address() itself).
+            // Same sticky-address policy as Handler::new (see its own
+            // comments), applied here to the in-memory settings used
+            // for the XMR retry attempt, not settings.json.
             let is_own_derived_default = is_own_derived_ws_default(&self.cms, &settings.xmr_web_socket_address_in_use);
             if !self.settings.xmr_web_socket_address_in_use.is_empty() && !is_own_derived_default
                 && !ws_address_has_port(&settings.xmr_web_socket_address_in_use) {
@@ -1024,17 +874,10 @@ impl Handler {
         // download all missing files
         let mut result = Vec::new();
         let total = required.len();
-        // BUG fix (found from a real report: `DownloadStartWindow`/
-        // `DownloadEndWindow` -- a real Display Profile setting meant
-        // to keep a display from hogging bandwidth during business
-        // hours -- was parsed nowhere and enforced nowhere at all).
-        // Deliberately gates only the *bulk file downloads* below, not
-        // the lightweight RegisterDisplay/RequiredFiles/Schedule calls
-        // already made above -- those need to keep happening
-        // regardless so the schedule/layout-switching logic further
-        // down in this same function still has current information to
-        // act on using whatever's *already* cached, even while outside
-        // the configured download window.
+        // DownloadStartWindow/DownloadEndWindow gates only bulk file
+        // downloads below, not the lightweight XMDS calls above --
+        // schedule/layout-switching still needs current info even
+        // outside the window, using whatever's already cached.
         if !self.settings.is_within_download_window() {
             log::info!("outside the configured download window \
                         ({}-{}), skipping {total} pending file download(s) \
@@ -1170,12 +1013,9 @@ impl Handler {
     }
 
     /// Check if need to update the layouts to show.
-    /// See the matching `Err(_)` arm's own doc comment in `run()`'s
-    /// select! loop for the full context -- extracted into its own
-    /// method specifically so this logic (distinct from resetting the
-    /// select!-local `collect` timer, which stays inline at the call
-    /// site) can be tested directly, without needing to drive the
-    /// full, otherwise-infinite `run()` loop itself.
+    /// See the matching `Err(_)` arm in `run()`'s select! loop --
+    /// extracted so this can be tested directly without driving the
+    /// full, otherwise-infinite `run()` loop.
     fn xmr_disconnected(&mut self) {
         log::warn!("XMR connection thread ended (gave up reconnecting) -- \
                     will restart it with fresh settings on the next \
@@ -1195,18 +1035,10 @@ impl Handler {
             Some(id) => vec![id],
             None => self.schedule.layouts_now(&self.criteria),
         };
-        // BUG fix (found from a real report: with the download window
-        // -- section 44 -- active, a newly-scheduled layout never
-        // downloaded yet got shown anyway, producing a blank/404'd
-        // page). `layouts_now()` only knows the *schedule*, not which
-        // layouts are actually cached locally -- normally a non-issue
-        // since downloads happen earlier in the very same collection
-        // cycle, but the download window (or, in principle, any
-        // transient download failure) can leave a freshly-scheduled
-        // layout genuinely absent on disk. Filter those out, falling
-        // back to whatever's already showing (itself necessarily
-        // already cached, or it couldn't be showing) rather than
-        // switching to something that doesn't exist yet.
+        // Filter out scheduled layouts not yet cached (download window
+        // or a transient failure can leave one absent on disk) --
+        // fall back to whatever's already showing instead of switching
+        // to something that doesn't exist yet.
         let available: Vec<_> = new_layouts.iter().copied()
             .filter(|&id| self.cache.get_layout(id).is_some())
             .collect();
@@ -1263,29 +1095,15 @@ impl Handler {
     /// own `duration` -- to advance to the *next* one, wrapping around --
     /// if there's actually more than one overlay to rotate between.
     ///
-    /// BUG fix (found from a real report: the overlay kept reloading
-    /// every `duration` seconds forever, appearing to "permanently cover"
-    /// the normal layout underneath): with only a *single* active
-    /// overlay, there is nothing to rotate to, so unconditionally
-    /// rescheduling a timer here caused this same one overlay to be
-    /// reloaded (a fresh `ToGui::ShowOverlay`, i.e. a full page reload)
-    /// again and again indefinitely -- directly contradicting the
-    /// documented behavior ("Overlay Layouts... will only render media
-    /// content once so will not show any refreshed content"). Now: show
-    /// it once and leave `overlay_expiry` at `never()` -- it keeps
-    /// showing (correctly, for as long as it's scheduled) without ever
-    /// being reloaded again on its own.
+    /// With only a single active overlay, there's nothing to rotate
+    /// to -- reschedule only when there are 2+ overlays; otherwise show
+    /// once and leave overlay_expiry at never() so it doesn't keep
+    /// reloading itself indefinitely.
     fn show_current_schedule_overlay(&mut self) {
         let (layout_id, duration) = self.schedule_overlays[self.schedule_overlay_idx];
         if self.cache.get_layout(layout_id).is_none() {
-            // Not cached yet -- same conservative approach as the XMR
-            // overlayLayout path: don't show a broken/blank overlay,
-            // just wait and retry this same slot once a collection has
-            // (hopefully) fetched it. Reusing `duration` as the retry
-            // interval is arbitrary but reasonable (avoids needing a
-            // whole separate timer just for this rare case). This retry
-            // timer is legitimate regardless of rotation, since here we
-            // genuinely have nothing shown yet.
+            // Not cached yet -- wait and retry this slot once a
+            // collection has fetched it, rather than showing blank.
             log::warn!("scheduled overlay layout {layout_id} not cached yet, \
                         will retry in {duration}s");
             self.overlay_expiry = after(Duration::from_secs(duration.max(1) as u64));
@@ -1315,26 +1133,10 @@ impl Handler {
         let queue = std::mem::take(&mut self.resource_retry_queue);
         for (file, attempts) in queue {
             let desc = file.description();
-            // BUG fix (found from a real report: a resource widget
-            // stuck permanently blank on screen even after its retry
-            // download had genuinely succeeded server-side -- fixed
-            // only by an unrelated, full layout switch away and back,
-            // which forces the whole page to reload from scratch).
-            // Capture the widget id before `file` is consumed by
-            // download() below -- needed on success, to refresh
-            // whatever's already on screen (shown blank/broken from the
-            // original failed attempt). This must be `id`, matching the
-            // XLF's own `<media id="...">` attribute that becomes the
-            // iframe's `id="m{id}"` in the generated HTML (see
-            // layout.rs's write_media: `let mid =
-            // media.parse_attr("id")?;`) -- NOT `mediaid`, a genuinely
-            // different field (parsed from a separate `mediaid` XML
-            // attribute in the RequiredFiles response, unrelated to the
-            // widget's own identity) that was used here by mistake. The
-            // dataUpdate path (Cache::refresh_resource, mainloop.rs's
-            // own DataUpdate handler) already gets this right, using
-            // `fetch_id`/`id` correctly -- this was the one path that
-            // didn't.
+            // Must be `id` (the XLF's own <media id> / iframe id="m{id}")
+            // not `mediaid` (a different field) -- refreshes the widget
+            // once the retry succeeds instead of leaving it blank until
+            // an unrelated layout switch.
             let widget_id = match &file {
                 crate::resource::ReqFile::Resource { id, .. } => Some(*id),
                 _ => None,
@@ -1393,26 +1195,16 @@ impl Handler {
 
     /// Apply new player settings.
     fn update_settings(&mut self) {
-        // BUG fix (found from a real report -- cross-checking another
-        // fork's own overnight-audit findings): the CMS's own `logLevel`
-        // Display Profile setting was parsed into `PlayerSettings` but
-        // never actually applied anywhere -- only the local `--debug`
-        // CLI flag affected real log verbosity. `--debug` still always
-        // wins when set (an explicit local override for troubleshooting
-        // shouldn't be silently overridden by a remote setting), but
-        // otherwise this now genuinely takes effect, and is re-applied
-        // every time settings are refreshed in case the CMS changes it.
+        // CMS's logLevel setting takes effect unless --debug is set
+        // locally (an explicit override shouldn't be silently beaten
+        // by a remote setting).
         if !self.debug_override {
             log::set_max_level(self.settings.log_level_filter());
         }
 
-        // Propagate to the cache so newly-translated layouts pick up
-        // the current Adspace Exchange on/off state (see adspace.rs) --
-        // `adspace_partner` is deliberately left unset here: no
-        // confirmed CMS field name for it was found (see
-        // PlayerSettings::is_adspace_enabled's own doc comment), and
-        // it's optional in the bid request anyway (simply omitted when
-        // `None`).
+        // Adspace on/off state for newly-translated layouts (see
+        // adspace.rs) -- adspace_partner left unset, no confirmed CMS
+        // field name found, optional in the bid request anyway.
         self.cache.adspace_enabled = self.settings.is_adspace_enabled;
 
         // let the GUI know to reconfigure itself
@@ -1452,23 +1244,9 @@ fn is_command_allowed(allow_list: &str, code: &str) -> bool {
 }
 
 /// Whether a candidate XMR WebSocket address is actually usable to
-/// justify replacing a previously-known-good one -- specifically,
-/// whether it has an explicit port, not just whether the string is
-/// non-empty.
-///
-/// BUG fix (found from a direct correction of an earlier version of
-/// this sticky-address policy, section 70): checking only
-/// `.is_empty()` missed a real case the CMS can produce -- a non-empty
-/// address string *without* a port at all (e.g. "ws://192.168.2.10",
-/// the exact malformed address from section 62's own bug report). An
-/// address like that would have passed the old "non-empty, so it must
-/// be a genuine update" check, silently replacing a good
-/// "ws://192.168.2.10:8080" with a strictly worse, port-less version --
-/// exactly the kind of silent regression this whole sticky policy was
-/// meant to prevent in the first place, just for a different field
-/// within the same string. An address without an explicit port is
-/// never a legitimate replacement candidate, regardless of whether the
-/// string is otherwise non-empty.
+/// justify replacing a previously-known-good one -- must have an
+/// explicit port, not just be non-empty (a bare "ws://host" without a
+/// port is never a legitimate replacement).
 fn ws_address_has_port(addr: &str) -> bool {
     if addr.is_empty() {
         return false;
@@ -1480,17 +1258,8 @@ fn ws_address_has_port(addr: &str) -> bool {
 
 /// Whether `candidate` is exactly what `cms`'s own
 /// `default_xmr_websocket_address()` fallback would produce right now
-/// -- see both sticky-check call sites' own doc comments for why this
-/// matters: that fallback deliberately produces a port-less address
-/// (relying on the scheme's own default port), which `ws_address_
-/// has_port` alone would otherwise flag as suspiciously incomplete,
-/// keeping a stale cached address instead of ever accepting our own
-/// intentional derived default. Extracted as its own pure function
-/// (no network needed) specifically so this can be unit-tested
-/// directly with a genuinely port-less `cms.address` -- a real mock
-/// HTTP server's own `cms.address` necessarily has an explicit port
-/// (needing one to be reachable at all), which would otherwise mask
-/// exactly the port-less case this exists to handle.
+/// -- exempts our own intentional port-less default from the sticky
+/// check's suspicious-address guard.
 fn is_own_derived_ws_default(cms: &CmsSettings, candidate: &str) -> bool {
     cms.default_xmr_websocket_address().as_deref() == Some(candidate)
 }

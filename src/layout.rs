@@ -121,22 +121,8 @@ window.arexibo = {
     else if (next == -2)
       next = (cur + total - 1) % total;
 
-    // BUG fix (found from a real report: "Playlist with 3 pictures
-    // slideshow timed for 3 seconds each freezes on last picture after
-    // 1st run"). CONFIRMED via official Xibo documentation (two
-    // independent sources, xibosignage.com and the xibo.org.uk manual,
-    // consistent wording): "The Loop option is only applicable when
-    // there is only 1 media item in the region." -- for a region with
-    // MORE than one item, `loop` simply doesn't apply at all; it must
-    // always keep cycling through its items regardless of that
-    // setting. This freeze-on-wrap logic was previously applied
-    // unconditionally (added to fix a *different*, real report of
-    // "playlists kept cycling forever" -- that one, on reflection, was
-    // very likely about a single-item region, or about layout/campaign-
-    // level cycle counts, not about this multi-item case at all) --
-    // now scoped to `total <= 1` specifically, matching the documented
-    // semantics precisely instead of applying it to every region
-    // regardless of how many items it actually has.
+    // Loop only applies to single-item regions (confirmed in official
+    // Xibo docs) -- a region with 2+ items must keep cycling regardless.
     if (next == 0 && !first && !loop && total <= 1) {
       this.region_done(rid);
       return;
@@ -509,25 +495,11 @@ impl<'a> Translator<'a> {
                     writeln!(self.out, "document.body.addEventListener('click', function() {{ {call}; }});")?;
                 }
             }
-            // BUG fix (found from a real report: "Interactive layout
-            // button... did not recognize keyboard space key press...
-            // but touch is recognized"). CONFIRMED via a real XLF
-            // sample from the CMS: Xibo's "Key Press" interactive
-            // trigger (CMS 4.4+, docs: "trigger interactive content
-            // with your keyboard, without the need for a touchscreen
-            // display") does NOT use a separate triggerType -- it's the
-            // *same* triggerType="touch" action, with `triggerCode`
-            // additionally carrying a keyboard key name (e.g. "Space",
-            // matching the KeyboardEvent.code convention) as an
-            // *alternative* way to fire the identical action, alongside
-            // the touch/click zone above, not instead of it. This was
-            // previously never implemented at all -- triggerCode was
-            // read only for the (unrelated) webhook action type,
-            // completely ignored here. Always adding this listener is
-            // safe/inert for a touch-only action that doesn't use this
-            // feature: a triggerCode that isn't a real KeyboardEvent.code
-            // value (e.g. "<not set>") will simply never match any real
-            // key event.
+            // Key Press trigger (CMS 4.4+): same triggerType="touch"
+            // action, with triggerCode carrying a keyboard key name
+            // (KeyboardEvent.code) as an alternative to touch/click.
+            // Safe to always add: a non-matching triggerCode simply
+            // never fires.
             writeln!(self.out, "document.addEventListener('keydown', function(e) {{ \
                                 if (e.code === {code:?}) {{ {call}; }} }});")?;
         } else {
@@ -605,36 +577,15 @@ impl<'a> Translator<'a> {
                                 </style>")?;
         }
 
-        // BUG fix (found from a real report: the incoming widget during
-        // a "fly" transition rendered outside its own region's visual
-        // area, then jumped into position rather than sliding in
-        // smoothly). Root cause: previously each widget WAS its own
-        // absolutely-positioned element (left/top/width/height set
-        // directly, matching the region's own geometry) -- transform-
-        // translating it for "fly" moved that entire box, with nothing
-        // left behind to clip where it travelled *through* on its way
-        // in/out. This wrapper is the region's own fixed, stationary
-        // "window" (real geometry + overflow: hidden); each widget
-        // inside it now uses relative (0,0,100%,100%) coordinates (see
-        // the `media_geom` passed to write_media below) instead of the
-        // absolute region position, so a fly transform moves the widget
-        // only *within* this fixed, clipped viewport -- visible sliding
-        // in from just outside the region's own edge, not anywhere else
-        // on the whole page.
-        //
-        // MUST be opened here, before the write_media() loop below --
-        // an earlier version of this fix opened it *after* that loop
-        // instead (to avoid an unclosed div for an empty region), which
-        // meant every widget's own HTML (written *during* the loop) was
-        // emitted as a preceding *sibling* of the wrapper, not nested
-        // inside it at all -- so its "left:0; top:0" ended up relative
-        // to <body> itself (the whole page's own top-left corner)
-        // rather than to this wrapper, a real, visible bug found on a
-        // real totem (widget appearing at the screen's top-left instead
-        // of its correct position). An empty region now gets an empty,
-        // harmless open+close wrapper pair instead of no wrapper at all
-        // (see the nitems==0 check below) -- far simpler than deferring
-        // this decision, and has no visible or functional effect.
+        // Fixed, stationary wrapper (real geometry + overflow: hidden)
+        // for the "fly" transition -- widgets inside use relative
+        // (0,0,100%,100%) coordinates (see media_geom below) so a fly
+        // transform moves them only within this clipped viewport.
+        // MUST open before the write_media() loop below, not after --
+        // otherwise each widget's own HTML ends up as a preceding
+        // sibling of the wrapper, not nested inside it, breaking its
+        // relative positioning. An empty region gets an empty,
+        // harmless wrapper pair (see nitems==0 check below).
         writeln!(self.out, "<div class='r{rid}' style='position: absolute; \
                             left: {x}px; top: {y}px; width: {w}px; height: {h}px; \
                             overflow: hidden;'>")?;
@@ -690,32 +641,16 @@ impl<'a> Translator<'a> {
                     _ => ((Trans::None, 0), (Trans::None, 0)),
                 }
             }).unwrap_or(((Trans::None, 0), (Trans::None, 0)));
-        // BUG fix (found from a real report: playlists kept cycling
-        // forever regardless of this setting -- on reflection, most
-        // likely a single-item region case, or a layout/campaign-
-        // level cycle count, given the official docs confirm `loop`
-        // "is only applicable when there is only 1 media item in
-        // the region"): this was never read at all before. `<loop>`
-        // here is the REGION's own single-item loop -- whether,
-        // after showing its one media item once, it should reload/
-        // restart it (1) or freeze/hold on it until the layout
-        // itself finishes (0/absent) -- see region_switch's own
-        // handling above, which only applies this when the region
-        // has exactly one item; a region with more than one item
-        // always keeps cycling through them regardless of this
-        // setting, per the same documented semantics. Distinct from
-        // a video widget's own `<loop>` in its *own* `<options>`
-        // (see write_media's video branch), which governs native
-        // single-widget looping.
+        // Region's own single-item loop: whether to restart its one
+        // media item after showing it once (1) or freeze on it (0) --
+        // only applies with exactly one item (see region_switch above).
+        // Distinct from a video widget's own <loop> in write_media.
         let region_loop = region.find("options").and_then(|opts| opts.find("loop"))
             .map(|e| e.text().trim() == "1").unwrap_or(false);
 
         let mut sequence = Vec::new();
-        // [0, 0, w, h] rather than the real [x, y, w, h] geom -- each
-        // widget is now positioned *relative to the wrapper div* above
-        // (which already carries the real region position), not
-        // relative to the whole page. See the wrapper's own doc comment
-        // for why.
+        // [0, 0, w, h], not the real [x, y, w, h] -- widgets are
+        // positioned relative to the wrapper div above, not the page.
         let media_geom = [0, 0, w, h];
         for media in region.find_all("media") {
             match self.write_media(rid, media_geom, (x, y), media, (region_in, region_out)) {
@@ -949,37 +884,14 @@ impl<'a> Translator<'a> {
                 // text/ticker applies unchanged; no new download logic
                 // needed on the resource side.
                 //
-                // BUG fix (found from a real report: main layout content
-                // intermittently missing/delayed, worse whenever an
-                // Overlay Layout was also active): see
-                // `server::HTML_SHARD_COUNT`'s own doc comment for the
-                // full story (Chromium's hardcoded 6-connections-per-
-                // origin limit). Each widget's own `src` is now an
-                // *absolute* URL on one of several loopback origins,
-                // chosen deterministically from this widget's own `mid`
-                // (not randomly -- so repeated translations of the same
-                // layout consistently pick the same shard per widget,
-                // which doesn't matter for correctness but keeps
-                // generated output stable/diffable), instead of a
-                // relative path that would always resolve against
-                // whichever single origin loaded the *parent* page.
-                //
-                // Distinctively-named `arexiboShrinkW`/`arexiboShrinkH`
-                // query params *in addition to* the original `w`/`h`
-                // (kept as-is in case CMS-generated resource templates
-                // read those exact names themselves, e.g. via
-                // xiboLayoutScaler/bundle.min.js -- not worth risking a
-                // regression there) so the profile-level shrink-to-fit
-                // script (see gui/lib.cpp, injected into every frame
-                // including this one) can recognize *only* arexibo's own
-                // resource iframes -- picking a name unlikely to collide
-                // with any real external site's own, unrelated `w`/`h`
-                // query parameters matters *now* specifically because
-                // that script runs in every frame regardless of origin
-                // (it has to, now that this iframe may be cross-origin
-                // relative to the parent page -- see that script's own
-                // doc comment for why the shrink logic moved from
-                // parent-reaches-into-child to frame-shrinks-itself).
+                // Sharded across multiple loopback origins (see
+                // server::HTML_SHARD_COUNT) to work around Chromium's
+                // 6-connections-per-origin limit -- chosen
+                // deterministically from `mid` for stable output.
+                // arexiboShrinkW/H (alongside the original w/h, kept for
+                // CMS-template compatibility) let the shrink-to-fit
+                // script (gui/lib.cpp) recognize arexibo's own resource
+                // iframes across origins.
                 let shard = 1 + (mid as u32 % crate::server::HTML_SHARD_COUNT);
                 let port = self.html_port;
                 writeln!(self.out, "<iframe class='media r{rid}' id='m{mid}' \
@@ -1007,22 +919,11 @@ impl<'a> Translator<'a> {
                     writeln!(self.out, "<div class='media r{rid}' id='m{mid}' \
                                         style='left: {x}px; top: {y}px; width: {w}px; \
                                         height: {h}px;'></div>")?;
-                    // Deliberately abs_x/abs_y here, NOT the (0,0)-
-                    // relative x/y used just above for the placeholder's
-                    // own CSS -- jsNativeWebShow drives a *separate*,
-                    // real Qt QWebEngineView positioned in native window
-                    // coordinates (see Window::jsNativeWebShowImpl in
-                    // gui/view.cpp), entirely outside this page's own
-                    // DOM/CSS -- it has no wrapper div to be relative
-                    // to at all, and needs this region's real on-screen
-                    // position directly. Regression found from a real
-                    // report: using the same (0,0)-relative x/y here
-                    // (matching a stale copy-paste from the CSS
-                    // placeholder above, after the fly-transition fix
-                    // introduced that relative geometry) made every
-                    // native webpage widget land at the same spot
-                    // (the base view's own top-left corner) regardless
-                    // of its own region's actual position.
+                    // abs_x/abs_y here, NOT the (0,0)-relative x/y used
+                    // for the placeholder's CSS above -- jsNativeWebShow
+                    // drives a separate Qt QWebEngineView in native
+                    // window coordinates, with no wrapper div to be
+                    // relative to.
                     add_start = format!(
                         "window.arexiboGui.jsNativeWebShow({mid}, {url:?}, {abs_x}, {abs_y}, {w}, {h});");
                     add_stop = format!("window.arexiboGui.jsNativeWebHide({mid});");
@@ -1053,30 +954,10 @@ impl<'a> Translator<'a> {
             (_, Some("video" | "localvideo")) => {
                 let url = percent_decode(opts.find("uri").context("no video uri")?.text());
                 let mute = opts.find("mute").is_some_and(|el| el.text() == "1");
-                // BUG fix (found from a real report: video "loops, but
-                // with quite a long pause between each loop"). This
-                // widget's own `<loop>` option (distinct from the
-                // *region's* `<loop>`, see write_region) was never read
-                // at all before -- every video always had its `duration`
-                // overridden to `() => video.duration` regardless, so
-                // even a video meant to loop natively would, after
-                // exactly one play-through, get caught by
-                // region_switch's timer, which would hide/re-show it
-                // (re-triggering `.play()` from scratch) -- a
-                // JS-driven, timer-mediated restart with real overhead
-                // (event round-trip, re-reading `.duration`, DOM
-                // updates), instead of the browser's own native video
-                // decoder looping seamlessly with the HTML `loop`
-                // attribute. Now: `loop=1` sets that attribute (letting
-                // the browser handle actual repetition with no JS
-                // involvement at all) and *keeps* the widget's own
-                // static XLF-declared duration (already `duration`'s
-                // default value at this point, same as any other
-                // non-video widget type) instead of overriding it with
-                // the single-playthrough `video.duration` -- so
-                // region_switch only moves on once the widget's own
-                // intended on-screen time has elapsed, not after just
-                // one internal loop iteration.
+                // loop=1 uses the native HTML loop attribute (browser
+                // handles repetition) and keeps the widget's own static
+                // XLF duration, instead of a timer-mediated JS restart
+                // with a real pause between loops.
                 let loop_video = opts.find("loop").is_some_and(|el| el.text().trim() == "1");
                 writeln!(self.out, "<video class='media r{rid}' id='m{mid}' src='{url}' {} {} \
                                     style='left: {x}px; top: {y}px; width: {w}px; \
@@ -1084,103 +965,49 @@ impl<'a> Translator<'a> {
                          if mute { "muted" } else { "" },
                          if loop_video { "loop" } else { "" },
                          object_fit(opts), object_pos(opts))?;
-                // BUG fix (found from a real report: "Playlist with videos
-                // does not obey play time duration set in playlist video
-                // properties"). The CMS's own `useDuration` attribute on
-                // the <media> node (CONFIRMED REAL, from an official
-                // documentation XLF example:
-                // `<media type="image" duration="300" useDuration="1">`
-                // vs `duration="10" useDuration="0">`) governs exactly
-                // this: "1" means play for the CMS-configured `duration`
-                // seconds regardless of the video's own natural length
-                // (cutting it short, or holding past it); "0" (or absent)
-                // means play for the video's own natural length instead,
-                // with `duration` only a fallback default. The
-                // native-`ended`-event approach below was previously used
-                // unconditionally for any non-looping video, silently
-                // ignoring an explicit useDuration="1" override entirely.
+                // useDuration="1" (confirmed real CMS attribute): play
+                // for the configured `duration` regardless of the
+                // video's natural length, instead of always using the
+                // native `ended` event.
                 let use_duration = media.get_attr("useDuration").is_some_and(|v| v == "1");
                 if loop_video || use_duration {
                     add_start = format!("document.getElementById('m{mid}').play();");
-                    // `duration` already defaults to the CMS-configured
-                    // XLF `duration` attribute (set at the top of this
-                    // function, same as any other non-video widget type)
-                    // -- nothing further to do here for the useDuration=1
-                    // case; for loop_video, the native `loop` attribute on
-                    // the <video> element above handles actual repetition,
-                    // this just needs *a* duration to know when to move on.
+                    // `duration` already defaults to the XLF-configured
+                    // value; loop's own repetition is handled by the
+                    // native `loop` attribute above.
                 } else {
-                    // BUG fix (found from a real report: a non-looping
-                    // video "seems stuck, a screenshot always shows the
-                    // same frame"). Reading `video.duration`
-                    // *synchronously*, in the very same tick as calling
-                    // `.play()`, is unreliable -- video metadata loads
-                    // *asynchronously* (the `loadedmetadata` event fires
-                    // later), so `.duration` very commonly still reads
-                    // as `NaN` at that exact moment. Since
-                    // `region_switch`'s `let duration = media[next][2]()
-                    // || 1;` treats a NaN result as falsy, this silently
-                    // fell back to a **1-second** timer -- meaning the
-                    // video got restarted from scratch roughly every
-                    // second, often before it had made any real visible
-                    // progress at all, giving the appearance of being
-                    // frozen on its first frame forever. Fixed by using
-                    // the video's own reliable native `ended` event as
-                    // the actual mechanism to advance (fired by the
-                    // browser only once real playback has genuinely
-                    // finished, no race condition), rather than trying
-                    // to predict the duration up front. The `duration`
-                    // function below is now only a *safety-net* timeout
-                    // (24h) in case `ended` never fires for some reason
-                    // (e.g. a corrupt file) -- not the primary driver.
+                    // Reading `.duration` synchronously right after
+                    // `.play()` is unreliable (metadata loads
+                    // asynchronously, often still NaN) -- region_switch
+                    // would treat that as falsy and restart the video
+                    // every ~1s. Use the native `ended` event instead,
+                    // with an 86400s duration as a safety-net timeout only.
                     add_start = format!(
                         "{{ let el = document.getElementById('m{mid}'); \
                            el.play(); \
                            el.onended = () => window.arexibo.region_switch({rid}, -1, false); }}");
                     duration = "() => 86400".to_string();
                 }
-                // BUG fix (found from a real report: a video with an
-                // explicit duration set is sent to background when its
-                // time is up, but keeps playing invisibly instead of
-                // actually stopping). Every other widget type that
-                // needs cleanup when hidden (PDF, native webpage) already
-                // sets add_stop alongside add_start -- video/localvideo
-                // never did, for either duration-handling branch above
-                // (useDuration=1/loop, or the native `ended`-event path).
-                // Pausing *and* resetting playback position (not just
-                // pausing) also means the video restarts from the
-                // beginning next time this widget comes back around in
-                // the region's own loop, rather than resuming from
-                // wherever it happened to be left off (or already
-                // finished, appearing frozen on its last frame).
+                // Pause+reset when sent to background (regardless of
+                // branch above) -- otherwise the video kept playing
+                // invisibly, and would resume from wherever it was left
+                // off next time instead of restarting cleanly.
                 add_stop = format!(
                     "{{ let el = document.getElementById('m{mid}'); \
                        el.pause(); el.currentTime = 0; }}");
             }
             (_, Some("audio")) => {
-                // Standalone Audio widget (as opposed to audio attached to
-                // another widget, which the CMS embeds as <audio> tags
-                // inside that widget's own generated HTML and is therefore
-                // already handled by the resource/iframe path above).
-                // Modeled 1:1 on the video arm above: FLAGGED AS UNVERIFIED
-                // -- the `uri`/`mute` option names are carried over from the
-                // video module by analogy (same underlying Xibo media
-                // options schema) and confirmed only via the XLF developer
-                // docs stating a `loop`/`volume` pair also exists for Audio
-                // nodes; `volume` is not yet wired up here (video doesn't
-                // handle it either -- same pre-existing gap, left alone to
-                // stay in scope). Verify against a real CMS audio widget
-                // before relying on mute/volume behavior.
+                // Standalone Audio widget (audio attached to another
+                // widget is embedded as <audio> tags inside that
+                // widget's own HTML, handled by the resource/iframe path
+                // above). Modeled on the video arm above -- FLAGGED AS
+                // UNVERIFIED: uri/mute/loop carried over by analogy;
+                // `volume` not wired up (same gap as video). Verify
+                // against a real CMS audio widget.
                 let url = percent_decode(opts.find("uri").context("no audio uri")?.text());
                 let mute = opts.find("mute").is_some_and(|el| el.text() == "1");
-                // loop/useDuration handling mirrors the video arm above
-                // 1:1 -- added on direct request right after audio's own
-                // ended-event/add_stop fix, for full parity with video.
-                // See that arm's own doc comments for the full rationale
-                // (both bugs this fixes -- long pause between native
-                // loops, and useDuration=1 being silently ignored -- were
-                // originally found and fixed for video specifically, but
-                // the same underlying mechanism applies identically here).
+                // loop/useDuration/ended-event/add_stop below all mirror
+                // the video arm 1:1 -- same rationale, same fixes.
                 let loop_audio = opts.find("loop").is_some_and(|el| el.text().trim() == "1");
                 writeln!(self.out, "<audio class='media r{rid}' id='m{mid}' src='{url}' {} {}\
                                     ></audio>",
@@ -1189,41 +1016,13 @@ impl<'a> Translator<'a> {
                 let use_duration = media.get_attr("useDuration").is_some_and(|v| v == "1");
                 if loop_audio || use_duration {
                     add_start = format!("document.getElementById('m{mid}').play();");
-                    // `duration` already defaults to the CMS-configured
-                    // XLF `duration` attribute (set at the top of this
-                    // function) -- nothing further to do here; for
-                    // loop_audio, the native `loop` attribute on the
-                    // <audio> element above handles actual repetition.
                 } else {
-                    // BUG fix (found from a direct question, right after
-                    // fixing the exact same two issues for the video widget
-                    // above): this was modeled on an *earlier* version of
-                    // that video arm, before either fix existed there --
-                    // same synchronous-duration-read bug: reading
-                    // `.duration` in the very same tick as `.play()` is
-                    // unreliable (metadata loads asynchronously, often
-                    // still NaN at that exact moment), silently falling
-                    // back to region_switch's own 1-second timer and
-                    // restarting the audio from scratch roughly every
-                    // second. Fixed the same way: the native `ended`
-                    // event as the real advance mechanism, with a 24h
-                    // duration as a safety-net timeout only.
                     add_start = format!(
                         "{{ let el = document.getElementById('m{mid}'); \
                            el.play(); \
                            el.onended = () => window.arexibo.region_switch({rid}, -1, false); }}");
                     duration = "() => 86400".to_string();
                 }
-                // BUG fix (found from a direct question, right after
-                // fixing the exact same issue for the video widget above):
-                // same missing add_stop -- nothing paused/reset the audio
-                // when the widget was sent to background, so it kept
-                // playing invisibly instead of actually stopping, and
-                // would resume from wherever it was left off (or stay
-                // silent, already finished) rather than restarting cleanly
-                // next time this widget comes back around in the region's
-                // own loop. Applies regardless of which branch above was
-                // taken, same as video's own add_stop.
                 add_stop = format!(
                     "{{ let el = document.getElementById('m{mid}'); \
                        el.pause(); el.currentTime = 0; }}");

@@ -18,40 +18,22 @@ use crate::config::{CmsSettings, PlayerSettings};
 
 const READ_TMO: std::time::Duration = std::time::Duration::from_secs(40);
 const RECONNECT: std::time::Duration = std::time::Duration::from_secs(10);
-/// BUG fix (found from a real, still-unresolved report: repeated
-/// "Connection closed normally, reconnecting in 10s" that never
-/// recovered on its own -- only a full process restart fixed it,
-/// suggesting the reconnect loop retrying with the *same* captured
-/// uri/channel/cms_key indefinitely was the problem, not a genuinely
-/// permanent rejection). Direct suggestion: rather than retrying the
-/// exact same connect() forever, give up after a bounded number of
-/// attempts and let the *mainloop* redo a fresh RegisterDisplay-based
-/// XMR restart instead (see `run`'s own doc comment) -- using whatever
-/// settings/address are current at that point, exactly what a full
-/// process restart achieves, without requiring one.
+/// Give up reconnecting after this many attempts and let the mainloop
+/// redo a fresh RegisterDisplay-based restart instead, rather than
+/// retrying the same captured uri/channel/cms_key forever.
 const RECONNECT_MAX_ATTEMPTS: u32 = 6;
-/// BUG fix (found from a real reproduction: restarting the relay
-/// server caused every single reconnect *attempt* to succeed cleanly,
-/// but the relay then closed each new connection again immediately
-/// afterward -- WebSocket close code 1000 "normal closure", no error,
-/// no reason text -- in an endless cycle. A naive count of consecutive
-/// connect() *failures* alone (the original version of this fix) never
-/// triggers here, since every individual reconnect attempt succeeds;
-/// what actually needs bounding is the *rate* of full disconnect-
-/// reconnect cycles, not just outright connection failures. A
-/// connection that stays up for at least this long before failing
-/// again is treated as a fresh, unrelated problem -- resetting the
-/// consecutive-cycle counter -- rather than a continuation of a rapid
-/// reject loop.
+/// A connection stable for at least this long before failing again is
+/// treated as a fresh problem (resets the cycle counter), not a
+/// continuation of a rapid reconnect loop -- needed because a relay
+/// restart can make every reconnect *attempt* succeed but then
+/// immediately close again, which a naive failure-count alone never
+/// catches.
 const RECONNECT_STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Tracks consecutive disconnect-reconnect cycles for the bounded-
-/// give-up logic in both `run()` implementations below. Deliberately
-/// takes explicit `Instant` values rather than calling
-/// `Instant::now()` internally, so this can be tested with
-/// programmatically-advanced time instead of needing real sleeps
-/// (RECONNECT_MAX_ATTEMPTS x RECONNECT itself would make a real-time
-/// test take a full minute or more).
+/// give-up logic in both `run()` implementations below. Takes
+/// explicit `Instant` values (not `Instant::now()` internally) so this
+/// can be tested with programmatically-advanced time.
 struct ReconnectBudget {
     consecutive_cycles: u32,
     connected_since: std::time::Instant,
@@ -186,45 +168,15 @@ impl WsConnector {
         let port = uri.port_u16().unwrap_or(
             if uri.scheme_str() == Some("wss") { 443 } else { 80 }
         );
-        // Diagnostic context (found from a real report on GitHub: a
-        // Docker-based CMS correctly exposed its WebSocket XMR service
-        // on :8080, but the CMS's own "XMR WebSocket Address" setting
-        // was missing the port -- resulting in a silent, confusing
-        // "Connection refused" against the *scheme's own default port*
-        // (80/443) instead, since nothing runs XMR there. A missing
-        // port is virtually always a CMS misconfiguration for this
-        // specific address (real XMR WebSocket services essentially
-        // never run on 80/443 by convention) -- attaching this
-        // explicitly to the error should save the next person from
-        // re-deriving this from scratch via the TCP-level error alone.
-        //
-        // BUG fix (found from a direct report, right after adding
-        // CmsSettings::default_xmr_websocket_address's own fallback,
-        // AND a second, follow-up report on this same diagnostic): two
-        // separate problems, fixed together --
-        // 1. That fallback *deliberately* constructs a port-less
-        //    address (relying on the scheme's own default port,
-        //    matching the documented Docker convention) -- for exactly
-        //    that address, "this is almost always a CMS
-        //    misconfiguration" is simply wrong. See
-        //    missing_port_warning's own doc comment for how the two
-        //    cases are told apart.
-        // 2. This was logged *unconditionally*, before even attempting
-        //    the connection -- meaning it showed up on every single
-        //    startup for a CMS relying on the derived-default
-        //    convention, even when the connection went on to succeed
-        //    just fine. Only relevant if the connection actually
-        //    *fails* -- moved from an unconditional log::warn to
-        //    `.with_context()` on the connection attempt itself
-        //    (lazily evaluated, so it costs nothing on the success
-        //    path), surfacing only as part of the resulting error's
-        //    own message when there's an actual problem to explain.
+        // Attached as error context (not an unconditional log::warn --
+        // only relevant if the connection actually fails, and would
+        // otherwise fire on every startup for a CMS using the
+        // derived-default convention). See missing_port_warning's own
+        // doc comment for how a genuine misconfiguration is told apart
+        // from our own intentional port-less default.
         let port_missing = uri.port_u16().is_none();
-        // BUG fix (found from a real, frequently-occurring report:
-        // "IO error: Interrupted system call (os error 4)" during
-        // connect, forcing an unnecessary 10s reconnect cycle) -- see
-        // `connect_retrying_eintr`'s own doc comment for the full
-        // explanation.
+        // EINTR isn't auto-retried for "trivial" syscalls like connect()
+        // -- see connect_retrying_eintr's own doc comment.
         let socket = connect_retrying_eintr((host, port)).with_context(|| {
             if port_missing {
                 missing_port_warning(uri, port)
@@ -236,20 +188,11 @@ impl WsConnector {
         let stream = match uri.scheme_str() {
             Some("ws") => MaybeTlsStream::Plain(socket),
             Some("wss") => {
-                // BUG fix (found from a real, live test against a real
-                // CMS with a genuine TLS certificate: "invalid peer
-                // certificate: certificate not valid for name
-                // 'localhost'; certificate is only valid for
-                // DnsName('xibotest.tmaxlab.it')"). This was hardcoded
-                // to the literal string "localhost" regardless of the
-                // actual host being connected to -- meaning a properly
-                // *verified* wss:// connection to any real host (i.e.
-                // without --no-verify, which bypasses this check
-                // entirely and had been masking this bug) could never
-                // have worked at all, ever, for any deployment. Uses
-                // this connection's own real host instead, exactly
-                // matching what any TLS client is supposed to validate
-                // the presented certificate against.
+                // Must be this connection's own real host, not a
+                // hardcoded value -- a verified wss:// connection to
+                // any real host with a genuine certificate would
+                // otherwise always fail (masked previously only by
+                // --no-verify, which skips this check entirely).
                 let host = uri.host().context("XMR WebSocket URI missing host")?
                               .to_string();
                 let connector = rustls::ClientConnection::new(
@@ -272,18 +215,10 @@ impl WsConnector {
         Ok(socket)
     }
 
-    /// BUG fix (see `RECONNECT_MAX_ATTEMPTS`'s and
-    /// `RECONNECT_STABILITY_WINDOW`'s own doc comments for the full
-    /// context, including a real reproduction that exposed a gap in
-    /// the original version of this fix). Gives up after a bounded
-    /// number of consecutive disconnect-reconnect *cycles* within a
-    /// short time (not just outright connect() failures) -- letting
-    /// this function return, which drops `self.sender`, closing the
-    /// channel from the mainloop's own perspective. The mainloop's own
-    /// handling of that channel closing (see mainloop.rs's own
-    /// `recv(self.xmr)` match) is what actually restarts XMR via a
-    /// fresh `xmr::start()`, using its own always-current settings,
-    /// rather than this thread's own possibly-stale captured values.
+    /// Gives up after a bounded number of disconnect-reconnect cycles
+    /// (see ReconnectBudget), dropping self.sender to close the
+    /// channel -- the mainloop's own handling of that (recv(self.xmr))
+    /// restarts XMR via a fresh xmr::start() with current settings.
     fn run(mut self) {
         let mut budget = ReconnectBudget::new(std::time::Instant::now());
         loop {
@@ -319,56 +254,23 @@ impl WsConnector {
     }
 
     fn process_msg(&mut self) -> Result<()> {
-        // BUG fix (found from a real, still-recurring report after the
-        // earlier connect()-specific fix: the exact same "Interrupted
-        // system call (os error 4)" still showed up, just from a
-        // *different* syscall this time -- confirmed by the log's own
-        // "handling XMR message:" prefix, unique to *this* function,
-        // not the connection setup). tungstenite's own `read()` can
-        // likewise surface a raw `Error::Io` wrapping
-        // `ErrorKind::Interrupted` if the underlying socket read syscall
-        // gets hit by a signal at the wrong moment -- see
-        // `retry_ws_on_eintr`'s own doc comment.
+        // tungstenite's read() can also surface a raw EINTR -- see
+        // retry_ws_on_eintr's own doc comment.
         let msg = retry_ws_on_eintr(|| self.socket.read())?;
-        // BUG fix (found from a real report: XMR WebSocket connection
-        // closing almost immediately after connecting, newly appearing
-        // after a CMS 4.5 upgrade -- CONFIRMED via xibo-xmr's own real
-        // source code, index.php: `$wsServer->enableKeepAlive(...)`,
-        // using Ratchet's WsServer keepalive, which pings connected
-        // clients and closes any that don't Pong back in time.
-        // tungstenite *does* auto-queue a Pong reply on receiving a
-        // Ping, per its own docs, but only *flushes* it out on the
-        // *next* call to read/write/write_pending -- relying on that
-        // implicit queue-and-flush-next-time behavior, combined with
-        // our blocking read() with a 40s timeout, felt like an
-        // avoidable source of a race/delay against a keepalive that
-        // (per the earlier "linux WebSocket XMR" feature being brand
-        // new, merged March 2026, apparently only tested against "the
-        // new Linux player in beta") could plausibly have a short
-        // interval. Sending the Pong back explicitly and immediately
-        // removes any ambiguity about timing, regardless of whether
-        // this exact mechanism turns out to be the full explanation.
+        // CMS 4.5's XMR relay uses Ratchet's WsServer keepalive (pings
+        // clients, closes non-responders) -- tungstenite auto-queues a
+        // Pong but only flushes it on the next read/write call. Sending
+        // it back explicitly and immediately avoids any timing
+        // ambiguity against a possibly-short keepalive interval.
         if msg.is_ping() {
             retry_ws_on_eintr(|| self.socket.send(tungstenite::Message::Pong(msg.clone().into_data())))
                 .context("sending XMR WebSocket pong reply")?;
             return Ok(());
         }
-        // BUG fix (found from a direct suggestion: log the relay's own
-        // close reason instead of losing it). Previously, a Close
-        // message fell through both the is_ping() and is_text() checks
-        // below with no explicit handling at all -- silently discarding
-        // whatever code/reason string the relay sent (e.g. "Invalid
-        // key", the exact detail this session spent a long time trying
-        // to correlate via separate CMS/relay-side logs instead). The
-        // *next* read() call then genuinely fails with
-        // `Error::ConnectionClosed` ("Connection closed normally" --
-        // tungstenite's own literal Display text for that variant),
-        // which is all we were ever logging -- by then, the actually
-        // useful information from the Close frame itself was already
-        // gone. Logging it directly here means whatever specific
-        // reason the relay gives should now show up in arexibo's own
-        // log, without needing to correlate against a separate log on
-        // the CMS/relay side at all.
+        // A Close message used to fall through silently, discarding the
+        // relay's own close reason (e.g. "Invalid key") -- the next
+        // read() then just fails with tungstenite's generic
+        // "Connection closed normally". Log it directly instead.
         if let tungstenite::Message::Close(frame) = &msg {
             log::warn!("{}", describe_close(frame));
             return Ok(());
@@ -617,37 +519,17 @@ fn retry_on_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Resu
     }
 }
 
-/// Connect a TCP stream, transparently retrying if the connect syscall
-/// itself is interrupted by a signal (EINTR) rather than propagating
-/// that as a connection failure.
-///
-/// BUG fix (found from a real, frequently-occurring report: "IO error:
-/// Interrupted system call (os error 4)" during connect, forcing an
-/// unnecessary reconnect cycle -- for both the WebSocket and this
-/// module's own hand-rolled ZMTP/ZMQ connect path, which shares the
-/// exact same underlying `TcpStream::connect` call and therefore the
-/// exact same gap). Confirmed via Rust's own internals discussion
-/// (internals.rust-lang.org/t/policy-for-io-errorkind-interrupted) that
-/// the standard library does NOT automatically retry EINTR for
-/// "trivial" single-syscall wrappers like TcpStream::connect (unlike
-/// some other, more complex IO operations) -- a signal arriving at
-/// exactly the wrong moment (plausible here: this runs inside an
-/// X11/xinit session, where window-manager-driven signals like
-/// SIGWINCH are common right around startup, matching this being
-/// reported as happening often specifically in that context) surfaces
-/// directly as a connection *failure* to us, even though the
-/// connection attempt itself was never actually rejected -- it just
-/// needs to be retried immediately, not treated as "the server said
-/// no" and waited out for a full reconnect delay.
+/// Connect a TCP stream, retrying transparently if the connect
+/// syscall is interrupted by a signal (EINTR) -- std does not
+/// auto-retry EINTR for "trivial" single-syscall wrappers like
+/// TcpStream::connect (confirmed via Rust's own internals discussion).
 fn connect_retrying_eintr<A: std::net::ToSocketAddrs>(addr: A) -> std::io::Result<TcpStream> {
     retry_on_eintr(|| TcpStream::connect(&addr))
 }
 
 /// Same as `retry_on_eintr`, but for tungstenite's own `Result<T,
-/// tungstenite::Error>` -- its `Error::Io` variant is what wraps the
-/// same underlying `ErrorKind::Interrupted` this whole EINTR fix is
-/// about, just needing to be unwrapped first before the same check
-/// applies.
+/// tungstenite::Error>` -- its `Error::Io` variant wraps the same
+/// `ErrorKind::Interrupted`.
 fn retry_ws_on_eintr<T>(mut f: impl FnMut() -> Result<T, tungstenite::Error>)
     -> Result<T, tungstenite::Error> {
     loop {
@@ -662,39 +544,12 @@ fn retry_ws_on_eintr<T>(mut f: impl FnMut() -> Result<T, tungstenite::Error>)
     }
 }
 
-/// Format a WebSocket Close message's own code/reason for logging.
-///
-/// BUG fix (found from a direct suggestion: log the relay's own close
-/// reason instead of losing it silently). Previously, a Close message
-/// fell through both the is_ping() and is_text() checks in
-/// process_msg() with no explicit handling at all -- silently
-/// discarding whatever code/reason string the relay sent (e.g.
-/// "Invalid key", the exact detail this session spent a long time
-/// trying to correlate via separate CMS/relay-side logs instead). The
-/// *next* read() call then genuinely fails with
-/// `Error::ConnectionClosed` ("Connection closed normally" --
-/// tungstenite's own literal Display text for that variant), which is
-/// all that was ever logged -- by then, the actually useful
-/// information from the Close frame itself was already gone. Logging
-/// it directly (see process_msg's own use of this) means whatever
-/// specific reason the relay gives should now show up in arexibo's own
-/// log, without needing to correlate against a separate log on the
-/// CMS/relay side at all.
 /// Builds the diagnostic warning for a port-less XMR WebSocket
-/// address -- extracted as its own pure function (no network needed)
-/// specifically so the two distinct message variants can be tested
-/// directly, without needing a real connection attempt.
-///
-/// Distinguishes "this is our own derived default"
-/// (CmsSettings::default_xmr_websocket_address's own fallback,
-/// deliberately port-less) from "this looks like a genuine CMS
-/// misconfiguration" by path alone: the derived default always ends
-/// in exactly "/xmr" -- a real, manually-configured "XMR WebSocket
-/// Address" CMS setting essentially never happens to end in that
-/// exact path by coincidence (admins configure a bare host:port, not
-/// a full URL with a specific path) -- so this stays a reliable
-/// signal without needing to plumb through *why* this particular
-/// address ended up port-less all the way from xmds.rs.
+/// address. Distinguishes our own derived default
+/// (CmsSettings::default_xmr_websocket_address, deliberately
+/// port-less) from a genuine CMS misconfiguration by path alone: the
+/// derived default always ends in exactly "/xmr", which a manually-
+/// configured address essentially never does by coincidence.
 fn missing_port_warning(uri: &Uri, default_port: u16) -> String {
     if uri.path() == "/xmr" {
         format!("XMR WebSocket address {uri:?} has no explicit port -- \
@@ -718,6 +573,9 @@ fn missing_port_warning(uri: &Uri, default_port: u16) -> String {
     }
 }
 
+/// Format a WebSocket Close message's own code/reason for logging --
+/// this used to be discarded silently, with only tungstenite's own
+/// generic "Connection closed normally" showing up on the next read().
 fn describe_close(frame: &Option<tungstenite::protocol::CloseFrame>) -> String {
     match frame {
         Some(f) => format!("XMR WebSocket closed by the relay: {} (code {})", f.reason, f.code),
