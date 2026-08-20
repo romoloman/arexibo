@@ -2,43 +2,27 @@
 // Licensed under the GNU AGPL, version 3 or later.
 
 //! Xibo Adspace Exchange integration -- VAST (IAB standard) ad requests
-//! for the `ssp` widget type and (in principle, see the module-level
-//! scope note below) Adspace-driven schedule items.
+//! for the `ssp` widget type and (in principle, see scope note below)
+//! Adspace-driven schedule items.
 //!
-//! ARCHITECTURAL HONESTY NOTE, read before relying on this module: this
-//! was built without access to `exchange.xibo-adspace.com` (not reachable
-//! from the development sandbox this was written in -- only the domains
-//! needed to build arexibo itself are network-reachable there) and
-//! without the exchange's own API documentation (not publicly indexed;
-//! `xibo-adspace.com/docs` requires a login redirect that couldn't be
-//! followed). Nothing in this module has been exercised against a real
-//! bid response. What IS grounded in solid sources:
-//! - VAST itself (2.0 through 4.2) is a public IAB standard, well
-//!   understood independently of Xibo.
-//! - The custom `xibo*` VAST Extension names below (xiboPrefetch,
-//!   xiboPartner, xiboIsWrapperRateLimit, etc.) are confirmed real,
-//!   sourced from a genuine xibo-dotnetclient GitHub issue (#268)
-//!   describing their introduction, not invented.
-//! - The bid request endpoint/shape
-//!   (`https://exchange.xibo-adspace.com/vast/device`, query params for
-//!   size/partner/geo) comes from this project's own earlier Flutter
-//!   porting session notes (AREXIBO_STATO_LAVORO.md), not verified here
-//!   independently -- FLAGGED AS UNVERIFIED, the single biggest risk
-//!   area in this entire module if the real request shape differs.
+//! ARCHITECTURAL HONESTY NOTE: built without access to
+//! exchange.xibo-adspace.com or its API docs -- nothing here has been
+//! exercised against a real bid response. Grounded sources: VAST
+//! itself (public IAB standard); the custom `xibo*` VAST Extension
+//! names (confirmed real, from xibo-dotnetclient GitHub issue #268).
+//! FLAGGED AS UNVERIFIED: the bid request endpoint/shape
+//! (exchange.xibo-adspace.com/vast/device, query params) -- comes from
+//! this project's own earlier porting session notes, not independently
+//! verified, the single biggest risk area in this module.
 //!
-//! SCOPE: only widget-level activation (`type="ssp"` on a `<media>`
-//! inside a normal Layout, resolved synchronously during
-//! `layout.rs::Translator::translate()`) is wired up end-to-end.
-//! Schedule-item-level activation (an entire ScheduleItem of type
-//! "Adspace Exchange" replacing the normal layout for its duration, akin
-//! to an Interrupt Layout -- see `ScheduleItem.CreateForAdspaceExchange`
-//! in the real C# `ScheduleManager.cs`, and today's Interrupt/
-//! Share-of-Voice work in schedule.rs which this *could* plug into) is
-//! NOT implemented -- it would need synthesizing a fake "layout" that IS
-//! ad content and wiring that into layout navigation, cache, and Proof
-//! of Play as if it were a real cached `.xlf`, a materially bigger
-//! change than fit in this session alongside everything else. This
-//! module's `request_ad`/creative-download functions are written to be
+//! SCOPE: only widget-level activation (type="ssp" on a <media>,
+//! resolved during layout.rs's translate()) is wired up end-to-end.
+//! Schedule-item-level activation (a whole ScheduleItem of type
+//! "Adspace Exchange" replacing the layout, like an Interrupt Layout --
+//! see ScheduleItem.CreateForAdspaceExchange in the real C# client)
+//! is NOT implemented -- would need synthesizing a fake "layout" that
+//! is ad content, wired into navigation/cache/Proof of Play as if a
+//! real cached .xlf. request_ad/creative-download are written to be
 //! reusable for that follow-up regardless.
 
 use std::{collections::HashMap, fs, path::{Path, PathBuf}};

@@ -15,24 +15,8 @@ use serde::{Deserialize, Deserializer, Serializer, de::Error};
 /// A short, stable fingerprint of a secret value (e.g. the XMR CMS
 /// key), safe to log or display -- lets two values be compared to
 /// tell whether they're the *same* secret, without ever printing the
-/// actual value itself.
-///
-/// Added to help investigate a real, still-unexplained report: the
-/// user directly ruled out the relay itself restarting (confirmed via
-/// systemd uptime, 4 days), yet suspects the *client* somehow starts
-/// using a different/stale key after running for a while -- but
-/// nothing found in the code review suggests channel/cms_key should
-/// ever change (channel is a deterministic hash of static CmsSettings
-/// fields; cms_key comes from a global CMS-wide setting, confirmed in
-/// the real CMS source). Rather than continue reasoning abstractly,
-/// this lets a future occurrence be checked directly: log lines from
-/// a "working" connection and a "no longer working" one, for the same
-/// display, can now be compared for a genuine mismatch instead of
-/// assuming one way or the other. Shared (not private to xmr.rs)
-/// specifically so PlayerSettings's own Debug impl (config.rs) can
-/// reuse it too, for the exact same reason: never let a secret field
-/// leak in clear text through a debug dump, while still letting two
-/// dumps be compared for a genuine difference.
+/// actual value itself. Shared (not private to xmr.rs) so
+/// PlayerSettings's own Debug impl (config.rs) can reuse it too.
 pub fn fingerprint(secret: &str) -> String {
     hex::encode(Md5::digest(secret.as_bytes()))[..8].to_string()
 }

@@ -128,21 +128,15 @@ pub struct Handler {
     /// `PlayerSettings::log_level_filter`) is never applied, so the
     /// explicit local override always wins over a remote setting.
     debug_override: bool,
-    /// `Some` only while XMR genuinely isn't connected because startup
-    /// happened offline with `--allow-offline` (see the real bug this
-    /// fixes: github.com/birkenfeld/arexibo/issues/33) -- retried once
-    /// per collection cycle (see `collect_once`) until it succeeds, at
-    /// which point this goes back to `None` and `self.xmr` becomes the
-    /// real channel. Kept as a cloned key (RsaPrivateKey is Clone)
-    /// specifically so a retry attempt is possible without needing to
-    /// re-derive or persist it separately -- the original is otherwise
-    /// consumed once, at `Handler::new()` time.
-    /// Owned copies of the CMS settings and no-cert-verify flag,
-    /// specifically kept for the XMR retry in `collect_once` (see
-    /// `xmr_retry_key`'s own doc comment) -- the constructor otherwise
-    /// only ever needs a borrow of these.
+    /// Owned copies of the CMS settings and no-cert-verify flag, kept
+    /// for the XMR retry in `collect_once` (see `xmr_retry_key` below).
     cms: CmsSettings,
     no_verify: bool,
+    /// `Some` only while XMR isn't connected because startup happened
+    /// offline with `--allow-offline` -- retried once per collection
+    /// cycle until it succeeds, then back to `None`. A cloned key
+    /// (RsaPrivateKey is Clone) so a retry is possible without
+    /// re-deriving/persisting it separately.
     xmr_retry_key: Option<RsaPrivateKey>,
     /// Unlike `xmr_retry_key` (only `Some` while a retry is actually
     /// pending), this is *always* populated -- kept specifically so
@@ -151,57 +145,37 @@ pub struct Handler {
     /// in `run()`'s own select! loop, and `RECONNECT_MAX_ATTEMPTS`'s
     /// own doc comment in xmr.rs for the full context this exists for.
     xmr_privkey: RsaPrivateKey,
-    /// Feature (found from a real request: on first setup, or while
-    /// waiting for the CMS operator to authorize a new display, the
-    /// player used to just exit (a distinct exit code, 2, so a systemd
-    /// unit's own `Restart=` could patiently keep relaunching it -- but
-    /// nothing was ever visible on screen in the meantime, and every
-    /// relaunch redid the same setup from scratch). Now: `Handler::new`
-    /// constructs a Handler in this pending state instead of erroring
-    /// out -- with default (empty) settings/schedule, which naturally
-    /// means layout 0 (the splash screen, now showing this machine's
-    /// own hostname/IP -- see server.rs's `splash_html`) stays up, with
-    /// no real content to switch away to. `collect_once` retries
-    /// registration on every collection cycle exactly as it already did
-    /// for the "was authorized, lost it" case -- the only different
-    /// treatment `pending_auth` gives this state is a faster retry
-    /// interval (see `PENDING_AUTH_RETRY_INTERVAL`) and a clearer,
-    /// less alarming log message than "not authorized *anymore*" for
-    /// what's actually "not authorized *yet*".
+    /// On first setup, or while waiting for CMS authorization, the
+    /// player used to just exit (code 2, so systemd's Restart= could
+    /// relaunch it) -- nothing visible on screen meanwhile, and every
+    /// relaunch redid setup from scratch. Now: Handler::new constructs
+    /// a Handler in this pending state instead, with default (empty)
+    /// settings/schedule -- layout 0 (the splash screen, showing this
+    /// machine's own hostname/IP) stays up. collect_once retries
+    /// registration every cycle, same as the "was authorized, lost it"
+    /// case, just with a faster interval and a clearer log message.
     pending_auth: bool,
-    /// Timer that fires when the currently-shown overlay (whichever
-    /// source -- see below) should be hidden/advanced. Moved here (was
-    /// previously a local variable in `run()`) because `schedule_check()`
-    /// needs to be able to (re)schedule it too, not just the XMR
-    /// `overlayLayout` handling in `run()`'s own select! loop.
+    /// Timer for hiding/advancing the currently-shown overlay. Moved
+    /// here (was local to `run()`) since `schedule_check()` needs to
+    /// (re)schedule it too, not just XMR's `overlayLayout` handling.
     overlay_expiry: Receiver<std::time::Instant>,
     /// Currently-active schedule-driven Overlay Layouts (see
-    /// schedule.rs's `active_overlays` -- CONFIRMED REAL from a real
-    /// schedule.xml a user shared: a `<overlays>` section, distinct from
-    /// XMR's transient `overlayLayout` push action, see
-    /// `xmr::Message::OverlayLayout` handling below) as
-    /// (layoutid, duration_secs) pairs, and which one of them
-    /// (`schedule_overlay_idx`) is currently showing -- rotated through
-    /// via `overlay_expiry` when more than one is simultaneously active.
-    /// An active XMR-triggered overlay (`overlay_layout`, below) takes
-    /// precedence over these while set; schedule-driven overlays resume
-    /// once it reverts.
+    /// schedule.rs's `active_overlays` -- a real `<overlays>` section,
+    /// distinct from XMR's transient `overlayLayout` push action) as
+    /// (layoutid, duration_secs) pairs, with `schedule_overlay_idx`
+    /// tracking which one is showing -- rotated via `overlay_expiry`
+    /// when more than one is active. An active XMR-triggered overlay
+    /// (`overlay_layout` below) takes precedence while set.
     schedule_overlays: Vec<(i64, i64)>,
     schedule_overlay_idx: usize,
     /// Resources (see `ReqFile::Resource`) whose download failed during
-    /// a normal collection, queued for a short-delay retry rather than
-    /// waiting for the next full collection cycle (which could be many
-    /// minutes away). BUG fix (found from a real report): the CMS can
-    /// return a transient SOAP fault ("Cache not ready") for a
-    /// DataSet-View widget's own resource -- apparently the CMS renders
-    /// this content lazily/on-demand and hadn't finished doing so yet at
-    /// the moment of the request, not a permanent failure. Previously
-    /// this was just logged and the widget stayed broken/blank until
-    /// whenever the next scheduled collection happened to run. Each
-    /// entry is `(the request, attempts so far)`; capped at
-    /// `RESOURCE_RETRY_MAX_ATTEMPTS` before giving up for good (to avoid
-    /// retrying forever for a resource that's genuinely, permanently
-    /// broken, e.g. a widget referencing a deleted Dataset).
+    /// a normal collection, queued for a short-delay retry instead of
+    /// waiting for the next full collection cycle. The CMS can return a
+    /// transient "Cache not ready" fault for lazily-rendered content
+    /// (e.g. a DataSet View widget) -- previously this just left the
+    /// widget broken/blank until the next scheduled collection. Each
+    /// entry is (request, attempts so far), capped at
+    /// RESOURCE_RETRY_MAX_ATTEMPTS before giving up for good.
     resource_retry_queue: Vec<(crate::resource::ReqFile, u32)>,
     /// Same transient-fault retry protection as `resource_retry_queue`
     /// above, but for the XMR `dataUpdate` path specifically (see
@@ -216,18 +190,10 @@ pub struct Handler {
 
 /// See `Handler::resource_retry_queue`'s own doc comment.
 ///
-/// TUNING NOTE (found from a real report): the original 15s x 5
-/// attempts (75s total window) proved too short in a real case
-/// observed live via `--debug` -- the CMS's "Cache not ready" fault
-/// for a widget's resource persisted for *well over a minute*, and
-/// arexibo gave up on its own retries mere moments before the CMS
-/// would have resolved it on its own (an unrelated XMR `dataUpdate`
-/// push for that same widget, arriving independently ~90s after
-/// giving up, succeeded immediately). Widened to a ~3 minute total
-/// window to give the CMS more realistic room to finish generating
-/// this kind of lazily-rendered content, while still eventually
-/// giving up rather than retrying forever for a resource that's
-/// genuinely, permanently broken.
+/// Widened from the original 15s x 5 (75s total) -- proved too short
+/// in a real case where the CMS's "Cache not ready" fault persisted
+/// well over a minute. ~3 minute total window gives the CMS more
+/// realistic room while still eventually giving up.
 const RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(20);
 const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
 /// See `Handler::pending_auth`'s own doc comment. 30s strikes a balance
@@ -359,17 +325,11 @@ impl Handler {
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
         } else {
-            // Feature (see `pending_auth`'s own doc comment on the
-            // struct): construct a Handler in the pending-authorization
-            // state instead of erroring out. Everything here is a
-            // placeholder default -- there is genuinely no real
-            // configuration to use yet, since the CMS hasn't approved
-            // this display. `xmr_retry_key: Some(privkey)` deliberately
-            // reuses the *existing* --allow-offline retry mechanism in
-            // `collect_once` (originally built for "network came back,
-            // try starting XMR now") for exactly the same purpose here
-            // ("just got authorized, try starting XMR now") -- no need
-            // for a second, separate mechanism to do the same job.
+            // See pending_auth's own doc comment. Everything here is a
+            // placeholder default -- no real config exists yet.
+            // xmr_retry_key reuses the existing --allow-offline retry
+            // mechanism in collect_once ("network came back, try XMR
+            // now") for the same purpose here ("just got authorized").
             log::warn!("display is registered but not yet authorized in the CMS -- \
                         showing the splash screen and retrying periodically \
                         (see this machine's own hostname/IP on screen to help \
@@ -733,24 +693,13 @@ impl Handler {
                         ShellCommandAllowList");
             return;
         }
-        // Confirmed real convention (account.xibosignage.com's own
-        // Command Functionality docs: "RS232 commands, Android intents,
-        // HTTP requests, etc." alongside genuine shell commands) -- a
-        // shellcommand widget's own free-text command string can
-        // *also* be one of these special `http|url|contentType|jsonBody`
-        // or `rs232|params|message` forms, not just a literal shell
-        // command line. `command.rs`'s `Command::run()` already
-        // correctly implements both (used today only via the
-        // `storedCommand`/CMS-preregistered path, see run_command
-        // above) -- reused here via an ad-hoc, unvalidated `Command`
-        // rather than duplicating that parsing/execution logic.
-        // Deliberately run synchronously here (blocking this thread
-        // briefly, same as run_command already does for the identical
-        // underlying call) rather than going through the
-        // spawn-a-background-process-and-track-it-for-later-kill
-        // machinery below, which only makes sense for genuine shell
-        // commands (an HTTP request or RS232 write is a quick, one-shot
-        // action with no equivalent "terminate later" concept).
+        // A shellcommand widget's command string can also be a special
+        // http|url|contentType|jsonBody or rs232|params|message form
+        // (confirmed real convention), not just a shell line --
+        // command.rs's Command::run() already implements both. Run
+        // synchronously here (same as run_command does) rather than
+        // the spawn-and-track-for-kill machinery below, which only
+        // makes sense for genuine shell commands.
         if code.starts_with("http|") || code.starts_with("rs232|") {
             let adhoc = Command { command: code.to_string(), validate: String::new(), alerts: String::new() };
             match adhoc.run() {
@@ -912,15 +861,9 @@ impl Handler {
                                 ).with_layout(layout_id)
                             );
                         }
-                        // See `resource_retry_queue`'s own doc comment:
-                        // a resource-type download failure is treated as
-                        // possibly transient (confirmed real: the CMS
-                        // can return "Cache not ready" for a
-                        // DataSet-View widget it hasn't finished
-                        // rendering yet) and gets a short-delay retry,
-                        // rather than only being reported as failed
-                        // media inventory and left broken until whatever
-                        // the next full collection cycle happens to be.
+                        // Resource downloads get a short-delay retry
+                        // (see resource_retry_queue's own doc comment)
+                        // instead of just being reported as failed.
                         if matches!(file, crate::resource::ReqFile::Resource { .. }) {
                             self.resource_retry_queue.push((file, 0));
                             self.resource_retry_timer = after(RESOURCE_RETRY_DELAY);
@@ -1119,16 +1062,11 @@ impl Handler {
         };
     }
 
-    /// Retry every resource currently queued after a failed download
-    /// during a normal collection -- see `resource_retry_queue`'s own
-    /// doc comment (a real, confirmed transient CMS-side fault: "Cache
-    /// not ready" for a DataSet-View widget it hadn't finished rendering
-    /// yet). Widgets whose resource keeps failing past
-    /// `RESOURCE_RETRY_MAX_ATTEMPTS` are dropped from the queue (logged)
-    /// rather than retried forever -- a genuinely, permanently broken
-    /// resource (e.g. referencing a deleted Dataset) shouldn't retry on
-    /// an indefinite loop; it'll get another chance at the next full
-    /// collection cycle regardless, same as before this fix existed.
+    /// Retry every resource queued after a failed download (see
+    /// `resource_retry_queue`'s own doc comment). Widgets past
+    /// RESOURCE_RETRY_MAX_ATTEMPTS are dropped from the queue (logged)
+    /// rather than retried forever -- they'll get another chance at
+    /// the next full collection cycle regardless.
     fn retry_failed_resources(&mut self) {
         let queue = std::mem::take(&mut self.resource_retry_queue);
         for (file, attempts) in queue {
@@ -1604,15 +1542,10 @@ mod sticky_ws_address_tests {
 
     #[test]
     fn a_non_empty_address_missing_its_port_does_not_replace_a_good_one() {
-        // The exact case pointed out directly: a response can be
-        // non-empty (xmrType="ws", so it would have passed the
-        // earlier, too-loose ".is_empty()" check) while still being
-        // useless -- the address itself is missing its port (matching
-        // section 62's own real bug report: the CMS's "XMR WebSocket
-        // Address" setting missing ":8080"). This must NOT be accepted
-        // as a "genuinely different, valid" replacement -- it must be
-        // rejected exactly like an empty response would be, keeping
-        // the previously-known-good, *complete* address instead.
+        // A non-empty response (xmrType="ws") can still be useless if
+        // the address itself is missing its port -- must be rejected
+        // exactly like an empty response, keeping the previously-known
+        // -good, complete address instead.
         let (port, _calls) = start_mock(vec![
             ("ws", "ws://127.0.0.1:1"),
             ("ws", "ws://127.0.0.1"),  // same host, but no port at all
@@ -1634,21 +1567,13 @@ mod sticky_ws_address_tests {
 
     #[test]
     fn our_own_derived_default_fallback_wins_over_a_cached_good_address_end_to_end() {
-        // End-to-end confirmation that the exemption mechanism is
-        // actually wired into both call sites and does the right thing
-        // in a real Handler::new()+collect_once() flow. Note: this
-        // mock CMS's own address necessarily has an explicit port (a
-        // real server needs one to be reachable at all) -- so the
-        // derived default here happens to *also* carry a port, meaning
-        // this specific test would technically still pass even
-        // without the exemption (ws_address_has_port alone would
-        // already accept it). The genuinely port-less case this fix
-        // exists for -- the exact scenario reported directly, where
-        // the CMS's own address had no explicit port at all -- is
-        // covered in isolation just below, in
-        // is_own_derived_ws_default_tests, without needing a real
-        // network listener on a port-less address (not practical to
-        // set up reliably in a test).
+        // End-to-end confirmation the exemption is wired into both call
+        // sites. Note: this mock's own address necessarily has a port
+        // (needed to be reachable), so this test would technically
+        // still pass without the exemption -- the genuinely port-less
+        // case is covered in isolation below, in
+        // is_own_derived_ws_default_tests (a real network listener on
+        // a port-less address isn't practical to set up reliably).
         let (port, _calls) = start_mock(vec![
             ("ws", "ws://127.0.0.1:8080"),
             ("ws", ""),  // empty -- triggers xmds.rs's own derived-default fallback

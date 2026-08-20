@@ -25,25 +25,14 @@ pub struct ScheduleCriterion {
 
 /// A single `<overlay file="" fromdt="" todt="" scheduleid="" priority=""
 /// duration="" isGeoAware="" geoLocation="" maxPlaysPerHour=""/>` node
-/// inside the schedule's own `<overlays>` wrapper -- CONFIRMED REAL from
-/// a real `schedule.xml` the user shared (not inferred/guessed): a
-/// genuinely separate element from `<layout>` (different tag name),
-/// sibling to the normal schedule's `<layout>` entries and `<default>`.
-/// Corresponds to Xibo's "Overlay Layout" schedule Event Type -- shown
-/// *on top of* whatever the normal schedule is showing (background not
-/// rendered), one or more can be active simultaneously and are cycled
-/// through in rotation (matches the official manual: the overlay layout
-/// will "sit 'on top' of all your other layouts... allow for all
-/// 'layers' of your content to be shown in rotation"). Distinct from,
-/// but reuses the same underlying mechanism as, the XMR `overlayLayout`
-/// push action (see mainloop.rs) -- this is the persistent,
-/// schedule-driven source of overlays; XMR is the transient, CMS-pushed
-/// one. Confirmed real (unlike a normal `<layout>` entry) that overlay
-/// entries have no shareOfVoice/cyclePlayback/groupKey/playCount/
-/// syncEvent attributes at all -- Interrupt/Share-of-Voice and Cycle
-/// Playback semantics don't apply to overlays, only a plain per-item
-/// `duration` (seconds), used here for rotation timing between multiple
-/// simultaneously-active overlays.
+/// inside the schedule's own `<overlays>` wrapper -- a separate element
+/// from `<layout>`, sibling to normal schedule entries. Corresponds to
+/// Xibo's "Overlay Layout" Event Type: shown on top of the normal
+/// schedule, rotating if more than one is active. Distinct from (but
+/// reuses the same mechanism as) the XMR `overlayLayout` push action
+/// (mainloop.rs) -- this is the persistent, schedule-driven source, XMR
+/// is the transient, CMS-pushed one. No shareOfVoice/cyclePlayback/
+/// playCount/syncEvent -- only a plain per-item `duration` for rotation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OverlayEntry {
     from: OffsetDateTime,
@@ -339,30 +328,21 @@ impl Schedule {
 }
 
 /// Faithful (bug-fixed) port of the C# client's
-/// `ResolveNormalAndInterrupts`/`ParseCyclePlayback` et al -- combines
-/// normal-priority and Interrupt Layouts (`shareOfVoice > 0`) into a
-/// single ordered sequence representing one hour's worth of plays, with
-/// interrupts spread proportionally to their configured share of voice
-/// and normal layouts round-robining through the remaining time. Ported
-/// from the real, current xibo-dotnetclient source
-/// (Logic/ScheduleManager.cs, fetched and read in full during
-/// development, not from memory).
+/// `ResolveNormalAndInterrupts`/`ParseCyclePlayback` (Logic/
+/// ScheduleManager.cs) -- combines normal-priority and Interrupt
+/// Layouts (`shareOfVoice > 0`) into one ordered sequence for an hour's
+/// worth of plays, interrupts spread proportionally to their share of
+/// voice, normal layouts round-robining through the rest.
 ///
-/// NOT reproducing a real bug found in that source: it reduces the
-/// Adspace Exchange share of voice by the *cumulative running* interrupt
-/// total *inside* the summing loop instead of the final total once,
-/// over-subtracting whenever more than one interrupt layout is
-/// configured. Moot here anyway since arexibo has no Adspace Exchange
-/// integration yet (see AREXIBO_STATO_LAVORO.md) -- noted for whenever
-/// that gets built, so the same mistake isn't repeated.
+/// NOT reproducing a real bug in that source: it over-subtracts the
+/// Adspace Exchange share of voice using a cumulative running total
+/// instead of the final total once. Moot here (no AXE integration
+/// yet) -- noted for whenever that gets built.
 ///
-/// Deliberately NOT ported: Adspace Exchange share-of-voice reduction
-/// itself (no AXE integration exists yet), `MaxPlaysPerHour` (a
-/// different, unrelated per-schedule-item play-count cap, out of scope
-/// here), and the C#'s historical actual-play-duration cache -- a
-/// layout's duration for these calculations is only ever its own
-/// schedule-item `duration` (if the CMS provides one) or a flat 60s
-/// fallback (see `layouts_now`).
+/// Deliberately not ported: AXE reduction itself, `MaxPlaysPerHour`
+/// (unrelated per-item play-count cap), and the C#'s historical
+/// actual-play-duration cache -- duration here is always the
+/// schedule-item's own `duration` or a 60s fallback (see `layouts_now`).
 fn resolve_normal_and_interrupts(
     normal: &[(LayoutId, i64)],
     interrupt: &[(LayoutId, i64, i32)],

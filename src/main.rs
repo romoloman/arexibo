@@ -84,16 +84,12 @@ fn main() {
     if let Err(e) = main_inner() {
         // Exit code 2: display not authorized yet.
         //
-        // NOTE: as of the pending-authorization feature (see
-        // mainloop.rs's `Handler::pending_auth`), this specific error
-        // no longer occurs during normal operation -- an unauthorized
-        // display now stays running, showing the splash screen with
-        // this machine's own hostname/IP, and retries registration
-        // periodically on its own, rather than exiting for systemd's
-        // `Restart=` to relaunch it from scratch every time. This check
-        // is kept as a defensive fallback (harmless if never triggered)
-        // rather than removed outright, in case `NotAuthorized` is ever
-        // raised again for some other reason in the future.
+        // As of the pending-authorization feature (Handler::pending_auth
+        // in mainloop.rs), this no longer occurs during normal
+        // operation -- an unauthorized display now stays running,
+        // showing the splash screen, and retries on its own. Kept as a
+        // defensive fallback (harmless if never triggered) in case
+        // NotAuthorized is ever raised again for another reason.
         //
         // Exit code 1: actual error (bad config, CMS unreachable, etc.)
         if e.root_cause().downcast_ref::<mainloop::NotAuthorized>().is_some() {
@@ -173,23 +169,12 @@ fn main_inner() -> anyhow::Result<()> {
     handler.set_html_port(shard_port);
     webserver.start_pool();
 
-    // Additional listeners, same port, different loopback addresses, all
-    // serving the exact same directory -- see server::HTML_SHARD_COUNT's
-    // own doc comment for why (Chromium's hardcoded 6-connections-per-
-    // origin limit; a single layout can easily have more than 6
-    // simultaneous `render="html"` iframe widgets, each its own HTTP
-    // request, and this compounds further whenever an overlay is also
-    // showing such widgets at the same time -- a real report: main
-    // layout content intermittently missing/delayed, but only while an
-    // overlay was also active). `layout.rs::write_media` picks one of
-    // these shards per widget (deterministically, from the widget's own
-    // id) for every `render="html"` iframe's own `src`, spreading
-    // connection load across `HTML_SHARD_COUNT` independent pools
-    // regardless of which view(s) are currently active -- the `127.0.0.1`
-    // pool set up just above (used for each view's own top-level
-    // navigation, and implicitly shard 1) is one of them; loopback
-    // addresses 2..=HTML_SHARD_COUNT get their own dedicated listener
-    // here.
+    // Additional listeners, same port, different loopback addresses,
+    // all serving the same directory -- see HTML_SHARD_COUNT's own doc
+    // comment (Chromium's 6-connections-per-origin limit). write_media
+    // picks a shard per widget deterministically from its id; 127.0.0.1
+    // (set up above, shard 1) handles top-level navigation, shards
+    // 2..=HTML_SHARD_COUNT get their own listener here.
     for shard in 2..=server::HTML_SHARD_COUNT {
         let addr = format!("127.0.0.{shard}");
         let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,

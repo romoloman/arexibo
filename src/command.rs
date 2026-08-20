@@ -152,18 +152,10 @@ impl Command {
 #[derive(Deserialize)]
 struct HttpOpts {
     method: String,
-    // BUG fix (found via a real log the user shared): this is NOT a
-    // nested JSON object in practice -- the real payload has
-    // `"headers":"{}"`, i.e. `headers` is itself a STRING whose content
-    // happens to be JSON text (the CMS's command-builder form appears
-    // to store the raw text a user typed into a headers field this
-    // way, same as `body` below already is). Declaring this as
-    // `HashMap<String, String>` directly made deserialization fail
-    // outright on every real HTTP ad-hoc command, not just ones with
-    // populated headers -- parsed as a plain string here instead, then
-    // parsed *again* as JSON where actually used (see run_http), which
-    // tolerates the common empty "{}" case gracefully instead of
-    // erroring the whole command out.
+    // NOT a nested JSON object -- the real payload has
+    // "headers":"{}", a STRING whose content happens to be JSON text
+    // (same as `body` below). Parsed as a plain string here, then
+    // parsed again as JSON where actually used (see run_http).
     headers: String,
     body: String
 }

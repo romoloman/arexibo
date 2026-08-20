@@ -42,54 +42,24 @@ pub struct DurationRequest {
 /// independent Chromium per-origin connection pools instead of sharing
 /// a single one.
 ///
-/// BUG fix (found from a real report: content in the main layout was
-/// intermittently missing/delayed, worse -- though not exclusively --
-/// whenever an Overlay Layout was also active): Chromium hard-caps
-/// concurrent HTTP connections *per origin* at 6 (a long-standing,
-/// deliberately-chosen upstream limit with no stable command-line
-/// override in an unpatched Chromium build -- confirmed via Chromium's
-/// own bug tracker discussions, not guessed). A single layout can
-/// easily have more than 6 simultaneous `render="html"` iframe widgets
-/// (each is its own HTTP request) -- this was already a latent risk with
-/// just the main view alone, and gets worse still whenever an overlay
-/// is *also* requesting its own such widgets at the same time, since
-/// (before this fix) both views loaded everything from the exact same
-/// origin, sharing one 6-connection budget between them. `127.0.0.1`
-/// through `127.0.0.4` are different loopback addresses but equally
-/// "localhost"-only at the OS level (never reachable from any other
-/// machine) -- Chromium treats each as a genuinely different origin
-/// with its own independent connection pool, all served from the exact
-/// same directory (no duplicated files, no extra state to keep in
-/// sync). 4 is a conservative, commonly-used sharding factor for this
-/// exact class of problem (the same technique, "domain sharding", that
-/// real websites used for years before HTTP/2 multiplexing made it
-/// largely unnecessary for the public web -- it's still the right tool
-/// here, since this embedded server has no plans to speak HTTP/2).
+/// Chromium hard-caps concurrent HTTP connections per origin at 6,
+/// with no stable override -- a layout can easily have more than 6
+/// simultaneous render="html" widgets, worse still with an overlay
+/// also loading from the same origin. 127.0.0.1-127.0.0.4 are
+/// different origins to Chromium despite all being loopback-only, so
+/// sharding across them (same technique as pre-HTTP/2 "domain
+/// sharding") gives each its own connection pool from the same served
+/// directory.
 pub const HTML_SHARD_COUNT: u32 = 4;
 
-/// BUG fix (found from a real report): this embedded server's port used
-/// to be chosen dynamically (`0`, letting the OS assign any free port)
-/// on every single startup -- but a layout's own translated HTML, once
-/// cached, has that port baked *directly* into every `render="html"`
-/// widget's own absolute, sharded iframe URL (see `HTML_SHARD_COUNT`'s
-/// own doc comment above). If a layout doesn't need re-translating on a
-/// given run (its own XLF is unchanged, `TRANSLATOR_VERSION` matches --
-/// exactly what happens on any normal run *without* `--clear`), its
-/// cached HTML keeps referencing whatever port a *previous* run
-/// happened to be assigned, which is almost certainly not the port this
-/// run's server is actually listening on -- every widget iframe on that
-/// layout then points nowhere, connecting to a dead port, and simply
-/// never loads at all (confirmed: this exact symptom, `arexibo-show`
-/// firing correctly but no further console output ever following, only
-/// when starting *without* `--clear`). Fixed by using a stable, fixed
-/// port instead, so cached HTML's baked-in port references remain valid
-/// indefinitely across restarts -- loopback-only (127.0.0.0/8), never
-/// reachable from another machine, so the usual "well-known port
-/// collision" concern that would apply to a real network-facing service
-/// doesn't really apply here; the only realistic risk is another
-/// process on the very same machine already bound to this exact port,
-/// which `Server::new`'s own error propagation (via `tiny_http`) surfaces
-/// clearly rather than silently misbehaving.
+/// Fixed rather than OS-assigned (0): a layout's cached HTML has this
+/// port baked directly into every iframe's absolute URL (see
+/// HTML_SHARD_COUNT) -- a dynamic port would make cached HTML from a
+/// previous run point at a dead port on any restart that doesn't
+/// re-translate (no --clear). Loopback-only, so the usual "port
+/// collision" concern for network-facing services doesn't really
+/// apply; a same-machine conflict surfaces clearly via tiny_http's own
+/// error propagation.
 pub const EMBEDDED_SERVER_PORT: u16 = 34519;
 
 /// Shared, in-memory key-value store backing the `/realtime?dataKey=`
@@ -182,23 +152,11 @@ impl Server {
     /// to every successful response, regardless of which of
     /// `serve_inner`'s several return points produced it.
     ///
-    /// BUG fix (found from a real report: a widget's own resource file
-    /// -- which had genuinely failed to download on the first attempt
-    /// with a transient "Cache not ready" SOAP fault, see
-    /// `resource_retry_queue`'s own doc comment -- still appeared
-    /// missing even *after* a later retry successfully downloaded it
-    /// and triggered a reload). Without any `Cache-Control` header at
-    /// all, Chromium is free to apply its own heuristics for whether to
-    /// reuse a previous response instead of making a fresh request --
-    /// including, plausibly, reusing an earlier 404 for the exact same
-    /// URL (same path *and* query string) instead of hitting the server
-    /// again after `layout.rs`'s generated reload code re-assigns the
-    /// iframe's own unchanged `src`. Every response this server sends
-    /// can legitimately change over time (a resource file appearing
-    /// after a retry, `/realtime`'s own stored value being updated,
-    /// etc.), so nothing here should ever be cached by the browser at
-    /// all -- `no-store` is the strongest, least ambiguous directive for
-    /// that.
+    /// Without any Cache-Control header, Chromium may reuse a previous
+    /// response (e.g. an earlier 404) for the same URL instead of
+    /// re-requesting after a retry succeeds and reload code re-assigns
+    /// the same iframe src. Every response here can legitimately change
+    /// over time -- no-store is the strongest, least ambiguous fix.
     fn serve(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
              local_data: &LocalDataStore) -> Result<ResponseBox> {
         let resp = Self::serve_inner(dir, req, duration_tx, local_data)?;
@@ -358,15 +316,9 @@ impl Server {
     }
 }
 
-// BUG fix / feature (found from a real request: knowing the totem's own
-// hostname/IP during initial setup, or while waiting for CMS
-// authorization, previously required a separate SSH session -- showing
-// it directly on the splash screen the totem is already displaying is
-// much more convenient). Computed once (OnceLock) and shared across
-// every `Server` instance (see `Server::new`'s own doc comment on why
-// several independent instances exist, for HTML sharding) -- this info
-// is extremely unlikely to change during a single run, so recomputing
-// it on every request would be pure waste.
+// Shows the totem's own hostname/IP on the splash screen -- avoids
+// needing a separate SSH session during setup/CMS authorization.
+// Computed once (OnceLock), shared across every Server instance.
 fn splash_html() -> &'static [u8] {
     static SPLASH: OnceLock<Vec<u8>> = OnceLock::new();
     SPLASH.get_or_init(|| {
@@ -393,13 +345,9 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
              justify-content: center;">
 <img style="max-width: 70vw; max-height: 40vh; width: auto; height: auto;"
      src="branding.png">
-<!-- BUG fix (found from a real report): the *old* splash.jpg had its own
-     "LOADING..." text baked directly into the image's own pixels --
-     replacing that image with a different logo (see branding.png's own
-     doc comment below) silently lost that text along with it, since it
-     was never a separate, independent element to begin with. A real
-     HTML text element here stays readable regardless of whatever logo
-     image is configured, present or future. -->
+<!-- Separate HTML text element (the old splash.jpg had "LOADING..."
+     baked into its pixels, lost when replaced with branding.png) --
+     stays readable regardless of whatever logo is configured. -->
 <div style="margin-top: 24px; font-family: sans-serif; font-size: 28px;
             font-weight: 600; color: #333333; letter-spacing: 0.05em;">
   LOADING...

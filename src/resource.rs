@@ -378,46 +378,23 @@ impl Cache {
         } else if let Some((layoutid, regionid, mediaid, updated)) =
             self.find_widget_layout_region(id)
         {
-            // BUG fix (found from a real report: dataset-bound widgets
-            // -- confirmed via a real required.xml, this affects
-            // DataSet View widgets specifically) never appear in the
-            // CMS's own RequiredFiles response at all, even though
-            // *neighboring* resources in the exact same region/layout
-            // are listed completely normally -- apparently a genuine
-            // CMS-side omission for this widget type, not an arexibo
-            // parsing bug (verified: the raw XML the user shared truly
-            // has no `<file type="resource" id="...">` entry for this
-            // id anywhere). Since GetResource still needs (layoutid,
-            // regionid, mediaid) to fetch this widget's HTML, and
-            // RequiredFiles never gave us that mapping for this
-            // particular id, fall back to searching the XLF of every
-            // layout we DO have cached for a `<media id="{id}">`
-            // element and reading its parent region's id directly --
-            // the XLF itself unambiguously declares this regardless of
-            // whether the CMS also chose to mention it in
-            // RequiredFiles.
+            // Dataset-bound (DataSet View) widgets never appear in
+            // RequiredFiles at all, even though neighboring resources
+            // in the same region/layout do -- a genuine CMS-side
+            // omission for this widget type. Fall back to searching
+            // cached layout XLFs for the <media id> element, reading
+            // its parent region directly.
             (id, layoutid, regionid, mediaid, updated)
         } else if let Some((fetch_id, layoutid, regionid, mediaid, updated)) =
             self.find_nested_widget_resource(id)
         {
-            // BUG fix (found from a real report, a second real widget
-            // id hitting a related but distinct gap): some widgets
-            // aren't `<media>` elements in any XLF *at all* -- the
-            // newer "Elements" designer can combine several logical
-            // widgets into *one* resource file (confirmed via real
-            // widget HTML the user shared: a single `{id}.html` embeds
-            // a `widgetData`/`elements` JSON array covering multiple
-            // widget ids together, e.g. a "global elements" background
-            // widget and a dataset-bound text widget sharing one file).
-            // Refreshing the *nested* widget's own id makes no sense
-            // (there is no separate resource for it to fetch) --
-            // instead, search every resource we DO have cached for a
-            // `"widgetId":{id}` entry inside its own JSON (a reliable,
-            // distinctive marker: this exact string is written by the
-            // CMS itself as part of each nested widget's own JSON
-            // object), and refresh *that containing resource* instead
-            // -- re-fetching the combined file naturally refreshes
-            // every widget nested inside it, including this one.
+            // Some widgets aren't standalone <media> elements at all --
+            // the Elements designer can combine several into one
+            // resource file (a single {id}.html with a widgetData/
+            // elements JSON array covering multiple widget ids).
+            // Refreshing the nested widget's own id makes no sense --
+            // search cached resources for a "widgetId":{id} JSON entry
+            // and refresh the containing resource instead.
             log::info!("widget {id} isn't its own resource, but is nested inside \
                         resource {fetch_id}'s own combined HTML -- refreshing that instead");
             (fetch_id, layoutid, regionid, mediaid, updated)
@@ -500,32 +477,10 @@ impl Cache {
     pub fn purge_some(&mut self, list: &[String]) -> Result<()> {
         let mut changed = false;
         for name in list {
-            // BUG fix (found from a real report: the CMS's purge list
-            // wasn't being honored at all for media files). Two separate
-            // problems in the old version of this function:
-            //
-            // 1. Removal was only even *attempted* if `self.content`
-            //    already had a matching key for this exact filename --
-            //    silently skipping the file entirely if it didn't (e.g.
-            //    a key-naming mismatch between how a file was originally
-            //    registered and what the CMS's own `storedAs` value is,
-            //    or this file was never successfully registered in
-            //    `self.content` in the first place for some other
-            //    reason). Now: always attempt `fs::remove_file`
-            //    regardless of whether this key is tracked -- deleting a
-            //    file the CMS is explicitly telling us to remove isn't a
-            //    risk just because our own bookkeeping doesn't (or
-            //    doesn't yet) have a matching entry for it.
-            // 2. `fs::remove_file(...)?` inside the loop meant a SINGLE
-            //    failed removal (e.g. a permissions issue, or a file
-            //    already gone) aborted the *entire* purge batch via the
-            //    `?` operator, silently skipping every remaining file in
-            //    `list` -- and the caller (mainloop.rs) discarded the
-            //    resulting error entirely (`let _ = ...`), so this could
-            //    never even be noticed in the logs. Now: every file in
-            //    the batch is attempted independently; a failure on one
-            //    is logged and does not prevent the rest from being
-            //    purged.
+            // Always attempt fs::remove_file regardless of whether
+            // self.content tracks this key (a naming mismatch shouldn't
+            // block deletion), and independently per-file (one failure
+            // no longer aborts the whole batch via `?`).
             match fs::remove_file(self.dir.join(name)) {
                 Ok(()) => changed = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

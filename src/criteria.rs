@@ -51,27 +51,18 @@ impl CriteriaStore {
     }
 }
 
-/// FLAGGED AS UNVERIFIED: the exact set of `condition` strings Xibo's
-/// schedule criteria XML uses isn't independently confirmed (couldn't
-/// find an explicit enumeration in the fetched documentation -- only
-/// that a `condition` attribute exists, e.g. `<criteria metric=""
-/// condition="" type="weather/etc">value</criteria>`). This supports
-/// both short (eq/ne/gt/gte/lt/lte) and long
-/// (equals/notEquals/greaterThan/greaterThanOrEqual/lessThan/
-/// lessThanOrEqual) forms defensively, matching the general
-/// condition-naming pattern seen elsewhere in Xibo's module/widget rule
-/// system (account.xibosignage.com/docs/developer/widgets/xml-definitions,
-/// which uses short forms like "lte"/"lt"). Verify against a real
-/// criteria-conditioned schedule item from the CMS before relying on
-/// this for anything safety-critical.
+/// FLAGGED AS UNVERIFIED: the exact set of `condition` strings isn't
+/// independently confirmed (only that a `condition` attribute exists).
+/// Supports both short (eq/ne/gt/gte/lt/lte) and long (equals/
+/// notEquals/greaterThan/...) forms defensively, matching the general
+/// pattern in Xibo's module/widget rule system. Verify against a real
+/// criteria-conditioned schedule item before relying on this for
+/// anything safety-critical.
 ///
-/// Numeric conditions (gt/gte/lt/lte and their long forms) require both
-/// `expected` and `actual` to parse as f64 -- if either doesn't, the
-/// condition is treated as not satisfied (fail closed: an unparseable
-/// comparison should not silently activate a schedule item). `eq`/`ne`
-/// fall back to plain string comparison if numeric parsing fails, since
-/// metrics like `weather_condition` ("clear", "rain", ...) are
-/// legitimately non-numeric strings.
+/// Numeric conditions require both `expected` and `actual` to parse as
+/// f64 -- fail closed (not satisfied) if either doesn't. eq/ne fall
+/// back to string comparison, since metrics like weather_condition are
+/// legitimately non-numeric.
 pub fn criterion_matches(condition: &str, expected: &str, actual: &str) -> bool {
     let nums = || -> Option<(f64, f64)> {
         Some((actual.parse().ok()?, expected.parse().ok()?))

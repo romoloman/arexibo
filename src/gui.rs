@@ -96,24 +96,14 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                     // widgets always are -- see write_media's `Some("html")`
                     // branch in layout.rs -- so this is just defensive).
                     //
-                    // BUG fix (found from a real report): this used to
-                    // call `el.contentWindow.location.reload(true)` --
-                    // but since widgets are now sharded across several
-                    // loopback origins (see server::HTML_SHARD_COUNT),
-                    // an iframe can genuinely be cross-origin relative
-                    // to this page, and reaching into its
-                    // `contentWindow` throws a same-origin-policy
-                    // SecurityError ("Blocked a frame with origin ...
-                    // from accessing a frame with origin ..."),
-                    // silently failing the reload. Re-assigning the
-                    // iframe's own `src` attribute instead needs no
-                    // cross-origin access at all -- a parent page can
-                    // always change *which* URL one of its own iframes
-                    // points to, regardless of what origin that iframe
-                    // currently shows. Clearing it first (rather than
-                    // just re-assigning the same string) avoids the
-                    // browser treating an unchanged `src` value as a
-                    // no-op and skipping the reload entirely.
+                    // Re-assigns src instead of calling
+                    // el.contentWindow.location.reload(true) -- widgets
+                    // are sharded across loopback origins (see
+                    // server::HTML_SHARD_COUNT), so an iframe can be
+                    // cross-origin, and contentWindow access throws a
+                    // same-origin SecurityError. Re-assigning src needs
+                    // no cross-origin access; cleared first so an
+                    // unchanged value isn't treated as a no-op.
                     let code = CString::new(format!(
                         "(function() {{ \
                            var el = document.getElementById('m{id}'); \

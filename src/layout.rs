@@ -260,25 +260,18 @@ impl FlyDir {
 
     /// (dx%, dy%) -- a CSS translate() offset, as a percentage of the
     /// element's own size, that moves it fully off-screen in this
-    /// compass direction. Percentage-based (not absolute pixels) so
-    /// this works correctly regardless of the widget's actual
-    /// on-screen size.
+    /// compass direction.
     ///
     /// SEMANTICS NOTE: the CMS's own precise meaning of "which way N
     /// moves content" isn't documented anywhere accessible (checked
-    /// the real CMS source, including its own minified Designer
-    /// preview JS -- found the 8 compass values themselves, not a
-    /// clear spec of the exact animation direction). This uses the
-    /// most intuitive, commonly-expected convention (matching how
-    /// other fly/slide transition libraries describe it, e.g. "fly in
-    /// from left"): for an in-transition, the widget arrives *from*
-    /// this direction; for an out-transition, it exits *toward* this
-    /// direction. N/S/E/W map to up/down/right/left respectively,
-    /// diagonals combine both axes. If a specific layout's fly
-    /// direction looks mirrored compared to the CMS Designer's own
-    /// preview, it's a difference in this specific convention, not a
-    /// sign the fly transition itself is broken -- worth revisiting if
-    /// ever confirmed against a real reference player.
+    /// the real CMS source, including its Designer preview JS -- found
+    /// the 8 compass values, not a clear animation-direction spec).
+    /// Uses the most intuitive convention: for an in-transition, the
+    /// widget arrives *from* this direction; for out, it exits
+    /// *toward* it. If a layout's fly direction looks mirrored vs the
+    /// CMS Designer's preview, it's this convention, not a broken
+    /// transition -- worth revisiting if confirmed against a reference
+    /// player.
     fn offset(self) -> (i32, i32) {
         match self {
             Self::N  => (0, -100),
@@ -590,34 +583,21 @@ impl<'a> Translator<'a> {
                             left: {x}px; top: {y}px; width: {w}px; height: {h}px; \
                             overflow: hidden;'>")?;
 
-        // Confirmed real schema (account.xibosignage.com/docs/developer/
-        // creating-a-player/xlf, fetched and read during development):
-        // a region's own <options> can carry <transitionType>
-        // (fadeIn/fadeOut/fly), <transitionDuration> (milliseconds), and
-        // <transitionDirection> (compass point, "fly" only). HOWEVER,
-        // a real XLF from a real CMS (shared by the user after
-        // reporting that transitions weren't being honored) showed this
-        // region-level trio present but almost always *empty*, while
-        // every single *widget* additionally carries its own
-        // `transIn`/`transInDuration`/`transInDirection` and
-        // `transOut`/`transOutDuration`/`transOutDirection` in its own
-        // `<options>` -- a DIFFERENT, per-widget mechanism this file
-        // didn't parse at all before, which is why transitions weren't
-        // being honored. Both are now supported: this region-level trio
-        // is used only as a *fallback default* for widgets that don't
-        // specify their own transIn/transOut (see write_media), matching
-        // the community's own description of the region-level setting
-        // ("a region transition which allows exit transitions... Is
-        // there a way to set the In and Out transitions to a specific
-        // setting for all content in that region?").
-        // Region-level fallback: `(in, out)`, each `(Trans, u32)`.
-        // Unlike the widget-level transIn/transOut (two independent
-        // fields), the region only has ONE `<transitionType>` -- its
-        // string value says which side it applies to: "fadeIn"/
-        // "fadeOut" unambiguously mean just the in/out side
-        // respectively (matching their name), while "fly" doesn't
-        // distinguish a side at all, so it's applied to BOTH (a single
-        // whole-region setting), using the same direction for both.
+        // A region's own <options> can carry <transitionType>
+        // (fadeIn/fadeOut/fly), <transitionDuration> (ms), and
+        // <transitionDirection> (compass, fly only) -- but a real CMS
+        // XLF showed this region-level trio almost always empty, while
+        // every widget carries its own transIn/transInDuration/
+        // transInDirection and transOut equivalents in its own
+        // <options> -- a different, per-widget mechanism, previously
+        // unparsed. Both are supported now: the region-level trio is
+        // only a fallback default for widgets without their own
+        // transIn/transOut (see write_media).
+        // Region-level fallback: (in, out), each (Trans, u32). Unlike
+        // widget-level transIn/transOut (independent fields), the
+        // region has ONE <transitionType> -- "fadeIn"/"fadeOut" apply
+        // to just that side, "fly" doesn't distinguish a side so it
+        // applies to both with the same direction.
         let (region_in, region_out): ((Trans, u32), (Trans, u32)) =
             region.find("options").map(|opts| {
                 let ty = opts.find("transitionType").map(|e| e.text().trim().to_string())
@@ -745,39 +725,24 @@ impl<'a> Translator<'a> {
             if nitems > 1 {
                 match trans_out {
                     Trans::Fade => {
-                        // Deliberately fire-and-forget: region_switch already
-                        // moves on to showing the *next* widget immediately
-                        // after calling this, so its own in-transition (if
-                        // any) overlaps with this fade-out -- a real
-                        // crossfade, rather than the old sequential
-                        // fade-to-background-then-fade-in behavior some very
-                        // old Xibo player versions were reported to have
-                        // (community forum, 2015). The next widget's own
-                        // duration countdown is *not* delayed by this timer,
-                        // matching "duration should... exclude the out
-                        // transition".
+                        // Fire-and-forget: region_switch already moves
+                        // to the next widget immediately, so its own
+                        // in-transition overlaps with this fade-out --
+                        // a real crossfade, not sequential fade-out-
+                        // then-fade-in. Duration countdown isn't
+                        // delayed by this timer.
                         //
-                        // z-index bump is essential, not cosmetic: `.media`
-                        // elements are `position: absolute` with no explicit
-                        // z-index (see LAYOUT_CSS), so they stack in DOM
-                        // order -- the *incoming* widget (written later in
-                        // the region's own media list, or simply shown
-                        // without any fade-in of its own if its `transIn`
-                        // isn't fadeIn) would otherwise paint immediately
-                        // on top of this one from the very first frame,
-                        // completely hiding the fade-out happening
-                        // underneath it -- a real bug found because the
-                        // fade was reported as "not happening" even though
-                        // the opacity animation itself was verified working
-                        // correctly (see this session's QtWebEngine
-                        // measurement). Bumping z-index keeps the
-                        // *fading-out* widget on top for the duration of its
-                        // own fade, so its decreasing opacity visibly
-                        // reveals whatever's now underneath, regardless of
-                        // DOM order. Not reset back afterwards: once
-                        // `visibility: hidden`, the element doesn't
-                        // participate in visible stacking at all regardless
-                        // of z-index, so there is nothing to clean up.
+                        // z-index bump is essential, not cosmetic:
+                        // .media elements are position:absolute with
+                        // no explicit z-index, stacking in DOM order --
+                        // the incoming widget would otherwise paint on
+                        // top from frame one, hiding this fade-out
+                        // entirely. Bumping keeps the fading-out widget
+                        // on top so its decreasing opacity visibly
+                        // reveals what's underneath. Not reset
+                        // afterwards -- once visibility:hidden, the
+                        // element doesn't participate in stacking
+                        // regardless of z-index.
                         writeln!(self.out, "      {{ let el = {el}; \
                                             el.style.zIndex = '9999'; \
                                             el.style.transition = 'opacity {ms_out}ms'; \
@@ -824,19 +789,13 @@ impl<'a> Translator<'a> {
         let mut add_start = String::new();
         let mut add_stop = String::new();
 
-        // Per-widget transition override -- confirmed real (a genuine
-        // XLF from a real CMS, shared by the user after reporting
-        // transitions weren't being honored): every widget's own
-        // `<options>` can carry `transIn`/`transInDuration`/
-        // `transInDirection` and `transOut`/`transOutDuration`/
-        // `transOutDirection`, DIFFERENT property names from the
-        // region-level `transitionType`/`transitionDuration`/
-        // `transitionDirection` trio (see write_region) -- this is the
-        // one actually populated by the CMS/editor in practice, which is
-        // exactly why transitions weren't working before this was added.
-        // Falls back to the region-level default (`region_fallback`)
-        // independently for in/out -- only for whichever side this
-        // widget doesn't specify its own transIn/transOut for at all.
+        // Per-widget transition override -- every widget's own
+        // <options> can carry transIn/transInDuration/transInDirection
+        // and transOut equivalents, different property names from the
+        // region-level transitionType trio (see write_region) -- this
+        // is the one actually populated by the CMS/editor in practice.
+        // Falls back to region_fallback independently per side, only
+        // for whichever side this widget doesn't specify its own.
         fn parse_trans(ty: Option<&str>, dir: Option<&str>, ms: u32) -> (Trans, u32) {
             match ty {
                 Some("fadeIn") | Some("fadeOut") if ms > 0 => (Trans::Fade, ms),

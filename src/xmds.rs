@@ -160,19 +160,13 @@ impl Cms {
                 if !xmr_web_socket_address.is_empty() {
                     xmr_web_socket_address.clone()
                 } else if let Some(default) = &self.default_ws_address {
-                    // BUG fix (found from a real user's own suspicion,
-                    // confirmed against the real CMS source AND the
-                    // official Docker docs -- see
-                    // CmsSettings::default_xmr_websocket_address's own
-                    // doc comment for the full context): the CMS never
-                    // computes this default server-side, despite
-                    // documenting the convention -- it's on the player
-                    // to know it. Previously, an empty address here
-                    // meant falling straight to ZMQ, never trying
-                    // WebSocket XMR at all for a CMS relying on this
-                    // documented default (e.g. a fresh Docker install
-                    // with XMR_WS_ADDRESS left at its own default,
-                    // empty, value).
+                    // The CMS never computes this default server-side
+                    // despite documenting the convention (see
+                    // CmsSettings::default_xmr_websocket_address) --
+                    // without this, an empty address here always meant
+                    // ZMQ, never trying WebSocket for a CMS relying on
+                    // this documented default (e.g. Docker with
+                    // XMR_WS_ADDRESS left empty).
                     log::debug!("CMS sent an empty XMR WebSocket address (xmrType=ws) -- \
                                 trying the documented default convention ({default}, same \
                                 host as the CMS itself, path /xmr) before falling back to \
@@ -185,33 +179,20 @@ impl Cms {
             } else { String::new() };
 
             Ok(Some(PlayerSettings {
-                // BUG fix (found while testing a diagnostic clientType
-                // override): this used `parse_child` (erroring out if
-                // the field is absent entirely), inconsistent with its
-                // sibling XMR fields right above (xmrWebSocketAddress,
-                // xmrType, xmrCmsKey), all of which correctly use
-                // `def_child` with a graceful empty-string fallback. The
-                // CMS can legitimately omit this field for a client that
-                // only uses WebSocket XMR (it's the legacy ZMQ fallback
-                // address specifically) -- treating its absence as a
-                // hard registration failure meant collection fell back
-                // to stale cached settings entirely, rather than simply
-                // not having a ZMQ fallback available.
+                // xmrNetworkAddress (legacy ZMQ fallback) can be
+                // legitimately absent for a WebSocket-only client --
+                // def_child (graceful empty default), not parse_child
+                // (hard failure), matching its XMR sibling fields.
                 xmr_network_address: tree.def_child("xmrNetworkAddress", "")?,
                 xmr_web_socket_address,
                 xmr_web_socket_address_in_use,
                 xmr_cms_key: tree.def_child("xmrCmsKey", "")?,
-                // BUG fix (found while testing a diagnostic clientType
-                // override, "windows" -- the CMS's real ActivationMessage
-                // response omitted several fields entirely for that
-                // client type, causing a cascade of hard registration
-                // failures one field at a time as each was fixed in
-                // turn). All of the following were previously mandatory
-                // via `parse_child`, erroring the whole registration out
-                // (falling back to stale cached settings) if the CMS
-                // omitted any single one of them. Made optional with
-                // conservative, documented defaults instead, matching
-                // the same pattern already used for the fields above.
+                // All fields below are optional with conservative
+                // defaults, not mandatory via parse_child -- a real CMS
+                // response for some client types (e.g. "windows") omits
+                // several of these entirely; treating that as a hard
+                // registration failure fell back to stale cached
+                // settings unnecessarily.
                 log_level: tree.def_child("logLevel", "error".to_string())?,
                 display_name: tree.def_child("displayName", self.display_name.clone())?,
                 // Xibo's own typical CMS default for Proof of Play stats
