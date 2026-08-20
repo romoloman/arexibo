@@ -1139,6 +1139,23 @@ impl<'a> Translator<'a> {
                            el.onended = () => window.arexibo.region_switch({rid}, -1, false); }}");
                     duration = "() => 86400".to_string();
                 }
+                // BUG fix (found from a real report: a video with an
+                // explicit duration set is sent to background when its
+                // time is up, but keeps playing invisibly instead of
+                // actually stopping). Every other widget type that
+                // needs cleanup when hidden (PDF, native webpage) already
+                // sets add_stop alongside add_start -- video/localvideo
+                // never did, for either duration-handling branch above
+                // (useDuration=1/loop, or the native `ended`-event path).
+                // Pausing *and* resetting playback position (not just
+                // pausing) also means the video restarts from the
+                // beginning next time this widget comes back around in
+                // the region's own loop, rather than resuming from
+                // wherever it happened to be left off (or already
+                // finished, appearing frozen on its last frame).
+                add_stop = format!(
+                    "{{ let el = document.getElementById('m{mid}'); \
+                       el.pause(); el.currentTime = 0; }}");
             }
             (_, Some("audio")) => {
                 // Standalone Audio widget (as opposed to audio attached to
@@ -1150,17 +1167,66 @@ impl<'a> Translator<'a> {
                 // video module by analogy (same underlying Xibo media
                 // options schema) and confirmed only via the XLF developer
                 // docs stating a `loop`/`volume` pair also exists for Audio
-                // nodes; `loop`/`volume` are not yet wired up here (video
-                // doesn't handle them either -- same pre-existing gap,
-                // left alone to stay in scope). Verify against a real CMS
-                // audio widget before relying on mute/volume behavior.
+                // nodes; `volume` is not yet wired up here (video doesn't
+                // handle it either -- same pre-existing gap, left alone to
+                // stay in scope). Verify against a real CMS audio widget
+                // before relying on mute/volume behavior.
                 let url = percent_decode(opts.find("uri").context("no audio uri")?.text());
                 let mute = opts.find("mute").is_some_and(|el| el.text() == "1");
-                writeln!(self.out, "<audio class='media r{rid}' id='m{mid}' src='{url}' {}\
+                // loop/useDuration handling mirrors the video arm above
+                // 1:1 -- added on direct request right after audio's own
+                // ended-event/add_stop fix, for full parity with video.
+                // See that arm's own doc comments for the full rationale
+                // (both bugs this fixes -- long pause between native
+                // loops, and useDuration=1 being silently ignored -- were
+                // originally found and fixed for video specifically, but
+                // the same underlying mechanism applies identically here).
+                let loop_audio = opts.find("loop").is_some_and(|el| el.text().trim() == "1");
+                writeln!(self.out, "<audio class='media r{rid}' id='m{mid}' src='{url}' {} {}\
                                     ></audio>",
-                         if mute { "muted" } else { "" })?;
-                add_start = format!("document.getElementById('m{mid}').play();");
-                duration = format!("() => document.getElementById('m{mid}').duration");
+                         if mute { "muted" } else { "" },
+                         if loop_audio { "loop" } else { "" })?;
+                let use_duration = media.get_attr("useDuration").is_some_and(|v| v == "1");
+                if loop_audio || use_duration {
+                    add_start = format!("document.getElementById('m{mid}').play();");
+                    // `duration` already defaults to the CMS-configured
+                    // XLF `duration` attribute (set at the top of this
+                    // function) -- nothing further to do here; for
+                    // loop_audio, the native `loop` attribute on the
+                    // <audio> element above handles actual repetition.
+                } else {
+                    // BUG fix (found from a direct question, right after
+                    // fixing the exact same two issues for the video widget
+                    // above): this was modeled on an *earlier* version of
+                    // that video arm, before either fix existed there --
+                    // same synchronous-duration-read bug: reading
+                    // `.duration` in the very same tick as `.play()` is
+                    // unreliable (metadata loads asynchronously, often
+                    // still NaN at that exact moment), silently falling
+                    // back to region_switch's own 1-second timer and
+                    // restarting the audio from scratch roughly every
+                    // second. Fixed the same way: the native `ended`
+                    // event as the real advance mechanism, with a 24h
+                    // duration as a safety-net timeout only.
+                    add_start = format!(
+                        "{{ let el = document.getElementById('m{mid}'); \
+                           el.play(); \
+                           el.onended = () => window.arexibo.region_switch({rid}, -1, false); }}");
+                    duration = "() => 86400".to_string();
+                }
+                // BUG fix (found from a direct question, right after
+                // fixing the exact same issue for the video widget above):
+                // same missing add_stop -- nothing paused/reset the audio
+                // when the widget was sent to background, so it kept
+                // playing invisibly instead of actually stopping, and
+                // would resume from wherever it was left off (or stay
+                // silent, already finished) rather than restarting cleanly
+                // next time this widget comes back around in the region's
+                // own loop. Applies regardless of which branch above was
+                // taken, same as video's own add_stop.
+                add_stop = format!(
+                    "{{ let el = document.getElementById('m{mid}'); \
+                       el.pause(); el.currentTime = 0; }}");
             }
             (_, Some("shellcommand")) => {
                 writeln!(self.out, "<div class='media r{rid}' id='m{mid}' \
@@ -1858,6 +1924,117 @@ mod loop_tests {
         // must use the native 'ended' event to advance instead
         assert!(html.contains("el.onended = () => window.arexibo.region_switch(1, -1, false);"));
         assert!(html.contains("() => 86400"));
+    }
+
+    #[test]
+    fn audio_uses_ended_event_and_pauses_resets_on_stop_same_as_video() {
+        // Regression test for a real question asked directly, right
+        // after fixing the exact same two issues for the video widget:
+        // audio was modeled on an *earlier* version of that video arm,
+        // before either fix existed there. Same two bugs, same fixes:
+        // 1. Synchronous `.duration` read right after `.play()` is
+        //    unreliable (metadata loads asynchronously) -- must use the
+        //    native `ended` event instead, with an 86400s safety-net
+        //    duration, not a live `.duration` read.
+        // 2. Missing add_stop -- audio kept playing invisibly when sent
+        //    to background instead of actually stopping; must pause
+        //    *and* reset playback position.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5005" type="audio" duration="0"><options><uri>a.mp3</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        // must NOT read audio.duration synchronously
+        assert!(!html.contains("document.getElementById('m5005').duration"));
+        // must use the native 'ended' event to advance instead
+        assert!(html.contains("el.onended = () => window.arexibo.region_switch(1, -1, false);"));
+        assert!(html.contains("() => 86400"));
+        // must pause and reset playback position when sent to background
+        assert!(html.contains("{ let el = document.getElementById('m5005'); \
+                               el.pause(); el.currentTime = 0; }"),
+                "audio must pause+reset on stop, same as video -- got:\n{html}");
+    }
+
+    #[test]
+    fn audio_with_loop_1_gets_native_loop_attribute_and_static_duration() {
+        // loop/useDuration support for audio, added on direct request
+        // right after the ended-event/add_stop fix above, for full
+        // parity with video. Mirrors
+        // video_with_loop_1_gets_native_loop_attribute_and_static_duration
+        // 1:1.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5006" type="audio" duration="60"><options><uri>a.mp3</uri><loop>1</loop></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("<audio class='media r1' id='m5006' src='a.mp3'  loop"));
+        // must NOT override duration with audio.duration when looping --
+        // the widget's own static 60s duration must be used instead.
+        assert!(!html.contains("document.getElementById('m5006').duration"));
+        assert!(html.contains("() => 60"));
+    }
+
+    #[test]
+    fn audio_with_use_duration_1_respects_configured_duration_even_without_loop() {
+        // Mirrors video_with_use_duration_1_respects_configured_duration_
+        // even_without_loop 1:1.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5007" type="audio" duration="15" useDuration="1">
+                    <options><uri>a.mp3</uri><loop>0</loop></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(!html.contains(" loop "));
+        assert!(html.contains("() => 15"));
+        assert!(!html.contains("() => 86400"));
+        assert!(!html.contains("el.onended"));
+        assert!(html.contains("document.getElementById('m5007').play();"));
+        // add_stop must still apply regardless of which branch was taken
+        assert!(html.contains("{ let el = document.getElementById('m5007'); \
+                               el.pause(); el.currentTime = 0; }"));
+    }
+
+    #[test]
+    fn video_pauses_and_resets_when_sent_to_background_regardless_of_duration_branch() {
+        // Regression test for a real report: a video with an explicit
+        // duration set is sent to background when its time is up, but
+        // keeps playing invisibly instead of actually stopping. Every
+        // other widget type that needs cleanup when hidden (PDF, native
+        // webpage) already sets add_stop alongside add_start -- video
+        // never did, for either duration-handling branch (useDuration=1/
+        // loop, or the native `ended`-event path). Checked for both
+        // branches since the fix needed to apply regardless of which
+        // one is taken.
+        let expected_stop = "{ let el = document.getElementById('m5004'); \
+                              el.pause(); el.currentTime = 0; }";
+
+        // Branch 1: useDuration=1 (static duration, no native ended event)
+        let xlf_use_duration = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5004" type="video" duration="15" useDuration="1">
+                    <options><uri>a.mp4</uri></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf_use_duration);
+        assert!(html.contains(expected_stop),
+                "useDuration=1 branch must pause+reset on stop -- got:\n{html}");
+
+        // Branch 2: no loop, no useDuration (native `ended`-event path)
+        let xlf_ended_event = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5004" type="video" duration="0">
+                    <options><uri>a.mp4</uri><loop>0</loop></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf_ended_event);
+        assert!(html.contains(expected_stop),
+                "native ended-event branch must also pause+reset on stop -- got:\n{html}");
     }
 
     #[test]
