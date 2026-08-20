@@ -155,6 +155,18 @@ pub struct Handler {
     /// registration every cycle, same as the "was authorized, lost it"
     /// case, just with a faster interval and a clearer log message.
     pending_auth: bool,
+    /// Same pattern as `pending_auth`, for a different real cause: with
+    /// `--allow-offline` set but no cached settings.json to fall back
+    /// to (e.g. a brand-new totem's very first boot, before WiFi has
+    /// obtained an IP/working DNS yet), register_display() failing
+    /// used to `bail!()` the whole process out -- crashing on startup
+    /// repeatedly (systemd's Restart= redoing the full Xorg/D-Bus/
+    /// arexibo startup sequence each time) until the network happened
+    /// to come up in the brief window before the next attempt. Now:
+    /// the same empty-defaults, fast-retry Handler as pending_auth,
+    /// with its own accurate log message (this isn't a CMS
+    /// authorization issue).
+    pending_network: bool,
     /// Timer for hiding/advancing the currently-shown overlay. Moved
     /// here (was local to `run()`) since `schedule_check()` needs to
     /// (re)schedule it too, not just XMR's `overlayLayout` handling.
@@ -230,6 +242,7 @@ impl Handler {
         log::info!("doing initial register call to CMS");
 
         // try initial register call
+        let mut network_pending = false;
         let res = match xmds.register_display() {
             Err(e) => {
                 if !allow_offline {
@@ -247,7 +260,13 @@ impl Handler {
 
                         Some(settings)
                     }
-                    Err(_) => bail!("initial register failed and no cached settings available")
+                    Err(_) => {
+                        // See `pending_network`'s own doc comment for
+                        // the full context (previously bail!()'d the
+                        // whole process out here instead).
+                        network_pending = true;
+                        None
+                    }
                 }
             }
             Ok(res) => res
@@ -319,21 +338,29 @@ impl Handler {
                                  dataupdate_retry_queue: Vec::new(),
                                  resource_retry_timer: never(),
                                  pending_auth: false,
+                                 pending_network: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
         } else {
-            // See pending_auth's own doc comment. Everything here is a
-            // placeholder default -- no real config exists yet.
-            // xmr_retry_key reuses the existing --allow-offline retry
-            // mechanism in collect_once ("network came back, try XMR
-            // now") for the same purpose here ("just got authorized").
-            log::warn!("display is registered but not yet authorized in the CMS -- \
-                        showing the splash screen and retrying periodically \
-                        (see this machine's own hostname/IP on screen to help \
-                        find/approve it in Administration -> Displays)");
+            // See pending_auth's/pending_network's own doc comments.
+            // Everything here is a placeholder default -- no real
+            // config exists yet. xmr_retry_key reuses the existing
+            // --allow-offline retry mechanism in collect_once ("network
+            // came back, try XMR now") for the same purpose here.
+            if network_pending {
+                log::warn!("could not reach the CMS and no cached settings are \
+                            available yet (e.g. this display's very first boot, \
+                            before the network is fully up) -- showing the splash \
+                            screen and retrying periodically");
+            } else {
+                log::warn!("display is registered but not yet authorized in the CMS -- \
+                            showing the splash screen and retrying periodically \
+                            (see this machine's own hostname/IP on screen to help \
+                            find/approve it in Administration -> Displays)");
+            }
             let mut slf = Self { to_gui, from_gui, settings: PlayerSettings::default(),
                                  cache, xmds, xmr: never(), schedule: Schedule::default(),
                                  layouts: vec![], envdir: envdir.into(), current_layout: 0,
@@ -348,7 +375,8 @@ impl Handler {
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
                                  resource_retry_timer: never(),
-                                 pending_auth: true,
+                                 pending_auth: !network_pending,
+                                 pending_network: network_pending,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
                                  cms: cms.clone(), no_verify };
@@ -391,12 +419,14 @@ impl Handler {
                     if let Err(e) = self.collect_once() {
                         log::error!("during collect: {e:#}");
                     }
-                    // While waiting for CMS authorization, retry much
-                    // sooner than the normal collect_interval (which
+                    // While waiting for CMS authorization or a working
+                    // network (see pending_auth/pending_network), retry
+                    // much sooner than the normal collect_interval (which
                     // defaults to 900s/15min -- a long wait for someone
-                    // actively trying to approve a freshly-set-up
-                    // display and watching for it to come online).
-                    let interval = if self.pending_auth {
+                    // actively watching a freshly-set-up display come
+                    // online, or for a totem whose WiFi just needs a
+                    // few more seconds).
+                    let interval = if self.pending_auth || self.pending_network {
                         PENDING_AUTH_RETRY_INTERVAL
                     } else {
                         Duration::from_secs(self.settings.collect_interval)
@@ -615,6 +645,7 @@ impl Handler {
                     Ok(FromGui::Showing(layout)) => {
                         self.current_layout = layout;
                         self.record_layout_shown(layout);
+                        self.send_status_update();
                     }
                     Ok(FromGui::Command(code)) =>
                         self.run_command(&code),
@@ -756,29 +787,38 @@ impl Handler {
                 self.settings = settings;
                 self.update_settings();
             }
-            if self.pending_auth {
-                // Just got authorized -- this is the first real
+            if self.pending_auth || self.pending_network {
+                // Just got authorized, or the network/CMS finally
+                // became reachable -- this is the first real
                 // registration this Handler has ever seen (constructed
-                // in the pending state, see `Handler::new`'s own doc
-                // comment), so persist it now exactly as a normal
-                // startup registration would have (that write only
-                // happens once, at the point of first successful
+                // in one of these pending states, see `Handler::new`'s
+                // own doc comments), so persist it now exactly as a
+                // normal startup registration would have (that write
+                // only happens once, at the point of first successful
                 // registration -- this *is* that point, just reached
                 // via a later collection cycle instead of `new` itself).
-                log::info!("display just got authorized in the CMS, proceeding \
-                            with normal operation");
+                log::info!("{}, proceeding with normal operation",
+                           if self.pending_auth { "display just got authorized in the CMS" }
+                           else { "network/CMS is now reachable" });
                 self.pending_auth = false;
+                self.pending_network = false;
                 if let Err(e) = self.settings.to_file(self.envdir.join("settings.json")) {
                     log::warn!("writing player settings after authorization: {e:#}");
                 }
             }
-        } else if self.pending_auth {
-            // Not an error -- still simply not authorized *yet*, exactly
-            // the state this Handler was constructed in. Nothing to
-            // collect (no real settings/schedule exist), so return early
-            // rather than plowing ahead into required_files()/etc. below
-            // with placeholder defaults that would only produce
-            // confusing, unrelated errors of their own.
+        } else if self.pending_auth || self.pending_network {
+            // Not an error -- still simply not authorized *yet* (a
+            // successful SOAP call, network/CMS genuinely reachable,
+            // just an "unauthorized" answer). If this Handler started
+            // out in pending_network specifically (no network at
+            // startup), reaching here at all means the network issue
+            // has resolved -- transition cleanly to pending_auth,
+            // since that's now the actual remaining blocker, rather
+            // than falling through to the "was already authorized,
+            // now lost it" branch below, which would be a misleading
+            // message for what's actually happening here.
+            self.pending_auth = true;
+            self.pending_network = false;
             log::info!("still waiting for authorization in the CMS, will check \
                         again shortly");
             return Ok(());
@@ -886,17 +926,7 @@ impl Handler {
         // send log messages
         self.xmds.submit_log(&logger::pop_entries())?;
 
-        // collect status info
-        let (avail, total) = util::space_info(self.cache.dir())?;
-        let status = xmds::Status {
-            currentLayoutId: self.current_layout,
-            availableSpace: avail,
-            totalSpace: total,
-            lastCommandSuccess: self.last_command_success.unwrap_or(true),
-            deviceName: &self.settings.display_name,
-            timeZone: &util::timezone(),
-        };
-        self.xmds.notify_status(&status)?;
+        self.send_status_update();
 
         self.flush_stats();
         self.flush_faults();
@@ -924,6 +954,38 @@ impl Handler {
         }
         let sid = self.schedule.scheduleid_for(new_layout);
         self.layout_playing_since = Some((new_layout, sid, now));
+    }
+
+    /// Send a NotifyStatus update to the CMS with the current layout
+    /// id and other status fields. Previously only ever called once
+    /// per full collection cycle (which can be minutes apart) -- the
+    /// CMS's own "Current Layout" display would lag behind actual
+    /// layout switches by however long a collection cycle takes.
+    /// Called immediately on every real layout change (FromGui::Showing,
+    /// see `run()`'s own select! loop), in addition to still being
+    /// called once per collection. Logs (not propagates) any error --
+    /// a failed status update shouldn't be fatal, especially when
+    /// called from a context (a real-time layout switch) that isn't
+    /// itself inside a `Result`-returning function.
+    fn send_status_update(&mut self) {
+        let (avail, total) = match util::space_info(self.cache.dir()) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("getting disk space info for status update: {e:#}");
+                return;
+            }
+        };
+        let status = xmds::Status {
+            currentLayoutId: self.current_layout,
+            availableSpace: avail,
+            totalSpace: total,
+            lastCommandSuccess: self.last_command_success.unwrap_or(true),
+            deviceName: &self.settings.display_name,
+            timeZone: &util::timezone(),
+        };
+        if let Err(e) = self.xmds.notify_status(&status) {
+            log::error!("sending status update: {e:#}");
+        }
     }
 
     /// Flush any accumulated Proof of Play records to the CMS. Called at
@@ -1398,6 +1460,66 @@ mod pending_auth_tests {
 }
 
 #[cfg(test)]
+mod pending_network_tests {
+    use super::*;
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_pending_network_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn unreachable_cms_with_no_cache_constructs_pending_handler_instead_of_bailing() {
+        // Regression test for a real report: a totem's very first boot
+        // (no cached settings.json yet), with WiFi not yet having
+        // obtained an IP/working DNS -- register_display() genuinely
+        // fails (not just a "not yet authorized" answer, an actual
+        // connection failure) with --allow-offline set. This used to
+        // bail!() the whole process out, causing systemd's Restart= to
+        // redo the entire Xorg/D-Bus/arexibo startup sequence
+        // repeatedly until the network happened to come up in the
+        // brief window before the next attempt -- appearing "stuck".
+        //
+        // A genuinely unreachable address (nothing listening on this
+        // port at all) simulates the connection failure -- not a mock
+        // server returning a "not authorized" answer (that's
+        // pending_auth's own, different scenario, tested separately).
+        let unreachable_port = {
+            // Bind briefly to grab a genuinely free port, then drop the
+            // listener immediately so the port is free again but
+            // (very likely) nothing else grabs it before this test's
+            // own connection attempt -- good enough for a test, not
+            // meant to be airtight against a real concurrent bind.
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cms = CmsSettings {
+            address: format!("http://127.0.0.1:{unreachable_port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let envdir = test_envdir();  // fresh -- no settings.json exists here
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                    togui_tx, fromgui_rx, duration_rx)
+            .expect("must construct successfully, not bail out, when the network/CMS \
+                     is unreachable and no cache exists yet");
+        assert!(handler.pending_network, "must be marked as pending network specifically");
+        assert!(!handler.pending_auth, "must NOT be marked as pending auth -- different cause");
+        assert_eq!(handler.player_settings(), PlayerSettings::default(),
+                   "settings must be the placeholder default while pending");
+    }
+}
+
+#[cfg(test)]
 mod sticky_ws_address_tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1593,6 +1715,94 @@ mod sticky_ws_address_tests {
                    "our own derived /xmr default must win, even though it's port-shaped \
                     differently than the previously-cached address -- it's our own \
                     intentional fallback, not a suspicious CMS inconsistency");
+    }
+}
+
+#[cfg(test)]
+mod send_status_update_tests {
+    use super::*;
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_status_update_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Responds READY to the first request (RegisterDisplay, needed
+    /// for Handler::new() to succeed), then captures the raw body of
+    /// every subsequent request (NotifyStatus and anything else) into
+    /// `captured`, responding with a generic NotifyStatusResponse.
+    fn start_mock_capturing_requests() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        std::thread::spawn(move || {
+            let mut first = true;
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
+                if first {
+                    first = false;
+                    let response_body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                    let _ = request.respond(tiny_http::Response::from_string(response_body));
+                } else {
+                    captured_clone.lock().unwrap().push(body);
+                    let response_body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><NotifyStatusResponse><success>true</success></NotifyStatusResponse></soap:Body>
+</soap:Envelope>"#;
+                    let _ = request.respond(tiny_http::Response::from_string(response_body));
+                }
+            }
+        });
+        (port, captured)
+    }
+
+    #[test]
+    fn layout_change_immediately_sends_a_status_update_not_just_at_next_collection() {
+        // Regression test for a real report: the CMS's own "Current
+        // Layout" display only updated once per full collection cycle
+        // (which can be minutes apart), even though arexibo's own
+        // self.current_layout tracked the real, immediate layout
+        // change correctly the whole time -- it just wasn't telling
+        // the CMS promptly. FromGui::Showing now calls
+        // send_status_update() directly, in addition to still being
+        // sent once per collection.
+        let (port, captured) = start_mock_capturing_requests();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        // Simulate exactly what FromGui::Showing(layout) does in run()'s
+        // own select! loop -- without needing to drive that full,
+        // otherwise-infinite loop just to test this specific behavior.
+        handler.current_layout = 4242;
+        handler.record_layout_shown(4242);
+        handler.send_status_update();
+
+        let requests = captured.lock().unwrap();
+        assert!(requests.iter().any(|body| body.contains("4242")),
+                "a status update containing the new layout id must be sent \
+                 immediately on layout change -- captured requests: {requests:?}");
     }
 }
 
