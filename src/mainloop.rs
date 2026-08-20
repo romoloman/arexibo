@@ -823,7 +823,33 @@ impl Handler {
                         again shortly");
             return Ok(());
         } else {
-            bail!("display is not authorized anymore");
+            // BUG fix (found from a direct question asking to verify
+            // this exact scenario): a previously-authorized, normally-
+            // running display (pending_auth/pending_network both
+            // false) that gets deauthorized used to just `bail!()`
+            // here -- logged as an error once per collection cycle,
+            // but self.pending_auth was never set (so retries kept
+            // using the slow, normal collect_interval instead of the
+            // fast 30s one) and self.schedule/self.layouts were never
+            // cleared (so the GUI was never told to switch away --
+            // the display would keep cycling through its stale cached
+            // schedule indefinitely, never reverting to the splash
+            // screen the way a freshly-unauthorized display does).
+            // Now: transitions into the same pending_auth state a
+            // fresh, never-yet-authorized display starts in, and
+            // actively clears the schedule + calls schedule_check()
+            // immediately so schedule_check's own empty-schedule path
+            // (see its own doc comment) sends ToGui::Layouts(vec![]),
+            // which gui.rs's own Schedule::update() correctly resolves
+            // to the splash screen (layout 0) as a last resort -- not
+            // waiting for the next periodic schedule_check tick (60s).
+            log::warn!("display was previously authorized but no longer is -- \
+                        reverting to the splash screen and retrying periodically, \
+                        same as a freshly-unauthorized display");
+            self.pending_auth = true;
+            self.schedule = Schedule::default();
+            self.schedule_check();
+            return Ok(());
         }
 
         // See `xmr_retry_key`'s own doc comment / the `--allow-offline`
@@ -1456,6 +1482,118 @@ mod pending_auth_tests {
         let _ = handler.collect_once();
         assert!(!handler.pending_auth,
                 "must have transitioned out of pending authorization once the CMS said READY");
+    }
+}
+
+#[cfg(test)]
+mod deauthorization_tests {
+    use super::*;
+
+    /// Mock XMDS server returning a fixed sequence of RegisterDisplay
+    /// codes ("READY" or "WAITING") across successive calls, clamped to
+    /// the last entry once past the end -- lets a test exercise a
+    /// non-monotonic sequence (e.g. READY, then WAITING, then READY
+    /// again), unlike pending_auth_tests's own mock (which only ever
+    /// goes from not-ready to ready, never back).
+    fn start_mock(codes: Vec<&'static str>) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            let mut n = 0usize;
+            for request in server.incoming_requests() {
+                let code = codes.get(n).copied().unwrap_or(*codes.last().unwrap());
+                n += 1;
+                let activation = format!(r#"<ActivationMessage code="{code}"/>"#);
+                let escaped = activation.replace('&', "&amp;").replace('<', "&lt;")
+                                         .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_deauth_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_previously_authorized_display_reverts_to_splash_when_deauthorized_then_resumes() {
+        // Regression test for a direct question asking to verify this
+        // exact scenario: (1) totem installed, authorized, running
+        // normally; (2) authorization removed -- should revert to the
+        // splash screen (layout 0); (3) authorization restored --
+        // should resume normal operation. Found, while verifying this,
+        // that step 2 didn't actually work: a previously-authorized,
+        // running display (pending_auth/pending_network both false)
+        // getting deauthorized used to just bail!() -- an error logged
+        // once per (slow) collection interval, but pending_auth was
+        // never set (so retries stayed slow) and self.layouts was
+        // never cleared (so the GUI was never told to switch away --
+        // the display would keep showing its stale cached content
+        // indefinitely, never reverting to the splash screen).
+        let port = start_mock(vec!["READY", "WAITING", "READY"]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        // Call 1 (Handler::new, "READY"): normal, authorized startup.
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert!(!handler.pending_auth);
+        // Simulate "already running, showing some real content" --
+        // schedule_check() only ever populates this from a real,
+        // cached layout, which this test doesn't set up; setting it
+        // directly is equivalent for what this test actually verifies
+        // (does a deauth event clear it and tell the GUI), without
+        // needing a full download cycle's worth of real cached files.
+        handler.layouts = vec![4242];
+
+        // Call 2 (collect_once, "WAITING" -- deauthorized): must revert
+        // to the splash screen and enter the fast-retry pending state,
+        // not silently keep showing layout 4242 forever.
+        let _ = handler.collect_once();
+        assert!(handler.pending_auth,
+                "must transition into pending_auth so retries use the fast interval");
+        assert!(handler.layouts.is_empty(),
+                "must clear the stale layouts list -- must not keep showing old content");
+        let mut found_empty_layouts = false;
+        while let Ok(msg) = togui_rx.try_recv() {
+            if let ToGui::Layouts(layouts) = msg {
+                assert!(layouts.is_empty(),
+                        "must tell the GUI an empty layout list, which gui.rs's own \
+                         Schedule::update() resolves to the splash screen (layout 0) \
+                         as a last resort");
+                found_empty_layouts = true;
+            }
+        }
+        assert!(found_empty_layouts,
+                "must have sent ToGui::Layouts(vec![]) to the GUI on deauthorization");
+
+        // Call 3 (collect_once, "READY" again -- reauthorized): must
+        // resume normal operation.
+        let _ = handler.collect_once();
+        assert!(!handler.pending_auth,
+                "must have transitioned back out of pending authorization");
     }
 }
 

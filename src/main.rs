@@ -183,9 +183,81 @@ fn main_inner() -> anyhow::Result<()> {
         shard_server.start_pool();
     }
 
-    std::thread::spawn(|| handler.run());
+    // BUG fix (found from a real report: a totem got stuck showing
+    // only the splash screen forever after a hard power-cut, with
+    // "doing collection" never once appearing in the log -- strongly
+    // suggesting this thread panicked, or run() otherwise returned,
+    // almost immediately after starting, likely from a corrupted
+    // cached file on disk left by the abrupt power loss). run()'s own
+    // `loop { select! {...} }` has no explicit break/return -- it's
+    // designed to run forever, so ANY return (an Err bubbling up via
+    // `?` from deep inside a single collection cycle, or even an Ok,
+    // which shouldn't normally happen at all) represents an unexpected
+    // exit. Previously, this thread's own JoinHandle was never
+    // checked, and a panic inside it unwinds *only that thread*,
+    // silently -- the GUI thread keeps running with whatever was on
+    // screen at that moment (here, just the splash), forever, with no
+    // further collection ever happening again and no clear signal
+    // anywhere that this occurred. Wrapping in catch_unwind and
+    // exiting the whole process on either outcome means systemd's own
+    // `Restart=always` (see arexibo.service) gives a genuinely fresh
+    // start instead -- the same recovery this whole codebase already
+    // relies on elsewhere (e.g. the QtWebEngine renderProcessTerminated
+    // handler, gui/view.h) for exactly this class of "can't safely
+    // continue, but a full restart fixes it" problem.
+    std::thread::spawn(|| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run()));
+        log::error!("{}", mainloop_exit_message(&result));
+        std::process::exit(1);
+    });
 
     gui::run(settings, args.screen.unwrap_or_default(), args.inspect,
              args.web_debug, togui_rx, fromgui_tx);
     Ok(())
+}
+
+/// Determines the log message for the mainloop thread's own exit
+/// (whichever of the three ways it happened) -- extracted as its own
+/// pure function specifically so this can be unit-tested directly,
+/// without needing to actually spawn a thread or call
+/// std::process::exit (which would kill the test runner itself).
+fn mainloop_exit_message(result: &std::thread::Result<anyhow::Result<()>>) -> String {
+    match result {
+        Ok(Ok(())) => "mainloop thread exited normally (unexpected -- it's designed \
+                       to run forever) -- exiting so systemd can restart cleanly".to_string(),
+        Ok(Err(e)) => format!("mainloop thread exited with an error: {e:#} -- \
+                               exiting so systemd can restart cleanly"),
+        Err(_) => "mainloop thread panicked -- exiting so systemd can restart \
+                   cleanly".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod mainloop_exit_message_tests {
+    use super::mainloop_exit_message;
+
+    #[test]
+    fn describes_a_panic_distinctly() {
+        let result: std::thread::Result<anyhow::Result<()>> = Err(Box::new("boom"));
+        let msg = mainloop_exit_message(&result);
+        assert!(msg.contains("panicked"), "got: {msg}");
+    }
+
+    #[test]
+    fn describes_an_error_return_with_its_own_message() {
+        let result: std::thread::Result<anyhow::Result<()>> =
+            Ok(Err(anyhow::anyhow!("network is unreachable")));
+        let msg = mainloop_exit_message(&result);
+        assert!(msg.contains("network is unreachable"),
+                "the underlying error's own message must be included -- got: {msg}");
+        assert!(!msg.contains("panicked"));
+    }
+
+    #[test]
+    fn describes_an_unexpected_normal_return_distinctly() {
+        let result: std::thread::Result<anyhow::Result<()>> = Ok(Ok(()));
+        let msg = mainloop_exit_message(&result);
+        assert!(msg.contains("unexpected"), "got: {msg}");
+        assert!(!msg.contains("panicked"));
+    }
 }
