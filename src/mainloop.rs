@@ -913,10 +913,21 @@ impl Handler {
                     _ => None,
                 };
                 log::info!("downloading required file {}/{}: {}", i+1, total, filedesc);
+                // Dependencies are excluded from the MediaInventory
+                // report below (not pushed to `result` at all) --
+                // unlike media/layout files, they have no single
+                // meaningful integer id to report (see ReqFile::
+                // Dependency's own doc comment), and the reference
+                // client doesn't appear to report on them via
+                // MediaInventory either. Reporting a synthetic
+                // placeholder id for every dependency downloaded in
+                // the same cycle would produce multiple identical,
+                // meaningless entries in that report.
+                let is_dependency = matches!(file, crate::resource::ReqFile::Dependency { .. });
                 match self.cache.download(file.clone(), &mut self.xmds)
                                 .with_context(|| format!("downloading {filedesc}"))
                 {
-                    Ok(()) => result.push((inventory, true)),
+                    Ok(()) => if !is_dependency { result.push((inventory, true)); },
                     Err(e) => {
                         log::error!("{e:#}");
                         if let Some(layout_id) = layout_id_if_any {
@@ -934,7 +945,7 @@ impl Handler {
                             self.resource_retry_queue.push((file, 0));
                             self.resource_retry_timer = after(RESOURCE_RETRY_DELAY);
                         }
-                        result.push((inventory, false));
+                        if !is_dependency { result.push((inventory, false)); }
                     }
                 }
             }

@@ -36,13 +36,27 @@ pub enum ReqFile {
         mediaid: i64,
         updated: i64,
     },
+    /// A player dependency (font, player bundle JS/CSS for Elements-
+    /// based widgets, etc.) -- a distinct variant, not reusing `File`,
+    /// because its id is a string (e.g. a font/bundle name), unlike
+    /// every other file type's integer id, and the CMS provides no
+    /// md5 to verify it against (see required_files's own parsing).
+    Dependency {
+        id: String,
+        file_type: String,
+        size: u64,
+        http: bool,
+        path: String,
+        name: String,
+    },
 }
 
 impl ReqFile {
     pub fn description(&self) -> String {
         match self {
             ReqFile::File { typ, name, .. } => format!("{typ} {name}"),
-            ReqFile::Resource { mediaid, .. } => format!("resource {mediaid}")
+            ReqFile::Resource { mediaid, .. } => format!("resource {mediaid}"),
+            ReqFile::Dependency { file_type, name, .. } => format!("dependency ({file_type}) {name}"),
         }
     }
 
@@ -50,6 +64,11 @@ impl ReqFile {
         match self {
             ReqFile::File { id, typ, .. } => (typ, *id),
             ReqFile::Resource { id, .. } => ("resource", *id),
+            // Dependencies have no integer id (see the variant's own
+            // doc comment) and aren't part of MediaInventory reporting
+            // in the reference client either -- 0 is a harmless
+            // placeholder, never actually looked up by this id.
+            ReqFile::Dependency { .. } => ("dependency", 0),
         }
     }
 }
@@ -82,6 +101,16 @@ pub struct MediaInfo {
     pub md5: Vec<u8>,
 }
 
+/// A cached player dependency (see ReqFile::Dependency's own doc
+/// comment for why this needs its own type -- a string id, and no
+/// md5 given by the CMS to verify against).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DependencyInfo {
+    pub id: String,
+    pub file_type: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResourceInfo {
     pub id: i64,
@@ -105,6 +134,7 @@ pub enum Resource {
     Layout(Arc<LayoutInfo>),
     Media(Arc<MediaInfo>),
     Resource(Arc<ResourceInfo>),
+    Dependency(Arc<DependencyInfo>),
 }
 
 
@@ -215,6 +245,12 @@ impl Cache {
                     self.get_media(name).is_some_and(|res| &res.md5 == md5)
                 }
             }
+            // The CMS gives no md5 to detect a changed dependency (see
+            // ReqFile::Dependency's own doc comment) -- once cached
+            // under this name, considered up to date until the CMS's
+            // own purge mechanism removes it from RequiredFiles/the
+            // purge list entirely.
+            ReqFile::Dependency { ref name, .. } => self.get_dependency(name).is_some(),
         }
     }
 
@@ -245,7 +281,7 @@ impl Cache {
             ReqFile::File { id, typ, http, size, md5, path, name, code } => {
                 let filename = self.dir.join(&name);
                 if http {
-                    match self.download_http(&path, &filename, &md5) {
+                    match self.download_http(&path, &filename, Some(&md5)) {
                         Ok(()) => {},
                         Err(e) => {
                             log::warn!("failing download of {name} over http, retrying \
@@ -284,17 +320,38 @@ impl Cache {
                 }
                 self.save()?;
             }
+            ReqFile::Dependency { id, file_type, size, http, path, name } => {
+                let filename = self.dir.join(&name);
+                if http {
+                    match self.download_http(&path, &filename, None) {
+                        Ok(()) => {},
+                        Err(e) => {
+                            log::warn!("failing download of dependency {name} over http, \
+                                        retrying xmds: {e:#}");
+                            Self::download_dependency_xmds(&id, &file_type, size, cms, &filename)?;
+                        }
+                    }
+                } else {
+                    Self::download_dependency_xmds(&id, &file_type, size, cms, &filename)?;
+                }
+                self.content.insert(name, Resource::Dependency(Arc::new(
+                    DependencyInfo { id, file_type, size }
+                )));
+                self.save()?;
+            }
         }
         Ok(())
     }
 
     fn download_http(&mut self, path: &str, filename: &PathBuf,
-                     md5: &[u8]) -> Result<()> {
+                     md5: Option<&[u8]>) -> Result<()> {
         let body = self.agent.get(path).call()?.into_body();
         let file = io::BufWriter::new(fs::File::create(filename)?);
         let mut wrapper = HashingWriter::new(file);
         io::copy(&mut body.into_reader(), &mut wrapper)?;
-        ensure!(wrapper.hash() == md5, "md5 mismatch");
+        if let Some(md5) = md5 {
+            ensure!(wrapper.hash() == md5, "md5 mismatch");
+        }
         Ok(())
     }
 
@@ -311,6 +368,26 @@ impl Cache {
             wrapper.write_all(&chunk)?;
         }
         ensure!(wrapper.hash() == md5, "md5 mismatch");
+        Ok(())
+    }
+
+    /// Same chunked-download loop as `download_xmds`, but for a
+    /// dependency's own string id (see ReqFile::Dependency's own doc
+    /// comment) via GetDependency instead of GetFile -- and no md5 to
+    /// verify against, since the CMS doesn't provide one for this file
+    /// type (confirmed via the real reference client source).
+    fn download_dependency_xmds(id: &str, file_type: &str, size: u64, cms: &mut xmds::Cms,
+                                filename: &PathBuf) -> Result<()> {
+        const CHUNK_SIZE: u64 = 1024 * 1024;
+        let mut got_size = 0;
+        let file = io::BufWriter::new(fs::File::create(filename)?);
+        let mut writer = file;
+        while got_size < size {
+            let next_size = (size - got_size).min(CHUNK_SIZE);
+            let chunk = cms.get_dependency_data(id, file_type, got_size, next_size)?;
+            got_size += chunk.len() as u64;
+            writer.write_all(&chunk)?;
+        }
         Ok(())
     }
 
@@ -341,6 +418,13 @@ impl Cache {
     fn get_media(&self, name: &str) -> Option<Arc<MediaInfo>> {
         self.content.get(name).and_then(|entry| match entry {
             Resource::Media(media) => Some(media.clone()),
+            _ => None
+        })
+    }
+
+    fn get_dependency(&self, name: &str) -> Option<Arc<DependencyInfo>> {
+        self.content.get(name).and_then(|entry| match entry {
+            Resource::Dependency(dep) => Some(dep.clone()),
             _ => None
         })
     }
@@ -757,5 +841,86 @@ mod nested_widget_fallback_tests {
         let cache = make_cache_with_resource(html, 3261);
         assert_eq!(cache.find_nested_widget_resource(3262), None);
         assert_eq!(cache.find_nested_widget_resource(3261), Some((3261, 749, 3630, 3261, 12345)));
+    }
+}
+
+#[cfg(test)]
+mod dependency_download_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn make_cache() -> (Cache, std::path::PathBuf) {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("arexibo_dependency_test_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cms = CmsSettings {
+            address: "https://example.com".into(),
+            key: "k".into(),
+            display_id: "d".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let cache = Cache::new(&cms, dir.clone(), false, true).unwrap();
+        (cache, dir)
+    }
+
+    /// Real mock XMDS server for the GetDependency chunked-download
+    /// path -- same real-response-format approach as xmds.rs's own
+    /// tests, not a shortcut that bypasses the real SOAP parsing.
+    fn make_cms_with_mock_getdependency(response_bytes: &'static [u8]) -> xmds::Cms {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                use base64::Engine as _;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(response_bytes);
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><GetDependencyResponse><file>{encoded}</file></GetDependencyResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let cms_settings = CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "k".into(), display_id: "d".into(), display_name: None, proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_dependency_xmds_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&xml_dir).unwrap();
+        xmds::Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn has_is_false_before_download_and_true_after() {
+        // The CMS gives no md5 for a dependency (see ReqFile::
+        // Dependency's own doc comment) -- once cached under its name,
+        // it must be considered up to date, not re-downloaded every
+        // cycle.
+        let (mut cache, _dir) = make_cache();
+        let req = ReqFile::Dependency {
+            id: "roboto-regular.ttf".to_string(), file_type: "font".to_string(),
+            size: 12, http: false, path: String::new(), name: "roboto-regular.ttf".to_string(),
+        };
+        assert!(!cache.has(&req), "must not be considered cached before any download");
+        let mut cms = make_cms_with_mock_getdependency(b"font bytes!!");
+        cache.download(req.clone(), &mut cms).unwrap();
+        assert!(cache.has(&req), "must be considered cached after a successful download");
+    }
+
+    #[test]
+    fn downloads_via_xmds_getdependency_and_writes_the_correct_file() {
+        let (mut cache, dir) = make_cache();
+        let mut cms = make_cms_with_mock_getdependency(b"actual font file bytes");
+        let req = ReqFile::Dependency {
+            id: "roboto-regular.ttf".to_string(), file_type: "font".to_string(),
+            size: 22, http: false, path: String::new(), name: "roboto-regular.ttf".to_string(),
+        };
+        cache.download(req, &mut cms).unwrap();
+        let saved = fs::read(dir.join("roboto-regular.ttf")).unwrap();
+        assert_eq!(saved, b"actual font file bytes");
     }
 }

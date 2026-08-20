@@ -302,6 +302,20 @@ impl Cms {
                     mediaid: file.parse_attr("mediaid")?,
                     updated: file.parse_attr("updated")?,
                 });
+            } else if typ == "dependency" {
+                // Attributes confirmed via the real reference client
+                // source (xibo-dotnetclient's RequiredFiles.cs) -- id
+                // is a string (e.g. a font/bundle name), not an int
+                // like every other file type, and there is no md5 to
+                // verify against (unlike media/layout).
+                res.push(ReqFile::Dependency {
+                    id: file.parse_attr("id")?,
+                    file_type: file.parse_attr("fileType")?,
+                    size: file.parse_attr("size")?,
+                    http: file.get_attr("download").context("missing download")? == "http",
+                    path: file.parse_attr("path")?,
+                    name: file.parse_attr("saveAs")?,
+                });
             } else {
                 continue;
             }
@@ -340,6 +354,31 @@ impl Cms {
                 chuckSize: size as f64,
             }
         ).context("getting file data")?.file.0)
+    }
+
+    /// Gets a chunk of a player dependency (e.g. a font, or a player
+    /// bundle JS/CSS file used by Elements-based widgets) via the
+    /// GetDependency XMDS call -- distinct from GetFile: dependency
+    /// ids are strings (e.g. a bundle/font name), not integers, unlike
+    /// every other file type. Confirmed via the real reference client
+    /// source (xibo-dotnetclient's RequiredFiles.cs) and the real v7
+    /// WSDL, neither of which arexibo previously implemented at all --
+    /// any RequiredFiles entry with type="dependency" was silently
+    /// skipped entirely (see required_files's own handling), so any
+    /// widget relying on a player-delivered dependency (fonts for
+    /// Elements-based Data Widgets, in particular) could never
+    /// actually get it.
+    pub fn get_dependency_data(&mut self, id: &str, ftype: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        Ok(self.service.GetDependency(
+            soap::GetDependencyRequest {
+                serverKey: &self.cms_key,
+                hardwareKey: &self.hw_key,
+                fileType: ftype,
+                id,
+                chunkOffset: offset as f64,
+                chunkSize: size as f64,
+            }
+        ).context("getting dependency data")?.file.0)
     }
 
     pub fn get_resource(&mut self, layout: i64, region: &str, media: &str) -> Result<String> {
@@ -715,5 +754,168 @@ mod default_ws_address_fallback_tests {
         assert_eq!(settings.xmr_web_socket_address_in_use, "",
                    "must stay empty for xmrType=zmq, regardless of the derived default \
                     being available");
+    }
+}
+
+#[cfg(test)]
+mod required_files_dependency_tests {
+    use super::*;
+
+    /// Mock XMDS server: responds to every request with the given
+    /// RequiredFilesXml body -- Cms::new() itself makes no network
+    /// call (unlike mainloop::Handler::new()), so the first request
+    /// this test's own required_files() call makes is already the
+    /// RequiredFiles one.
+    fn start_mock(required_files_xml: &'static str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = required_files_xml.replace('&', "&amp;").replace('<', "&lt;")
+                                                 .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RequiredFilesResponse><RequiredFilesXml>{escaped}</RequiredFilesXml></RequiredFilesResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_dependency_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn a_dependency_entry_is_parsed_not_silently_skipped() {
+        // Regression test: previously, any RequiredFiles <file> entry
+        // with a type other than media/layout/resource was silently
+        // discarded via `continue` -- confirmed via the real reference
+        // client source (xibo-dotnetclient's RequiredFiles.cs) that
+        // "dependency" is a real, distinct file type the CMS sends,
+        // with its own attribute set (id as a string, fileType as an
+        // inner sub-type, no md5).
+        let xml = r#"<files>
+            <file type="dependency" id="roboto-regular.ttf" fileType="font"
+                  size="12345" download="xmds" path="/fonts/roboto-regular.ttf"
+                  saveAs="roboto-regular.ttf"/>
+        </files>"#;
+        let port = start_mock(xml);
+        let mut cms = test_cms(port);
+        let (files, _purge) = cms.required_files().unwrap();
+        assert_eq!(files.len(), 1, "the dependency entry must not be silently skipped");
+        match &files[0] {
+            ReqFile::Dependency { id, file_type, size, http, path, name } => {
+                assert_eq!(id, "roboto-regular.ttf");
+                assert_eq!(file_type, "font");
+                assert_eq!(*size, 12345);
+                assert!(!http);
+                assert_eq!(path, "/fonts/roboto-regular.ttf");
+                assert_eq!(name, "roboto-regular.ttf");
+            }
+            other => panic!("expected ReqFile::Dependency, got a different variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dependency_entry_over_http_is_parsed_correctly() {
+        let xml = r#"<files>
+            <file type="dependency" id="player-bundle.js" fileType="playerBundle"
+                  size="999" download="http" path="https://cms.example/bundle.js"
+                  saveAs="player-bundle.js"/>
+        </files>"#;
+        let port = start_mock(xml);
+        let mut cms = test_cms(port);
+        let (files, _purge) = cms.required_files().unwrap();
+        assert_eq!(files.len(), 1);
+        match &files[0] {
+            ReqFile::Dependency { http, path, .. } => {
+                assert!(*http, "download=\"http\" must be parsed as the http download path");
+                assert_eq!(path, "https://cms.example/bundle.js");
+            }
+            other => panic!("expected ReqFile::Dependency, got a different variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn media_and_dependency_entries_coexist_correctly() {
+        // Guards against a regression that would misclassify one type
+        // as the other, or lose one of them, when both appear together
+        // (the realistic case -- a Data Widget's own media alongside
+        // its font dependency).
+        let xml = r#"<files>
+            <file type="media" id="42" size="100" md5="d41d8cd98f00b204e9800998ecf8427e"
+                  download="xmds" path="" saveAs="42.jpg"/>
+            <file type="dependency" id="roboto-regular.ttf" fileType="font"
+                  size="12345" download="xmds" path="/fonts/roboto-regular.ttf"
+                  saveAs="roboto-regular.ttf"/>
+        </files>"#;
+        let port = start_mock(xml);
+        let mut cms = test_cms(port);
+        let (files, _purge) = cms.required_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(matches!(&files[0], ReqFile::File { typ: "media", .. }));
+        assert!(matches!(&files[1], ReqFile::Dependency { .. }));
+    }
+}
+
+#[cfg(test)]
+mod get_dependency_data_tests {
+    use super::*;
+
+    fn start_mock(response_bytes: &'static [u8]) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                use base64::Engine as _;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(response_bytes);
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><GetDependencyResponse><file>{encoded}</file></GetDependencyResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_getdep_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn fetches_a_dependency_chunk_by_its_string_id() {
+        // Confirms the actual SOAP round-trip works end-to-end
+        // (request built correctly, response parsed correctly) for a
+        // real, non-numeric dependency id -- not just that the WSDL
+        // compiles.
+        let port = start_mock(b"font file bytes here");
+        let mut cms = test_cms(port);
+        let data = cms.get_dependency_data("roboto-regular.ttf", "font", 0, 1024).unwrap();
+        assert_eq!(data, b"font file bytes here");
     }
 }
