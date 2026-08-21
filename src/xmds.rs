@@ -288,6 +288,12 @@ impl Cms {
                 // RegisterDisplay response -- see the field's own doc
                 // comment in config.rs for the full mechanism.
                 screen_shot_requested: tree.def_child::<i32>("screenShotRequested", 0)? != 0,
+                // Confirmed real element names from an actual
+                // RegisterDisplay response (both empty when no
+                // migration is pending) -- see the fields' own doc
+                // comment in config.rs.
+                new_cms_address: tree.def_child::<String>("newCmsAddress", String::new())?,
+                new_cms_key: tree.def_child::<String>("newCmsKey", String::new())?,
                 // embeddedServerPort from the CMS is effectively
                 // vestigial regardless -- main.rs immediately overwrites
                 // it with whatever port we actually bound locally

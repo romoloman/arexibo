@@ -109,6 +109,16 @@ pub struct PlayerSettings {
     // fulfilled instead of being silently dropped.
     #[serde(default)]
     pub screen_shot_requested: bool,
+    // Confirmed real fields (newCmsAddress/newCmsKey) -- a CMS-driven
+    // migration mechanism: when both are non-empty, the CMS wants this
+    // display to switch to a different CMS server. See
+    // mainloop::attempt_cms_migration for the full, deliberately
+    // cautious handling (this is a genuinely risky operation -- a
+    // totem could become unreachable if handled carelessly).
+    #[serde(default)]
+    pub new_cms_address: String,
+    #[serde(default)]
+    pub new_cms_key: String,
     #[serde(default = "default_embedded_server_port")]
     pub embedded_server_port: u16,
     #[serde(default)]
@@ -179,6 +189,8 @@ impl fmt::Debug for PlayerSettings {
             .field("display_time_zone", &self.display_time_zone)
             .field("expire_modified_layouts", &self.expire_modified_layouts)
             .field("screen_shot_requested", &self.screen_shot_requested)
+            .field("new_cms_address", &self.new_cms_address)
+            .field("new_cms_key", &self.new_cms_key)
             .field("embedded_server_port", &self.embedded_server_port)
             .field("prevent_sleep", &self.prevent_sleep)
             .field("display_name", &self.display_name)
@@ -487,7 +499,8 @@ mod tests {
             "xmr_cms_key", "log_level", "screenshot_interval", "screenshot_size",
             "send_current_layout_as_status_update", "is_adspace_enabled",
             "download_start_window", "download_end_window", "display_time_zone",
-            "expire_modified_layouts", "screen_shot_requested", "embedded_server_port",
+            "expire_modified_layouts", "screen_shot_requested", "new_cms_address",
+            "new_cms_key", "embedded_server_port",
             "prevent_sleep", "display_name", "size_x", "size_y", "pos_x", "pos_y",
             "commands", "enable_shell_commands", "shell_command_allow_list",
         ] {

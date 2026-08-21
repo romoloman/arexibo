@@ -1418,9 +1418,141 @@ impl Handler {
             self.screenshot_requested_seen = false;
         }
 
+        // CMS-driven migration to a different server (see
+        // new_cms_address/new_cms_key's own doc comment in config.rs)
+        // -- deliberately cautious given how risky getting this wrong
+        // would be (a totem could become unreachable). Only attempted
+        // here, at the very end, after every other settings-derived
+        // action above -- if this succeeds it exits the process.
+        self.attempt_cms_migration();
+
         // let the GUI know to reconfigure itself
         self.to_gui.send(ToGui::Settings(Box::new(self.settings.clone()))).unwrap();
     }
+
+    /// Attempts a CMS migration if the CMS has told us to (see
+    /// new_cms_address/new_cms_key's own doc comment in config.rs).
+    /// Validates the new CMS *before* committing anything -- a genuine
+    /// SOAP-level success (READY *or* WAITING; a freshly-migrated
+    /// display is very likely not yet authorized on the new CMS, and
+    /// that alone must not be treated as a validation failure) confirms
+    /// the new server is reachable and accepts this display's own
+    /// identity, before any files on disk change. Does nothing at all
+    /// (not even a log entry) if no migration is currently requested.
+    fn attempt_cms_migration(&mut self) {
+        if !should_attempt_cms_migration(&self.settings.new_cms_address, &self.settings.new_cms_key) {
+            return;
+        }
+
+        log::info!("CMS requested migration to a new server ({}) -- validating before \
+                    committing anything", self.settings.new_cms_address);
+
+        let candidate = CmsSettings {
+            address: self.settings.new_cms_address.clone(),
+            key: self.settings.new_cms_key.clone(),
+            // Same physical device migrating, not a fresh one -- keep
+            // its own stable identity (see CmsSettings's own field,
+            // used to derive hw_key in xmds::Cms::new) so the new
+            // CMS's admin sees the same hardware key to recognize and
+            // authorize, and carry over the other non-identity-
+            // affecting settings too.
+            display_id: self.cms.display_id.clone(),
+            display_name: self.cms.display_name.clone(),
+            proxy: self.cms.proxy.clone(),
+        };
+
+        let pub_key = match RsaPublicKey::from(&self.xmr_privkey).to_public_key_pem(Default::default()) {
+            Ok(k) => k,
+            Err(e) => {
+                log::error!("deriving public key for CMS migration validation, NOT \
+                             migrating: {e:#}");
+                return;
+            }
+        };
+
+        match validate_new_cms(&candidate, pub_key, self.no_verify, self.envdir.join("xml")) {
+            Ok(()) => {
+                log::info!("new CMS accepted registration -- committing migration");
+                match commit_cms_migration(&self.envdir, &candidate) {
+                    Ok(()) => {
+                        log::error!("CMS migration complete -- exiting so systemd restarts \
+                                     cleanly against the new CMS");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        log::error!("committing CMS migration (validation had already \
+                                     succeeded): {e:#} -- NOT exiting, will retry next cycle");
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("validating new CMS before migration, NOT migrating \
+                             (will retry next cycle): {e:#}");
+            }
+        }
+    }
+}
+
+/// Validates that a candidate new CMS is reachable and accepts this
+/// display's own registration -- extracted as its own free function
+/// (rather than inline in attempt_cms_migration) specifically so it
+/// can be unit-tested directly against a real mock server, without
+/// needing to go through the surrounding method that ends in
+/// std::process::exit() on success. Ok(Some(_)) (READY, already
+/// authorized) and Ok(None) (WAITING, not yet authorized) are both
+/// treated as a successful Ok(()) -- see attempt_cms_migration's own
+/// comment on why "not yet authorized" must not count as a validation
+/// failure (a freshly-migrated display is very likely not yet
+/// authorized on the new CMS, and that alone says nothing about
+/// whether the new CMS is reachable/correctly configured).
+fn validate_new_cms(candidate: &CmsSettings, pub_key: String, no_verify: bool,
+                     xml_dir: PathBuf) -> Result<()> {
+    let mut validation_cms = xmds::Cms::new(candidate, pub_key, no_verify, xml_dir)
+        .context("constructing validation client")?;
+    validation_cms.register_display().context("registering with the new CMS")?;
+    Ok(())
+}
+
+/// Whether a CMS migration should be attempted -- both a new address
+/// and a new key must be present (an empty value on either side means
+/// no migration is currently requested by the CMS).
+fn should_attempt_cms_migration(new_address: &str, new_key: &str) -> bool {
+    !new_address.is_empty() && !new_key.is_empty()
+}
+
+/// The actual, disk-mutating part of a CMS migration -- separated from
+/// attempt_cms_migration's own validation (network I/O against the new
+/// CMS) and from the final process::exit() so this specific part can
+/// be unit-tested directly (constructing a real temp directory,
+/// checking the resulting files) without needing a real network call
+/// or risking killing the test process. Only ever called *after* the
+/// new CMS has already been validated as reachable and accepting.
+fn commit_cms_migration(envdir: &Path, new_cms: &CmsSettings) -> Result<()> {
+    let cms_path = envdir.join("cms.json");
+    let backup_path = envdir.join("cms.json.bak");
+    // A failed backup is logged but doesn't abort an otherwise-valid
+    // migration -- losing the ability to manually inspect the old
+    // settings later is a lesser problem than failing to migrate at
+    // all after the new CMS has already confirmed it will accept us.
+    if let Err(e) = fs::copy(&cms_path, &backup_path) {
+        log::warn!("backing up cms.json before CMS migration: {e:#}");
+    }
+    new_cms.to_file(&cms_path).context("writing new cms.json")?;
+
+    // Stale cache (layouts/media/resources) from the *old* CMS is at
+    // best irrelevant and at worst actively misleading against a
+    // different CMS (e.g. the same numeric layout id could mean
+    // something completely different there) -- same clearing
+    // mechanism already used for the existing --clear-cache flag (see
+    // Cache::new's own `clear` parameter), just triggered here instead
+    // of via a CLI flag on next start.
+    let cache_dir = envdir.join("res");
+    if cache_dir.is_dir() {
+        if let Err(e) = fs::remove_dir_all(&cache_dir) {
+            log::warn!("clearing cache after CMS migration: {e:#}");
+        }
+    }
+    Ok(())
 }
 
 
@@ -2920,5 +3052,158 @@ mod screenshot_requested_tests {
         handler.update_settings();
         assert_eq!(count_screenshot_messages(&togui_rx), 1,
                    "a new request (flag re-transitioning false -> true) must fire again");
+    }
+}
+
+#[cfg(test)]
+mod should_attempt_cms_migration_tests {
+    use super::*;
+
+    #[test]
+    fn requires_both_address_and_key() {
+        assert!(should_attempt_cms_migration("https://new.example.com", "newkey"));
+        assert!(!should_attempt_cms_migration("", "newkey"), "address missing");
+        assert!(!should_attempt_cms_migration("https://new.example.com", ""), "key missing");
+        assert!(!should_attempt_cms_migration("", ""), "neither present -- the common case");
+    }
+}
+
+#[cfg(test)]
+mod commit_cms_migration_tests {
+    use super::*;
+
+    fn test_envdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_cms_migration_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn old_cms() -> CmsSettings {
+        CmsSettings { address: "https://old.example.com".into(), key: "oldkey".into(),
+                      display_id: "stable-hw-id-123".into(), display_name: None, proxy: None }
+    }
+
+    #[test]
+    fn writes_the_new_settings_and_backs_up_the_old_ones() {
+        let envdir = test_envdir();
+        old_cms().to_file(envdir.join("cms.json")).unwrap();
+
+        let new_cms = CmsSettings { address: "https://new.example.com".into(), key: "newkey".into(),
+                                     display_id: "stable-hw-id-123".into(), display_name: None,
+                                     proxy: None };
+        commit_cms_migration(&envdir, &new_cms).unwrap();
+
+        let written = CmsSettings::from_file(envdir.join("cms.json")).unwrap();
+        assert_eq!(written.address, "https://new.example.com");
+        assert_eq!(written.key, "newkey");
+        assert_eq!(written.display_id, "stable-hw-id-123",
+                   "the stable hardware identity must be preserved, not the old CMS's own value");
+
+        let backed_up = CmsSettings::from_file(envdir.join("cms.json.bak")).unwrap();
+        assert_eq!(backed_up.address, "https://old.example.com",
+                   "the old settings must be backed up before being overwritten");
+    }
+
+    #[test]
+    fn clears_the_cache_directory_if_it_exists() {
+        let envdir = test_envdir();
+        old_cms().to_file(envdir.join("cms.json")).unwrap();
+        let cache_dir = envdir.join("res");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("stale_layout.xlf.html"), b"old cms content").unwrap();
+
+        let new_cms = CmsSettings { address: "https://new.example.com".into(), key: "newkey".into(),
+                                     display_id: "stable-hw-id-123".into(), display_name: None,
+                                     proxy: None };
+        commit_cms_migration(&envdir, &new_cms).unwrap();
+
+        assert!(!cache_dir.join("stale_layout.xlf.html").exists(),
+                "stale cache from the old CMS must be cleared -- it's at best irrelevant and \
+                 at worst actively misleading against a different CMS");
+    }
+
+    #[test]
+    fn succeeds_even_without_a_pre_existing_cache_directory() {
+        // A totem that has never actually downloaded anything yet (or
+        // one where "res" was already removed for some other reason)
+        // must not fail the migration just because there's nothing to
+        // clear.
+        let envdir = test_envdir();
+        old_cms().to_file(envdir.join("cms.json")).unwrap();
+        let new_cms = CmsSettings { address: "https://new.example.com".into(), key: "newkey".into(),
+                                     display_id: "stable-hw-id-123".into(), display_name: None,
+                                     proxy: None };
+        assert!(commit_cms_migration(&envdir, &new_cms).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod validate_new_cms_tests {
+    use super::*;
+
+    fn start_mock(activation_body: &'static str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = activation_body.replace('&', "&amp;").replace('<', "&lt;")
+                                              .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_xml_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_validate_cms_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_ready_response_is_a_successful_validation() {
+        let port = start_mock(r#"<ActivationMessage code="READY"/>"#);
+        let candidate = CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "k".into(),
+                                       display_id: "d".into(), display_name: None, proxy: None };
+        assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_ok());
+    }
+
+    #[test]
+    fn a_waiting_not_yet_authorized_response_is_also_a_successful_validation() {
+        // The exact scenario flagged directly: a freshly-migrated
+        // display is very likely not yet authorized on the new CMS --
+        // that alone must not block the migration, since it says
+        // nothing about whether the new CMS is reachable/correctly
+        // configured. Matches the same "not an error, just not ready
+        // yet" reasoning pending_auth already uses elsewhere.
+        let port = start_mock(r#"<ActivationMessage code="WAITING"/>"#);
+        let candidate = CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "k".into(),
+                                       display_id: "d".into(), display_name: None, proxy: None };
+        assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_ok(),
+                "WAITING (not yet authorized) must count as a successful validation, not a failure");
+    }
+
+    #[test]
+    fn an_unreachable_server_fails_validation() {
+        // A genuinely unreachable address (nothing listening) --
+        // simulates the new CMS being misconfigured/down, which must
+        // block the migration.
+        let unreachable_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let candidate = CmsSettings { address: format!("http://127.0.0.1:{unreachable_port}"),
+                                       key: "k".into(), display_id: "d".into(), display_name: None,
+                                       proxy: None };
+        assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_err(),
+                "an unreachable new CMS must fail validation, not be silently treated as OK");
     }
 }
