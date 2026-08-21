@@ -276,6 +276,10 @@ impl Cms {
                                                                   String::new())?,
                 download_end_window: tree.def_child::<String>("downloadEndWindow",
                                                                 String::new())?,
+                // Confirmed real element name and format from an actual
+                // RegisterDisplay response ("Europe/Rome") -- see the
+                // field's own doc comment in config.rs.
+                display_time_zone: tree.def_child::<String>("displayTimeZone", String::new())?,
                 // embeddedServerPort from the CMS is effectively
                 // vestigial regardless -- main.rs immediately overwrites
                 // it with whatever port we actually bound locally

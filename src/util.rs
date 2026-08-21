@@ -207,6 +207,18 @@ pub fn json_value_to_criteria_string(value: &serde_json::Value) -> String {
     }
 }
 
+/// Reads the system's own configured IANA timezone name (e.g.
+/// "Europe/Rome") from `/etc/timezone` -- the standard Debian/Ubuntu
+/// mechanism, matching this player's own target deployment. Returns
+/// None if the file is missing/unreadable (e.g. a non-Debian system,
+/// or a container without it set up) -- callers should treat this as
+/// "can't verify", not "mismatch".
+pub fn read_system_timezone() -> Option<String> {
+    std::fs::read_to_string("/etc/timezone").ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 
 const SS_SVC: &str   = "org.freedesktop.ScreenSaver";
 const SS_PATH: &str  = "/ScreenSaver";

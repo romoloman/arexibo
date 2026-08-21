@@ -73,6 +73,18 @@ pub struct PlayerSettings {
     pub download_start_window: String,
     #[serde(default)]
     pub download_end_window: String,
+    // The IANA timezone name the CMS's own Display record says this
+    // display should be in (e.g. "Europe/Rome") -- confirmed real
+    // field from an actual RegisterDisplay response. Applied directly
+    // as this process's own TZ environment variable (see
+    // mainloop::apply_process_timezone) so schedules/download windows
+    // are evaluated against what the CMS says this display should be
+    // in, without touching this machine's own system-wide timezone --
+    // self-correcting rather than merely warning, even on a
+    // misconfigured installation (wrong system timezone despite the
+    // autoinstall image intending to force it).
+    #[serde(default)]
+    pub display_time_zone: String,
     #[serde(default = "default_embedded_server_port")]
     pub embedded_server_port: u16,
     #[serde(default)]
@@ -140,6 +152,7 @@ impl fmt::Debug for PlayerSettings {
             .field("is_adspace_enabled", &self.is_adspace_enabled)
             .field("download_start_window", &self.download_start_window)
             .field("download_end_window", &self.download_end_window)
+            .field("display_time_zone", &self.display_time_zone)
             .field("embedded_server_port", &self.embedded_server_port)
             .field("prevent_sleep", &self.prevent_sleep)
             .field("display_name", &self.display_name)
@@ -447,7 +460,8 @@ mod tests {
             "xmr_web_socket_address", "xmr_web_socket_address_in_use",
             "xmr_cms_key", "log_level", "screenshot_interval", "screenshot_size",
             "send_current_layout_as_status_update", "is_adspace_enabled",
-            "download_start_window", "download_end_window", "embedded_server_port",
+            "download_start_window", "download_end_window", "display_time_zone",
+            "embedded_server_port",
             "prevent_sleep", "display_name", "size_x", "size_y", "pos_x", "pos_y",
             "commands", "enable_shell_commands", "shell_command_allow_list",
         ] {

@@ -178,6 +178,16 @@ pub struct Handler {
     /// warning about indefinitely. Once set, collect_once() skips the
     /// call entirely instead of repeating the same failed attempt.
     weather_unsupported: bool,
+    /// The display_time_zone value actually applied to this process's
+    /// own TZ environment variable so far this run (see
+    /// apply_process_timezone's own doc comment) -- None until the
+    /// first successful registration provides one. Tracked so a LATER
+    /// change to the CMS's own setting is detected and reported (a
+    /// restart is required to pick it up) rather than either silently
+    /// ignored, or unsafely re-applied from update_settings()'s own
+    /// later, multi-threaded calls (collect_once() runs on a separate
+    /// thread from the one that first constructed this Handler).
+    process_timezone_applied: Option<String>,
     /// Timer for hiding/advancing the currently-shown overlay. Moved
     /// here (was local to `run()`) since `schedule_check()` needs to
     /// (re)schedule it too, not just XMR's `overlayLayout` handling.
@@ -351,6 +361,7 @@ impl Handler {
                                  pending_auth: false,
                                  pending_network: false,
                                  weather_unsupported: false,
+                                 process_timezone_applied: None,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
@@ -390,6 +401,7 @@ impl Handler {
                                  pending_auth: !network_pending,
                                  pending_network: network_pending,
                                  weather_unsupported: false,
+                                 process_timezone_applied: None,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
                                  cms: cms.clone(), no_verify };
@@ -1294,6 +1306,29 @@ impl Handler {
         // field name found, optional in the bid request anyway.
         self.cache.adspace_enabled = self.settings.is_adspace_enabled;
 
+        // Applies the CMS's own display_time_zone as *this process's*
+        // local timezone (see apply_process_timezone's own doc comment
+        // for why, and why only once per run) rather than merely
+        // warning about a mismatch with the system's -- a warning
+        // requires someone to notice it in the logs; actively using
+        // the CMS-specified timezone for our own schedule/download-
+        // window evaluations means arexibo behaves correctly even on
+        // a misconfigured installation, self-correcting instead of
+        // just alerting.
+        match decide_timezone_action(&self.process_timezone_applied, &self.settings.display_time_zone) {
+            TimezoneAction::DoNothing => {}
+            TimezoneAction::Apply(tz) => {
+                apply_process_timezone(&tz);
+                self.process_timezone_applied = Some(tz);
+            }
+            TimezoneAction::WarnRestartNeeded { was, now } => {
+                log::warn!("the CMS's own display timezone changed from {was:?} to {now:?} \
+                            since this process started -- a restart is required to pick up \
+                            the change (changing a process's own timezone mid-session, from \
+                            a background thread, isn't safe to do here)");
+            }
+        }
+
         // let the GUI know to reconfigure itself
         self.to_gui.send(ToGui::Settings(Box::new(self.settings.clone()))).unwrap();
     }
@@ -1378,6 +1413,105 @@ fn apply_weather_criteria(criteria: &mut CriteriaStore, json: &str, ttl: i64) ->
 /// GetWeather.
 fn is_method_not_present_fault(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("not present")
+}
+
+// POSIX's own tzset(3) -- glibc does NOT re-parse the TZ environment
+// variable just because it changed; without calling this explicitly
+// after std::env::set_var("TZ", ...), time::OffsetDateTime::now_local()
+// keeps returning the offset it had before the change. Verified
+// experimentally (a standalone check, not just reasoning from docs):
+// without this call, three different TZ values in a row all produced
+// the same, unchanged +00:00:00 offset -- setting TZ alone silently
+// had no effect at all. A single extern "C" declaration for one POSIX
+// function, rather than pulling in the whole `libc` crate as a new
+// dependency just for this.
+extern "C" {
+    fn tzset();
+}
+
+/// Sets *this process's own* TZ environment variable to the CMS's
+/// display_time_zone (e.g. "Europe/Rome") -- so `arexibo`'s own
+/// schedule/download-window evaluations (which read
+/// time::OffsetDateTime::now_local(), itself respecting TZ) use the
+/// CMS-specified timezone directly, without needing to touch this
+/// machine's own system-wide /etc/localtime or /etc/timezone, and
+/// without affecting any other process on the same machine. This is
+/// the standard POSIX mechanism for "override one process's own idea
+/// of local time" -- setting TZ does not change the system timezone.
+///
+/// Self-correcting rather than merely alerting: even a totem whose
+/// system timezone ended up wrong (despite an autoinstall image
+/// intending to force it -- manual setup, hardware clock issue, human
+/// error) still evaluates schedules/download windows correctly, using
+/// what the CMS's own Display record says this display should be in,
+/// rather than requiring someone to notice a warning in the logs and
+/// go fix the system's own configuration.
+///
+/// SAFETY-ADJACENT: only call this once, very early, before any other
+/// thread has been spawned (main.rs's own Handler::new() call, before
+/// its own `std::thread::spawn` and before gui::run()) -- mutating
+/// process environment variables concurrently with another thread
+/// reading them is a real, platform-level hazard regardless of
+/// whether a given Rust toolchain's std::env::set_var happens to
+/// require an `unsafe` block or not (this crate's own `time`
+/// dependency gates its equivalent functionality behind an opt-in
+/// "local-offset" feature for exactly this reason). See
+/// process_timezone_applied's own doc comment for how the *caller*
+/// (update_settings) avoids ever calling this again from a later,
+/// multi-threaded context.
+fn apply_process_timezone(tz: &str) {
+    match util::read_system_timezone() {
+        Some(sys_tz) if sys_tz != tz => log::info!(
+            "using {tz:?} as this process's own timezone (from the CMS's own \
+             display_time_zone setting) -- note this machine's own system timezone \
+             is {sys_tz:?}, only this process's own idea of local time is affected"),
+        _ => log::info!("using {tz:?} as this process's own timezone (from the CMS's \
+                          own display_time_zone setting)"),
+    }
+    std::env::set_var("TZ", tz);
+    // SAFETY: tzset() only reads the TZ environment variable and
+    // updates process-global libc state describing the current
+    // timezone rules -- it does not take/return pointers we own, and
+    // is safe to call from a single thread (see apply_process_timezone's
+    // own SAFETY-ADJACENT doc comment for why this whole function is
+    // only ever called once, early, before any other thread exists).
+    unsafe { tzset(); }
+}
+
+/// What update_settings should do about the CMS's own display_time_zone,
+/// given what (if anything) has already been applied this run -- see
+/// apply_process_timezone's own doc comment for the full context.
+/// Extracted as its own pure decision (computed, not acted upon) so it
+/// can be unit-tested directly without mutating this whole test
+/// binary's own real TZ environment variable, which is process-global
+/// and would risk flaky interference with any other test that also
+/// happens to read it.
+#[derive(Debug, PartialEq, Eq)]
+enum TimezoneAction {
+    /// Nothing to do -- either the CMS didn't send one, or it matches
+    /// what's already applied.
+    DoNothing,
+    /// Not yet applied this run -- safe to apply now (only ever
+    /// reached from the single-threaded window at startup, see
+    /// apply_process_timezone's own SAFETY-ADJACENT note).
+    Apply(String),
+    /// Already applied a *different* value this run -- changing it
+    /// again from here would be from a later, potentially
+    /// multi-threaded context, so report instead of acting.
+    WarnRestartNeeded { was: String, now: String },
+}
+
+fn decide_timezone_action(applied: &Option<String>, cms_tz: &str) -> TimezoneAction {
+    if cms_tz.is_empty() {
+        return TimezoneAction::DoNothing;
+    }
+    match applied {
+        None => TimezoneAction::Apply(cms_tz.to_string()),
+        Some(applied) if applied == cms_tz => TimezoneAction::DoNothing,
+        Some(applied) => TimezoneAction::WarnRestartNeeded {
+            was: applied.clone(), now: cms_tz.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -2350,5 +2484,78 @@ mod is_method_not_present_fault_tests {
         // normally, unlike a real method-not-present fault.
         let err = anyhow::anyhow!("getting weather: io: connection refused");
         assert!(!is_method_not_present_fault(&err));
+    }
+}
+
+#[cfg(test)]
+mod decide_timezone_action_tests {
+    use super::*;
+
+    #[test]
+    fn applies_on_first_registration() {
+        // The safe, single-threaded window at startup (see
+        // apply_process_timezone's own SAFETY-ADJACENT note) -- nothing
+        // applied yet this run, the CMS sent a real value.
+        assert_eq!(decide_timezone_action(&None, "Europe/Rome"),
+                   TimezoneAction::Apply("Europe/Rome".to_string()));
+    }
+
+    #[test]
+    fn does_nothing_once_already_applied_and_unchanged() {
+        assert_eq!(
+            decide_timezone_action(&Some("Europe/Rome".to_string()), "Europe/Rome"),
+            TimezoneAction::DoNothing);
+    }
+
+    #[test]
+    fn warns_instead_of_reapplying_when_the_cms_value_changes_later() {
+        // Must NOT call apply_process_timezone again here -- this path
+        // is reached from update_settings() being called repeatedly
+        // from collect_once(), which runs on a separate thread from
+        // the one that first constructed this Handler (see
+        // process_timezone_applied's own doc comment).
+        assert_eq!(
+            decide_timezone_action(&Some("Europe/Rome".to_string()), "America/New_York"),
+            TimezoneAction::WarnRestartNeeded {
+                was: "Europe/Rome".to_string(), now: "America/New_York".to_string(),
+            });
+    }
+
+    #[test]
+    fn does_nothing_when_the_cms_sends_nothing() {
+        // An empty value is "the CMS didn't send this field", not "the
+        // CMS wants an empty timezone" -- nothing to apply.
+        assert_eq!(decide_timezone_action(&None, ""), TimezoneAction::DoNothing);
+        assert_eq!(decide_timezone_action(&Some("Europe/Rome".to_string()), ""),
+                   TimezoneAction::DoNothing);
+    }
+}
+
+#[cfg(test)]
+mod apply_process_timezone_tests {
+    use super::*;
+
+    #[test]
+    fn genuinely_changes_this_processs_own_local_offset() {
+        // End-to-end check, not just the decision logic above --
+        // std::env::set_var("TZ", ...) alone was verified experimentally
+        // to have NO effect on time::OffsetDateTime::now_local() without
+        // also calling tzset() afterward (three different TZ values in
+        // a row all produced the same unchanged offset without it) --
+        // this test exists specifically to catch that exact class of
+        // regression, which a pure decision-logic test can't.
+        //
+        // NOTE: TZ is process-global process state; no other test in
+        // this codebase currently reads/sets it, so this is safe today,
+        // but a new test relying on a *specific* current offset without
+        // itself pinning TZ could flake if it happens to run
+        // concurrently with this one.
+        apply_process_timezone("Europe/Rome");
+        let offset = time::OffsetDateTime::now_local().unwrap().offset();
+        assert_eq!(offset.whole_hours(), 2, "August in Europe/Rome must be UTC+2 (CEST)");
+
+        apply_process_timezone("America/New_York");
+        let offset = time::OffsetDateTime::now_local().unwrap().offset();
+        assert_eq!(offset.whole_hours(), -4, "August in America/New_York must be UTC-4 (EDT)");
     }
 }
