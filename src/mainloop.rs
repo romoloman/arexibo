@@ -1418,6 +1418,12 @@ impl Handler {
             self.screenshot_requested_seen = false;
         }
 
+        // forceHttps (see that field's own doc comment in config.rs)
+        // -- same validate-before-committing caution as the CMS
+        // migration below, and reuses the same validate_new_cms
+        // helper. If this succeeds it exits the process too.
+        self.attempt_https_upgrade();
+
         // CMS-driven migration to a different server (see
         // new_cms_address/new_cms_key's own doc comment in config.rs)
         // -- deliberately cautious given how risky getting this wrong
@@ -1428,6 +1434,57 @@ impl Handler {
 
         // let the GUI know to reconfigure itself
         self.to_gui.send(ToGui::Settings(Box::new(self.settings.clone()))).unwrap();
+    }
+
+    /// Upgrades this display's own CMS address from http:// to https://
+    /// when the CMS says forceHttps is on -- see that field's own doc
+    /// comment in config.rs. Validates the https:// address actually
+    /// works first (reusing validate_new_cms, same reasoning as CMS
+    /// migration -- READY *or* WAITING both count as success), only
+    /// persisting and restarting on a confirmed-working upgrade. A
+    /// failed validation is logged and left alone (still working over
+    /// http, not broken) -- retried again next cycle for free, since
+    /// this naturally stops being attempted at all once the address is
+    /// already https://.
+    fn attempt_https_upgrade(&mut self) {
+        if !self.settings.force_https {
+            return;
+        }
+        let Some(https_address) = https_upgrade_address(&self.cms.address) else {
+            return; // already https://, or some other/unrecognized scheme
+        };
+
+        log::info!("CMS has forceHttps enabled and our own address ({}) is still http:// \
+                    -- validating the https:// equivalent before switching",
+                   self.cms.address);
+
+        let candidate = CmsSettings { address: https_address, ..self.cms.clone() };
+
+        let pub_key = match RsaPublicKey::from(&self.xmr_privkey).to_public_key_pem(Default::default()) {
+            Ok(k) => k,
+            Err(e) => {
+                log::error!("deriving public key for forceHttps validation, NOT \
+                             switching: {e:#}");
+                return;
+            }
+        };
+
+        match validate_new_cms(&candidate, pub_key, self.no_verify, self.envdir.join("xml")) {
+            Ok(()) => {
+                log::error!("https:// address confirmed working -- switching to it and \
+                             exiting so systemd restarts cleanly");
+                if let Err(e) = candidate.to_file(self.envdir.join("cms.json")) {
+                    log::error!("writing cms.json for forceHttps upgrade: {e:#} -- NOT \
+                                 exiting, will retry next cycle");
+                    return;
+                }
+                std::process::exit(1);
+            }
+            Err(e) => {
+                log::warn!("the https:// equivalent of our own CMS address didn't work, \
+                            staying on http:// for now (will retry next cycle): {e:#}");
+            }
+        }
     }
 
     /// Attempts a CMS migration if the CMS has told us to (see
@@ -1511,6 +1568,18 @@ fn validate_new_cms(candidate: &CmsSettings, pub_key: String, no_verify: bool,
         .context("constructing validation client")?;
     validation_cms.register_display().context("registering with the new CMS")?;
     Ok(())
+}
+
+/// Computes the https:// equivalent of `address` if it's currently
+/// http:// -- literal scheme swap only, keeping host/port/path exactly
+/// as configured (a deliberately simple interpretation of the real
+/// mechanism confirmed via a real Xibo project issue, xibo-linux#247:
+/// "swapped over to a HTTPS link" -- not attempting to guess a
+/// different default port). Returns None if `address` doesn't start
+/// with "http://" (already https://, or some other/unrecognized
+/// scheme) -- nothing to upgrade.
+fn https_upgrade_address(address: &str) -> Option<String> {
+    address.strip_prefix("http://").map(|rest| format!("https://{rest}"))
 }
 
 /// Whether a CMS migration should be attempted -- both a new address
@@ -3052,6 +3121,28 @@ mod screenshot_requested_tests {
         handler.update_settings();
         assert_eq!(count_screenshot_messages(&togui_rx), 1,
                    "a new request (flag re-transitioning false -> true) must fire again");
+    }
+}
+
+#[cfg(test)]
+mod https_upgrade_address_tests {
+    use super::*;
+
+    #[test]
+    fn swaps_http_to_https_keeping_everything_else() {
+        // Deliberately literal scheme swap only -- confirmed real
+        // mechanism (xibo-linux#247): "swapped over to a HTTPS link",
+        // not a different default port.
+        assert_eq!(https_upgrade_address("http://cms.example.com"),
+                   Some("https://cms.example.com".to_string()));
+        assert_eq!(https_upgrade_address("http://192.168.2.138:9092"),
+                   Some("https://192.168.2.138:9092".to_string()),
+                   "an explicit port must be kept exactly as configured");
+    }
+
+    #[test]
+    fn already_https_needs_no_upgrade() {
+        assert_eq!(https_upgrade_address("https://cms.example.com"), None);
     }
 }
 

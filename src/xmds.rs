@@ -294,6 +294,9 @@ impl Cms {
                 // comment in config.rs.
                 new_cms_address: tree.def_child::<String>("newCmsAddress", String::new())?,
                 new_cms_key: tree.def_child::<String>("newCmsKey", String::new())?,
+                // Confirmed real element name from an actual
+                // RegisterDisplay response.
+                force_https: tree.def_child::<i32>("forceHttps", 0)? != 0,
                 // embeddedServerPort from the CMS is effectively
                 // vestigial regardless -- main.rs immediately overwrites
                 // it with whatever port we actually bound locally
