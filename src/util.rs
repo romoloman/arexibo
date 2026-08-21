@@ -193,6 +193,20 @@ pub fn get_local_ips() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Converts a JSON value to a plain string for Schedule Criteria (see
+/// xmds::Cms::get_weather's own doc comment) -- matching C#'s own
+/// `.ToString()` semantics for a JSON-deserialized value: a JSON
+/// string becomes its own unquoted content (not re-serialized with
+/// quotes), a number becomes its plain decimal representation, and
+/// anything else falls back to its normal JSON text form.
+pub fn json_value_to_criteria_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
 
 const SS_SVC: &str   = "org.freedesktop.ScreenSaver";
 const SS_PATH: &str  = "/ScreenSaver";
@@ -234,6 +248,24 @@ pub fn timezone() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_string_value_becomes_unquoted_criteria_string() {
+        // Matches C#'s own .ToString() semantics -- a JSON string
+        // becomes its own content, not re-serialized with quotes
+        // (serde_json::Value::to_string() would otherwise produce
+        // "\"clear\"" instead of "clear").
+        let v: serde_json::Value = serde_json::from_str(r#""clear""#).unwrap();
+        assert_eq!(json_value_to_criteria_string(&v), "clear");
+    }
+
+    #[test]
+    fn json_number_value_becomes_plain_decimal_string() {
+        let v: serde_json::Value = serde_json::from_str("25").unwrap();
+        assert_eq!(json_value_to_criteria_string(&v), "25");
+        let v: serde_json::Value = serde_json::from_str("18.5").unwrap();
+        assert_eq!(json_value_to_criteria_string(&v), "18.5");
+    }
 
     #[test]
     fn fingerprint_is_deterministic_for_the_same_secret() {

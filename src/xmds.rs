@@ -20,6 +20,41 @@ use crate::resource::ReqFile;
 use crate::schedule::Schedule;
 use crate::logger::LogEntry;
 
+/// XMDS endpoint version this client currently connects with. Each
+/// XMDS version is a genuinely separate PHP class server-side
+/// (Soap5.php, Soap6.php, Soap7.php, ...), not a single class with
+/// clientType/clientCode-conditional behavior -- confirmed via a real
+/// report (a genuine "Procedure 'GetWeather' not present" SOAP fault
+/// against this exact v5 endpoint) and the CMS's own architecture
+/// docs ("web/xmds.php creates the appropriate SOAP handler based on
+/// the requested version"). GetDependency/GetData/GetWeather are
+/// v6/v7-only additions -- v5's own handler class doesn't have them
+/// at all, so calling them against this endpoint version will always
+/// fail, not just sometimes.
+///
+/// IMPORTANT if this ever gets bumped: CMS v4+'s own Data Widget
+/// JSON/HTML splitting (RequiredFiles entries with type="widget",
+/// consumed via GetData) is *also* gated by this same endpoint
+/// version, not by clientType/clientCode -- v5's handler class simply
+/// doesn't generate those entries, which is *why* Data Widgets
+/// currently render correctly via the older, everything-embedded-in-
+/// the-.htm path (see xmds::Cms::get_data's own doc comment for the
+/// full context). Bumping this without first finishing GetData's own
+/// end-to-end integration (recognizing type="widget", saving as
+/// <id>.json, serving it via the local webserver) would break Data
+/// Widgets, not just leave GetWeather/GetDependency still unsupported.
+const XMDS_ENDPOINT_VERSION: u32 = 5;
+
+/// Whether the current XMDS endpoint version has GetWeather (and, as
+/// far as confirmed, GetDependency/GetData too -- all three were added
+/// together) available at all -- see XMDS_ENDPOINT_VERSION's own doc
+/// comment. Lets callers skip even the first attempt at a call that's
+/// known in advance to always fail, rather than only discovering this
+/// via a failed SOAP round-trip.
+pub fn xmds_supports_v6_v7_methods() -> bool {
+    XMDS_ENDPOINT_VERSION >= 6
+}
+
 /// Proxy for the XMDS calls to the CMS.
 pub struct Cms {
     service: soap::Service,
@@ -40,7 +75,7 @@ pub struct Cms {
 impl Cms {
     pub fn new(cms: &CmsSettings, pub_key: String, no_verify: bool, xml_dir: PathBuf) -> Result<Self> {
         Ok(Self {
-            service: soap::Service::new(format!("{}/xmds.php?v=5", cms.address),
+            service: soap::Service::new(format!("{}/xmds.php?v={XMDS_ENDPOINT_VERSION}", cms.address),
                                         cms.make_agent(no_verify)?),
             display_name: cms.display_name.as_ref().map_or_else(get_display_name,
                                                                 |name| name.to_owned()),
@@ -216,6 +251,17 @@ impl Cms {
                 // today's existing behavior) if the CMS omits it.
                 screenshot_size: tree.def_child("screenShotSize", 0u32)?,
                 // Same lowerCamelCase convention as every other field
+                // here; the C# property name
+                // (`SendCurrentLayoutAsStatusUpdate`) is confirmed real
+                // (seen directly in MainWindow.xaml.cs, gating the
+                // exact same immediate-notify-on-layout-change call
+                // this field now gates in mainloop.rs). Defaults to
+                // true -- see the field's own doc comment in
+                // config.rs for why closed-by-default would be unsafe
+                // here specifically.
+                send_current_layout_as_status_update:
+                    tree.def_child::<i32>("sendCurrentLayoutAsStatusUpdate", 1)? != 0,
+                // Same lowerCamelCase convention as every other field
                 // here; the C# property name (`IsAdspaceEnabled`) is
                 // confirmed real (seen directly in ScheduleManager.cs),
                 // but the exact XML element name is FLAGGED AS
@@ -379,6 +425,59 @@ impl Cms {
                 chunkSize: size as f64,
             }
         ).context("getting dependency data")?.file.0)
+    }
+
+    /// Gets the JSON data for an Elements-based Data Widget (e.g. RSS,
+    /// social media, weather-via-elements). Confirmed via official
+    /// docs (account.xibosignage.com/docs/developer/creating-a-player/
+    /// xmds): the returned JSON should be saved as `<widgetId>.json`,
+    /// referenced by the widget's own resource HTML via the local
+    /// webserver, and may contain a `files` property listing
+    /// additional media (always HTTP-downloadable) the data itself
+    /// references (e.g. images embedded in an RSS item).
+    ///
+    /// FLAGGED AS UNVERIFIED / INCOMPLETE: only this raw SOAP call
+    /// itself is implemented and confirmed against the real WSDL --
+    /// the exact trigger (which RequiredFiles entry, if any, signals
+    /// "this widget needs GetData called for it", and how the
+    /// resulting JSON's own `files` property is shaped) was not found
+    /// in the reference client's own public source during a search,
+    /// unlike GetDependency's own RequiredFiles.cs. NOT YET WIRED IN
+    /// to any download/collection cycle -- calling this alone doesn't
+    /// make Data Widgets work end-to-end yet.
+    pub fn get_data(&mut self, widget_id: i64) -> Result<String> {
+        Ok(self.service.GetData(
+            soap::GetDataRequest {
+                serverKey: &self.cms_key,
+                hardwareKey: &self.hw_key,
+                widgetId: widget_id,
+            }
+        ).context("getting widget data")?.data)
+    }
+
+    /// Gets weather conditions for this display's own location (no
+    /// widget/geo params -- the CMS resolves these from the display's
+    /// own configuration). Confirmed via the real reference client
+    /// source (xibo-dotnetclient's XmdsAgents/WeatherAgent.cs): this
+    /// does NOT feed widget rendering at all -- every key/value pair
+    /// in the returned JSON becomes a Schedule Criteria update (same
+    /// destination as the existing xmr::Message::CriteriaUpdate push
+    /// mechanism, just pulled periodically instead of pushed by the
+    /// CMS). Called once per collection cycle in the reference client
+    /// (not on its own independent timer, unlike GetData's own
+    /// DataAgent), gated behind a simple enabled/disabled toggle
+    /// there -- FLAGGED AS UNVERIFIED here: the exact signal for when
+    /// weather is "required" for a given display wasn't confirmed:
+    /// called unconditionally instead, once per collection cycle
+    /// (see mainloop.rs's own collect_once), matching the reference
+    /// client's own polling cadence when enabled.
+    pub fn get_weather(&mut self) -> Result<String> {
+        Ok(self.service.GetWeather(
+            soap::GetWeatherRequest {
+                serverKey: &self.cms_key,
+                hardwareKey: &self.hw_key,
+            }
+        ).context("getting weather")?.data)
     }
 
     pub fn get_resource(&mut self, layout: i64, region: &str, media: &str) -> Result<String> {
@@ -917,5 +1016,186 @@ mod get_dependency_data_tests {
         let mut cms = test_cms(port);
         let data = cms.get_dependency_data("roboto-regular.ttf", "font", 0, 1024).unwrap();
         assert_eq!(data, b"font file bytes here");
+    }
+}
+
+#[cfg(test)]
+mod get_data_tests {
+    use super::*;
+
+    fn start_mock(response_json: &'static str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = response_json.replace('&', "&amp;").replace('<', "&lt;")
+                                            .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><GetDataResponse><data>{escaped}</data></GetDataResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_getdata_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn fetches_widget_data_by_its_integer_widget_id() {
+        // Confirms the SOAP round-trip works for a real, non-trivial
+        // JSON payload (not just that the WSDL compiles) -- widgetId
+        // is an int here, unlike GetDependency's own string id.
+        let port = start_mock(r#"{"data":[{"title":"hello"}],"files":[]}"#);
+        let mut cms = test_cms(port);
+        let data = cms.get_data(42).unwrap();
+        assert_eq!(data, r#"{"data":[{"title":"hello"}],"files":[]}"#);
+    }
+}
+
+#[cfg(test)]
+mod xmds_supports_v6_v7_methods_tests {
+    use super::*;
+
+    #[test]
+    fn correctly_reflects_the_current_hardcoded_endpoint_version() {
+        // Trip-wire, not a guarantee: if XMDS_ENDPOINT_VERSION is ever
+        // bumped past 5, this test starts failing -- a deliberate
+        // prompt to go re-read that constant's own doc comment (Data
+        // Widgets would need GetData's own end-to-end integration
+        // finished first, not just this flag flipping) before updating
+        // the expected value here.
+        assert!(!xmds_supports_v6_v7_methods(),
+                "XMDS_ENDPOINT_VERSION is 5 -- GetWeather/GetDependency/GetData must not \
+                 be considered supported yet");
+    }
+}
+
+#[cfg(test)]
+mod get_weather_tests {
+    use super::*;
+
+    fn start_mock(response_json: &'static str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = response_json.replace('&', "&amp;").replace('<', "&lt;")
+                                            .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><GetWeatherResponse><data>{escaped}</data></GetWeatherResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_getweather_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn fetches_weather_for_this_display_no_extra_params() {
+        // Confirms the SOAP round-trip works -- no widgetId/geo params,
+        // unlike GetData/GetDependency, matching the confirmed real
+        // WSDL shape (serverKey/hardwareKey only).
+        let port = start_mock(r#"{"temperature":25,"weather_condition":"clear"}"#);
+        let mut cms = test_cms(port);
+        let data = cms.get_weather().unwrap();
+        assert_eq!(data, r#"{"temperature":25,"weather_condition":"clear"}"#);
+    }
+}
+
+#[cfg(test)]
+mod send_current_layout_as_status_update_parsing_tests {
+    use super::*;
+
+    fn start_mock(activation_body: &'static str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = activation_body.replace('&', "&amp;").replace('<', "&lt;")
+                                              .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_sendlayout_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn explicit_false_from_the_cms_is_respected() {
+        let port = start_mock(
+            r#"<ActivationMessage code="READY"><sendCurrentLayoutAsStatusUpdate>0</sendCurrentLayoutAsStatusUpdate></ActivationMessage>"#);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert!(!settings.send_current_layout_as_status_update);
+    }
+
+    #[test]
+    fn explicit_true_from_the_cms_is_respected() {
+        let port = start_mock(
+            r#"<ActivationMessage code="READY"><sendCurrentLayoutAsStatusUpdate>1</sendCurrentLayoutAsStatusUpdate></ActivationMessage>"#);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert!(settings.send_current_layout_as_status_update);
+    }
+
+    #[test]
+    fn defaults_to_true_when_the_cms_omits_it() {
+        // See the field's own doc comment in config.rs for why this
+        // must default to true, not false -- a CMS that simply omits
+        // this element must not silently regress back to the laggy
+        // "Current Layout" display bug this setting was found for.
+        let port = start_mock(r#"<ActivationMessage code="READY"></ActivationMessage>"#);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert!(settings.send_current_layout_as_status_update);
     }
 }

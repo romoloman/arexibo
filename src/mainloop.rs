@@ -167,6 +167,17 @@ pub struct Handler {
     /// with its own accurate log message (this isn't a CMS
     /// authorization issue).
     pending_network: bool,
+    /// Set once GetWeather comes back with a "Procedure ... not
+    /// present" SOAP fault (see `is_method_not_present_fault`'s own
+    /// doc comment) -- found from a real report: our own XMDS
+    /// endpoint URL is hardcoded to `?v=5` (see xmds::Cms::new), but
+    /// GetWeather/GetDependency/GetData are v6/v7-only additions, so a
+    /// CMS whose v5 SOAP endpoint genuinely has no such method call
+    /// will fail this way on *every single* collection cycle forever
+    /// -- not a transient error worth retrying, logging a fresh
+    /// warning about indefinitely. Once set, collect_once() skips the
+    /// call entirely instead of repeating the same failed attempt.
+    weather_unsupported: bool,
     /// Timer for hiding/advancing the currently-shown overlay. Moved
     /// here (was local to `run()`) since `schedule_check()` needs to
     /// (re)schedule it too, not just XMR's `overlayLayout` handling.
@@ -339,6 +350,7 @@ impl Handler {
                                  resource_retry_timer: never(),
                                  pending_auth: false,
                                  pending_network: false,
+                                 weather_unsupported: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
@@ -377,6 +389,7 @@ impl Handler {
                                  resource_retry_timer: never(),
                                  pending_auth: !network_pending,
                                  pending_network: network_pending,
+                                 weather_unsupported: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
                                  cms: cms.clone(), no_verify };
@@ -645,7 +658,9 @@ impl Handler {
                     Ok(FromGui::Showing(layout)) => {
                         self.current_layout = layout;
                         self.record_layout_shown(layout);
-                        self.send_status_update();
+                        if self.settings.send_current_layout_as_status_update {
+                            self.send_status_update();
+                        }
                     }
                     Ok(FromGui::Command(code)) =>
                         self.run_command(&code),
@@ -958,6 +973,38 @@ impl Handler {
         // now that we should have all media, apply the schedule
         self.schedule = schedule;
         let _ = self.schedule.to_file(self.envdir.join("sched.json"));
+
+        // Weather-derived Schedule Criteria (see xmds::Cms::get_weather's
+        // own doc comment) -- a periodic pull, complementing (not
+        // replacing) the existing xmr::Message::CriteriaUpdate push
+        // path, both feeding the same self.criteria store. Errors here
+        // are logged, not propagated -- a failed weather fetch
+        // shouldn't fail this otherwise-successful collection cycle.
+        // Skipped proactively while the known, hardcoded XMDS endpoint
+        // version doesn't have GetWeather at all (see
+        // xmds::xmds_supports_v6_v7_methods's own doc comment) -- no
+        // point even trying a call known in advance to always fail.
+        // weather_unsupported stays as a runtime-learned fallback for
+        // the (currently not expected) case where that assumption
+        // turns out wrong for some CMS -- once either signal is true,
+        // stop calling for the rest of this session.
+        if xmds::xmds_supports_v6_v7_methods() && !self.weather_unsupported {
+            match self.xmds.get_weather() {
+                Ok(json) => {
+                    let ttl = self.settings.collect_interval as i64 + 60;
+                    if let Err(e) = apply_weather_criteria(&mut self.criteria, &json, ttl) {
+                        log::warn!("parsing weather JSON: {e:#}");
+                    }
+                }
+                Err(e) if is_method_not_present_fault(&e) => {
+                    log::info!("this CMS's XMDS endpoint does not support GetWeather \
+                                (v6/v7-only) -- not retrying every cycle");
+                    self.weather_unsupported = true;
+                }
+                Err(e) => log::warn!("getting weather: {e:#}"),
+            }
+        }
+
         self.schedule_check();
 
         // send log messages
@@ -999,11 +1046,14 @@ impl Handler {
     /// CMS's own "Current Layout" display would lag behind actual
     /// layout switches by however long a collection cycle takes.
     /// Called immediately on every real layout change (FromGui::Showing,
-    /// see `run()`'s own select! loop), in addition to still being
-    /// called once per collection. Logs (not propagates) any error --
-    /// a failed status update shouldn't be fatal, especially when
-    /// called from a context (a real-time layout switch) that isn't
-    /// itself inside a `Result`-returning function.
+    /// see `run()`'s own select! loop) *if*
+    /// settings.send_current_layout_as_status_update allows it (a real
+    /// CMS-controlled setting -- see that field's own doc comment),
+    /// in addition to still being called unconditionally once per
+    /// collection. Logs (not propagates) any error -- a failed status
+    /// update shouldn't be fatal, especially when called from a
+    /// context (a real-time layout switch) that isn't itself inside a
+    /// `Result`-returning function.
     fn send_status_update(&mut self) {
         let (avail, total) = match util::space_info(self.cache.dir()) {
             Ok(v) => v,
@@ -1299,6 +1349,35 @@ fn ws_address_has_port(addr: &str) -> bool {
 /// check's suspicious-address guard.
 fn is_own_derived_ws_default(cms: &CmsSettings, candidate: &str) -> bool {
     cms.default_xmr_websocket_address().as_deref() == Some(candidate)
+}
+
+/// Applies a GetWeather JSON response to the given CriteriaStore --
+/// every key/value pair becomes one Schedule Criteria update (see
+/// xmds::Cms::get_weather's own doc comment for why). Extracted as
+/// its own pure function specifically so this can be unit-tested
+/// directly, without needing a full Handler or a mock CMS server
+/// capable of answering every XMDS call collect_once() makes.
+fn apply_weather_criteria(criteria: &mut CriteriaStore, json: &str, ttl: i64) -> Result<()> {
+    let weather: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json)?;
+    for (metric, value) in weather {
+        criteria.set(metric, util::json_value_to_criteria_string(&value), ttl);
+    }
+    Ok(())
+}
+
+/// Whether an error's own message indicates a "Procedure ... not
+/// present" SOAP fault -- found from a real report: our own XMDS
+/// endpoint URL is hardcoded to `?v=5` (see xmds::Cms::new), but
+/// GetWeather/GetDependency/GetData are v6/v7-only additions, so a CMS
+/// whose v5 SOAP endpoint genuinely has no such method call fails
+/// this way -- permanently, not transiently, since retrying the exact
+/// same call against the exact same endpoint version will never
+/// succeed. This exact string is PHP SOAP's own generic "unknown
+/// method" fault wording (not something Xibo-specific), so this same
+/// check is reusable for any v6/v7-only method call, not just
+/// GetWeather.
+fn is_method_not_present_fault(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("not present")
 }
 
 #[cfg(test)]
@@ -1953,6 +2032,38 @@ mod send_status_update_tests {
                 "a status update containing the new layout id must be sent \
                  immediately on layout change -- captured requests: {requests:?}");
     }
+
+    #[test]
+    fn immediate_send_is_skipped_when_the_cms_setting_disables_it() {
+        // Confirmed real CMS setting (SendCurrentLayoutAsStatusUpdate,
+        // seen directly gating this exact same immediate-notify call
+        // in the reference client's MainWindow.xaml.cs) -- must be
+        // respected, not ignored. Mirrors run()'s own select! loop
+        // logic (`if self.settings.send_current_layout_as_status_update
+        // { self.send_status_update(); }`) without needing to drive
+        // that full, otherwise-infinite loop just to test this.
+        let (port, captured) = start_mock_capturing_requests();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        handler.settings.send_current_layout_as_status_update = false;
+
+        handler.current_layout = 4242;
+        handler.record_layout_shown(4242);
+        if handler.settings.send_current_layout_as_status_update {
+            handler.send_status_update();
+        }
+
+        let requests = captured.lock().unwrap();
+        assert!(!requests.iter().any(|body| body.contains("4242")),
+                "must NOT send an immediate status update when the CMS setting \
+                 disables it -- captured requests: {requests:?}");
+    }
 }
 
 #[cfg(test)]
@@ -2177,5 +2288,67 @@ mod sticky_address_applies_to_first_connection_tests {
                 "xmr::start() should have succeeded directly against the corrected \
                  address -- a retry being armed means it was actually attempted \
                  against the bad, port-less one instead");
+    }
+}
+
+#[cfg(test)]
+mod apply_weather_criteria_tests {
+    use super::*;
+
+    #[test]
+    fn each_key_value_pair_becomes_one_criteria_update() {
+        // Matches the real reference client's own behavior
+        // (WeatherAgent.cs): every key/value pair in the weather JSON
+        // becomes one Schedule Criteria update, string-valued.
+        let mut criteria = CriteriaStore::default();
+        apply_weather_criteria(&mut criteria, r#"{"temperature":25,"weather_condition":"clear"}"#, 120).unwrap();
+        assert_eq!(criteria.get("temperature"), Some("25"));
+        assert_eq!(criteria.get("weather_condition"), Some("clear"));
+    }
+
+    #[test]
+    fn invalid_json_returns_an_error_not_a_panic() {
+        let mut criteria = CriteriaStore::default();
+        let result = apply_weather_criteria(&mut criteria, "not valid json", 120);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn feeds_the_same_criteria_store_xmr_criteria_update_also_uses() {
+        // Confirms this is a genuine complement to (not a separate
+        // mechanism from) the existing xmr::Message::CriteriaUpdate
+        // push path -- both must be able to set/overwrite the exact
+        // same metric.
+        let mut criteria = CriteriaStore::default();
+        criteria.set("weather_condition".to_string(), "rain".to_string(), 60);
+        assert_eq!(criteria.get("weather_condition"), Some("rain"));
+        apply_weather_criteria(&mut criteria, r#"{"weather_condition":"clear"}"#, 120).unwrap();
+        assert_eq!(criteria.get("weather_condition"), Some("clear"),
+                   "a later weather pull must be able to update the same metric an XMR push set");
+    }
+}
+
+#[cfg(test)]
+mod is_method_not_present_fault_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_the_real_reported_error_message() {
+        // The exact real report: our own v5-hardcoded XMDS endpoint
+        // (see xmds::Cms::new) genuinely has no GetWeather method
+        // (v6/v7-only) -- confirmed via a real warning log from an
+        // actual totem.
+        let err = anyhow::anyhow!("getting weather: parsing GetWeather SOAP response: \
+                                    got SOAP fault: Procedure 'GetWeather' not present");
+        assert!(is_method_not_present_fault(&err));
+    }
+
+    #[test]
+    fn does_not_misclassify_an_unrelated_error() {
+        // A genuine network/auth failure must NOT be treated as
+        // "permanently unsupported" -- it should keep retrying
+        // normally, unlike a real method-not-present fault.
+        let err = anyhow::anyhow!("getting weather: io: connection refused");
+        assert!(!is_method_not_present_fault(&err));
     }
 }

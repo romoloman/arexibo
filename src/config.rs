@@ -43,6 +43,21 @@ pub struct PlayerSettings {
     // respected at all here.
     #[serde(default)]
     pub screenshot_size: u32,
+    // Master on/off switch for the *immediate* (layout-change-triggered)
+    // NotifyStatus send in mainloop.rs's own FromGui::Showing handler --
+    // confirmed real field name from the actual C# client source
+    // (`ApplicationSettings.Default.SendCurrentLayoutAsStatusUpdate`,
+    // seen directly gating the exact same immediate-notify call in
+    // MainWindow.xaml.cs). Does NOT gate the separate, unconditional
+    // once-per-collection-cycle NotifyStatus call -- that's baseline
+    // behavior, independent of this specific setting. Defaults to true
+    // (keep sending immediately) rather than false, since the section
+    // this setting was found for was itself a fix for a real report of
+    // laggy "Current Layout" CMS display -- defaulting closed would
+    // silently reintroduce that exact bug for any CMS that simply
+    // omits this field rather than sending an explicit false.
+    #[serde(default = "default_true")]
+    pub send_current_layout_as_status_update: bool,
     // Master on/off switch for Adspace Exchange (`ssp` widgets, see
     // adspace.rs) -- confirmed real field name from the actual C#
     // client source seen during development
@@ -120,6 +135,8 @@ impl fmt::Debug for PlayerSettings {
             .field("log_level", &self.log_level)
             .field("screenshot_interval", &self.screenshot_interval)
             .field("screenshot_size", &self.screenshot_size)
+            .field("send_current_layout_as_status_update",
+                   &self.send_current_layout_as_status_update)
             .field("is_adspace_enabled", &self.is_adspace_enabled)
             .field("download_start_window", &self.download_start_window)
             .field("download_end_window", &self.download_end_window)
@@ -250,6 +267,7 @@ impl PlayerSettings {
 }
 
 fn default_collect_interval() -> u64 { 900 }
+fn default_true() -> bool { true }
 fn default_log_level() -> String { "debug".into() }
 fn default_embedded_server_port() -> u16 { 9696 }
 fn default_display_name() -> String { "Xibo".into() }
@@ -407,6 +425,38 @@ impl danger::ServerCertVerifier for DisabledVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_impl_includes_every_known_field() {
+        // Regression test: PlayerSettings has a hand-written Debug impl
+        // (to redact xmr_cms_key, see its own field's format_args! call
+        // above) instead of #[derive(Debug)] -- meaning adding a new
+        // struct field does NOT automatically appear in it, unlike a
+        // derived impl. Found happening for real: send_current_layout_
+        // as_status_update was added to the struct but silently missing
+        // from this impl, making it invisible in the real debug logs
+        // arexibo already prints on every collection cycle. This is a
+        // trip-wire, not a guarantee -- adding a new field still
+        // requires remembering to add BOTH the field name below AND to
+        // the actual Debug impl above; this test only catches the
+        // second half being forgotten once the first half is done.
+        let settings = PlayerSettings::default();
+        let debug_output = format!("{settings:?}");
+        for field in [
+            "collect_interval", "stats_enabled", "xmr_network_address",
+            "xmr_web_socket_address", "xmr_web_socket_address_in_use",
+            "xmr_cms_key", "log_level", "screenshot_interval", "screenshot_size",
+            "send_current_layout_as_status_update", "is_adspace_enabled",
+            "download_start_window", "download_end_window", "embedded_server_port",
+            "prevent_sleep", "display_name", "size_x", "size_y", "pos_x", "pos_y",
+            "commands", "enable_shell_commands", "shell_command_allow_list",
+        ] {
+            assert!(debug_output.contains(field),
+                    "field {field:?} missing from PlayerSettings's own hand-written \
+                     Debug impl -- it exists on the struct but won't show up in the \
+                     real debug logs arexibo prints on every collection cycle");
+        }
+    }
 
     fn test_cms(address: &str) -> CmsSettings {
         CmsSettings { address: address.to_string(), key: "k".into(), display_id: "d".into(),
