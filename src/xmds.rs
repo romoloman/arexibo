@@ -280,6 +280,14 @@ impl Cms {
                 // RegisterDisplay response ("Europe/Rome") -- see the
                 // field's own doc comment in config.rs.
                 display_time_zone: tree.def_child::<String>("displayTimeZone", String::new())?,
+                // Confirmed real element name from an actual
+                // RegisterDisplay response -- see the field's own doc
+                // comment in config.rs for the full mechanism.
+                expire_modified_layouts: tree.def_child::<i32>("expireModifiedLayouts", 0)? != 0,
+                // Confirmed real element name from an actual
+                // RegisterDisplay response -- see the field's own doc
+                // comment in config.rs for the full mechanism.
+                screen_shot_requested: tree.def_child::<i32>("screenShotRequested", 0)? != 0,
                 // embeddedServerPort from the CMS is effectively
                 // vestigial regardless -- main.rs immediately overwrites
                 // it with whatever port we actually bound locally

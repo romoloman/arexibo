@@ -188,6 +188,16 @@ pub struct Handler {
     /// later, multi-threaded calls (collect_once() runs on a separate
     /// thread from the one that first constructed this Handler).
     process_timezone_applied: Option<String>,
+    /// Tracks whether this run has already triggered a screenshot for
+    /// the *current* true value of settings.screen_shot_requested (see
+    /// that field's own doc comment in config.rs) -- edge-triggered
+    /// (fires once when the flag transitions false -> true), not
+    /// level-triggered, so a flag that happens to stay true across
+    /// several collection cycles (e.g. some delay before the CMS
+    /// resets it after receiving our submission) doesn't cause a new
+    /// screenshot every single cycle. Reset back to false once the
+    /// flag itself goes back to false, ready to fire again next time.
+    screenshot_requested_seen: bool,
     /// Timer for hiding/advancing the currently-shown overlay. Moved
     /// here (was local to `run()`) since `schedule_check()` needs to
     /// (re)schedule it too, not just XMR's `overlayLayout` handling.
@@ -362,6 +372,7 @@ impl Handler {
                                  pending_network: false,
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
+                                 screenshot_requested_seen: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key, cms: cms.clone(), no_verify };
             slf.update_settings();
@@ -402,6 +413,7 @@ impl Handler {
                                  pending_network: network_pending,
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
+                                 screenshot_requested_seen: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
                                  cms: cms.clone(), no_verify };
@@ -913,6 +925,16 @@ impl Handler {
         // get the schedule
         let schedule = self.xmds.get_schedule()?;
 
+        // The scheduleid of whatever's currently on screen, looked up
+        // in the *old* schedule (self.schedule, not yet overwritten
+        // with the fresh one just fetched above) -- see
+        // is_exempt_as_currently_playing_layout's own doc comment for
+        // why this, not the raw layout id, is the correct identity to
+        // track across a publish (which changes the layout id but
+        // keeps the scheduleid the same -- confirmed via two real
+        // schedule.xml samples, before and after a real publish).
+        let current_scheduleid = self.schedule.scheduleid_for(self.current_layout);
+
         // download all missing files
         let mut result = Vec::new();
         let total = required.len();
@@ -927,7 +949,10 @@ impl Handler {
                        self.settings.download_end_window);
         } else {
         for (i, file) in required.into_iter().enumerate() {
-            if !self.cache.has(&file) {
+            if !self.cache.has(&file)
+               && !is_exempt_as_currently_playing_layout(&file, current_scheduleid,
+                                                          &schedule,
+                                                          self.settings.expire_modified_layouts) {
                 let filedesc = file.description();
                 let inventory = file.inventory();
                 // Captured before `file` is moved into `download()` below
@@ -1074,13 +1099,31 @@ impl Handler {
                 return;
             }
         };
+        // BUG fix (found from a real report, confirmed via a real
+        // Xibo issue -- #983, "the player should provide its timezone
+        // to RegisterDisplay... stored on the display record" -- and
+        // a real Android player bug report describing the exact same
+        // symptom): reporting the *raw system* timezone here
+        // unconditionally means an admin's manual displayTimeZone
+        // override in the CMS gets silently overwritten on the very
+        // next NotifyStatus (which happens often -- every collection
+        // cycle, and immediately on every layout change). Reporting
+        // the *effective* timezone we're already using (the CMS's own
+        // display_time_zone, once it's told us one) instead means our
+        // own report never fights a value the CMS already gave us --
+        // only a brand-new, never-configured display (empty
+        // display_time_zone) falls back to the system's own timezone,
+        // preserving the original auto-detection use case for that
+        // case specifically.
+        let system_tz = util::timezone();
+        let reported_tz = timezone_to_report(&self.settings.display_time_zone, &system_tz);
         let status = xmds::Status {
             currentLayoutId: self.current_layout,
             availableSpace: avail,
             totalSpace: total,
             lastCommandSuccess: self.last_command_success.unwrap_or(true),
             deviceName: &self.settings.display_name,
-            timeZone: &util::timezone(),
+            timeZone: &reported_tz,
         };
         if let Err(e) = self.xmds.notify_status(&status) {
             log::error!("sending status update: {e:#}");
@@ -1147,9 +1190,22 @@ impl Handler {
             .filter(|&id| self.cache.get_layout(id).is_some())
             .collect();
         let new_layouts = if available.is_empty() && !new_layouts.is_empty() {
-            log::warn!("none of the newly-scheduled layout(s) ({}) are cached yet, \
-                        keeping whatever's currently showing until they are",
-                       new_layouts.iter().format(", "));
+            // BUG fix (found from a real crash report): this codebase's
+            // own Logger (logger.rs) formats record.args() TWICE --
+            // once for console output, once to build the string stored
+            // for later upload to the CMS (SubmitLog). Most Display
+            // impls are idempotent, so this is normally harmless, but
+            // itertools::Format is explicitly single-use -- formatting
+            // it a second time panics with "Format: was already
+            // formatted once". Converting to a String *before* handing
+            // it to log::warn! (matching the already-safe pattern just
+            // below, at the new_layouts.iter().format(", ").to_string()
+            // call) means the log macro only ever sees a plain,
+            // idempotent String, regardless of how many times any
+            // logger implementation formats its own arguments.
+            let listed = new_layouts.iter().format(", ").to_string();
+            log::warn!("none of the newly-scheduled layout(s) ({listed}) are cached yet, \
+                        keeping whatever's currently showing until they are");
             self.layouts.clone()
         } else {
             available
@@ -1322,11 +1378,44 @@ impl Handler {
                 self.process_timezone_applied = Some(tz);
             }
             TimezoneAction::WarnRestartNeeded { was, now } => {
-                log::warn!("the CMS's own display timezone changed from {was:?} to {now:?} \
-                            since this process started -- a restart is required to pick up \
-                            the change (changing a process's own timezone mid-session, from \
-                            a background thread, isn't safe to do here)");
+                // Deliberately exits the whole process (rather than
+                // just logging and continuing with the stale timezone
+                // indefinitely) -- these totems are remote, unattended
+                // kiosks, so a warning that requires someone to notice
+                // it and manually restart is of little practical use.
+                // A timezone change is rare, so a brief service
+                // interruption for a clean restart (systemd's own
+                // Restart=always, see arexibo.service) is a reasonable
+                // trade-off against silently running with the wrong
+                // timezone -- affecting schedule/download-window
+                // evaluations -- until someone happens to notice.
+                // Exit code 1 (not 0) for compatibility with either
+                // Restart=always or Restart=on-failure policies,
+                // matching the same convention already used for the
+                // mainloop thread panic/exit handling in main.rs.
+                log::error!("the CMS's own display timezone changed from {was:?} to \
+                             {now:?} since this process started -- exiting so systemd \
+                             can restart cleanly and pick up the change (changing a \
+                             process's own timezone mid-session, from a background \
+                             thread, isn't safe to do here)");
+                std::process::exit(1);
             }
+        }
+
+        // Fallback for a screenshot request lost while offline (see
+        // screen_shot_requested's own doc comment in config.rs) --
+        // edge-triggered (see screenshot_requested_seen's own doc
+        // comment) to avoid repeating this every cycle while the CMS's
+        // own flag stays true.
+        if self.settings.screen_shot_requested {
+            if !self.screenshot_requested_seen {
+                log::info!("CMS has a pending screenshot request (screenShotRequested) -- \
+                            likely lost while offline/disconnected, fulfilling it now");
+                self.to_gui.send(ToGui::Screenshot).unwrap();
+                self.screenshot_requested_seen = true;
+            }
+        } else {
+            self.screenshot_requested_seen = false;
         }
 
         // let the GUI know to reconfigure itself
@@ -1398,6 +1487,88 @@ fn apply_weather_criteria(criteria: &mut CriteriaStore, json: &str, ttl: i64) ->
         criteria.set(metric, util::json_value_to_criteria_string(&value), ttl);
     }
     Ok(())
+}
+
+/// Whether `file` should be exempted from this cycle's re-download,
+/// even though `Cache::has()` says it's stale (modified) -- because it
+/// occupies the *same schedule slot* currently on screen, and
+/// `expire_modified_layouts` says an in-progress modification/publish
+/// should not interrupt it.
+///
+/// Uses `scheduleid`, NOT the raw layout id, to identify "the same
+/// schedule slot" -- confirmed via two real schedule.xml samples taken
+/// directly before and after a real publish of the layout being shown:
+/// the layout id changed (925 -> 927, a new published version), but
+/// `scheduleid="224"` stayed exactly the same. Comparing raw layout
+/// ids (as an earlier version of this function did) can never detect
+/// this common case at all, since publishing a layout is *specifically
+/// what changes its id* -- the previous, id-based check only ever
+/// caught the rarer case of a layout modified in place without a
+/// separate publish step.
+///
+/// `current_scheduleid` must be looked up in the *previous* schedule
+/// (before it gets replaced by the fresh one) -- the currently-playing
+/// layout id may no longer even appear in the fresh schedule at all
+/// (it's been superseded). `fresh_schedule` is then checked for
+/// whether `file`'s own (new) layout id occupies that same scheduleid
+/// now. A `current_scheduleid` of 0 (schedule.rs's own "no real
+/// schedule entry" convention, e.g. currently showing the splash or
+/// default layout) never exempts anything -- there's no real schedule
+/// slot to match against.
+
+/// Decides which timezone value to report to the CMS via NotifyStatus
+/// -- see send_status_update's own comment at its call site for the
+/// full context (a real report + a real Xibo issue confirming the CMS
+/// stores whatever the player reports here back onto the display
+/// record, silently overwriting an admin's manual override if we
+/// always report the raw system timezone unconditionally). Prefers the
+/// CMS's own display_time_zone (once it's told us one -- non-empty),
+/// so our own report never fights a value the CMS already gave us;
+/// falls back to the system's own timezone only for a brand-new,
+/// never-configured display, preserving the original auto-detection
+/// use case for that case specifically.
+fn timezone_to_report(cms_display_time_zone: &str, system_timezone: &str) -> String {
+    if !cms_display_time_zone.is_empty() {
+        cms_display_time_zone.to_string()
+    } else {
+        system_timezone.to_string()
+    }
+}
+
+#[cfg(test)]
+mod timezone_to_report_tests {
+    use super::*;
+
+    #[test]
+    fn prefers_the_cms_own_value_once_it_has_provided_one() {
+        // The exact fix for the real report: once the CMS has told us
+        // a display_time_zone, our own report must echo that same
+        // value back -- never the raw system one -- so it can never
+        // silently overwrite an admin's manual CMS-side override.
+        assert_eq!(timezone_to_report("Europe/London", "Europe/Rome"), "Europe/London");
+    }
+
+    #[test]
+    fn falls_back_to_the_system_timezone_for_a_never_configured_display() {
+        // A brand-new display the CMS has never told a timezone --
+        // preserves the original auto-detection use case (Xibo issue
+        // #983: "the player should provide its timezone... stored on
+        // the display record").
+        assert_eq!(timezone_to_report("", "Europe/Rome"), "Europe/Rome");
+    }
+}
+
+fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64,
+                                          fresh_schedule: &Schedule,
+                                          expire_modified_layouts: bool) -> bool {
+    if expire_modified_layouts || current_scheduleid == 0 {
+        return false;
+    }
+    match file {
+        ReqFile::File { typ: "layout", id, .. } =>
+            fresh_schedule.scheduleid_for(*id) == current_scheduleid,
+        _ => false,
+    }
 }
 
 /// Whether an error's own message indicates a "Procedure ... not
@@ -2557,5 +2728,197 @@ mod apply_process_timezone_tests {
         apply_process_timezone("America/New_York");
         let offset = time::OffsetDateTime::now_local().unwrap().offset();
         assert_eq!(offset.whole_hours(), -4, "August in America/New_York must be UTC-4 (EDT)");
+    }
+}
+
+#[cfg(test)]
+mod is_exempt_as_currently_playing_layout_tests {
+    use super::*;
+    use elementtree::Element;
+
+    fn layout_file(id: i64) -> ReqFile {
+        ReqFile::File { id, typ: "layout", size: 0, md5: vec![], http: false,
+                        path: String::new(), name: String::new(), code: None }
+    }
+
+    /// Builds a real Schedule from XML, same wide-open from/to window
+    /// convention as the real schedule.xml samples this whole fix is
+    /// based on (`fromdt="1970-01-01 01:00:00" todt="2038-01-19
+    /// 04:14:07"` -- always "currently active" regardless of when the
+    /// test itself runs).
+    fn schedule_with(layout_file_id: i64, scheduleid: i64) -> Schedule {
+        let xml = format!(
+            r#"<schedule generated="2026-08-21 11:53:13" filterFrom="2026-08-21 11:00:00" filterTo="2026-08-23 11:00:00">
+  <layout file="{layout_file_id}" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="{scheduleid}" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="1" playCount="0" maxPlaysPerHour="0"/>
+  <default file="1" duration="60"/>
+</schedule>"#);
+        let tree = Element::from_reader(xml.as_bytes()).unwrap();
+        Schedule::parse(&tree).unwrap()
+    }
+
+    #[test]
+    fn exempts_a_republished_layout_occupying_the_same_schedule_slot() {
+        // The exact real scenario confirmed via two real schedule.xml
+        // samples taken directly before/after a real publish: layout
+        // 925 got republished as 927 (a NEW layout id -- publishing is
+        // specifically what changes it), but scheduleid="224" stayed
+        // exactly the same in both. current_scheduleid is looked up in
+        // the *old* schedule (925 -> 224); the fresh schedule now maps
+        // 927 -> 224 too -- same slot, must be exempted.
+        let old_schedule = schedule_with(925, 224);
+        let fresh_schedule = schedule_with(927, 224);
+        let current_scheduleid = old_schedule.scheduleid_for(925);
+        assert_eq!(current_scheduleid, 224, "sanity check on the old schedule's own lookup");
+        assert!(is_exempt_as_currently_playing_layout(&layout_file(927), current_scheduleid,
+                                                        &fresh_schedule, false),
+                "a republished layout occupying the same schedule slot must be exempted -- \
+                 comparing raw layout ids (925 != 927) would incorrectly NOT exempt this, \
+                 which is the exact bug this fix addresses");
+    }
+
+    #[test]
+    fn does_not_exempt_a_genuinely_different_schedule_slot() {
+        // A DIFFERENT layout (different scheduleid) being modified must
+        // still get its normal validity check -- only the slot
+        // currently on screen is exempted.
+        let old_schedule = schedule_with(925, 224);
+        let fresh_schedule = schedule_with(913, 225);
+        let current_scheduleid = old_schedule.scheduleid_for(925);
+        assert!(!is_exempt_as_currently_playing_layout(&layout_file(913), current_scheduleid,
+                                                         &fresh_schedule, false));
+    }
+
+    #[test]
+    fn does_not_exempt_anything_when_expire_modified_layouts_is_true() {
+        // The CMS explicitly wants even the currently playing schedule
+        // slot refreshed immediately when modified/republished.
+        let old_schedule = schedule_with(925, 224);
+        let fresh_schedule = schedule_with(927, 224);
+        let current_scheduleid = old_schedule.scheduleid_for(925);
+        assert!(!is_exempt_as_currently_playing_layout(&layout_file(927), current_scheduleid,
+                                                         &fresh_schedule, true));
+    }
+
+    #[test]
+    fn does_not_exempt_non_layout_files() {
+        // Only layout-type files participate in this mechanism -- a
+        // media file happening to share the same numeric id as the
+        // republished layout must not be exempted.
+        let old_schedule = schedule_with(925, 224);
+        let fresh_schedule = schedule_with(927, 224);
+        let current_scheduleid = old_schedule.scheduleid_for(925);
+        let media = ReqFile::File { id: 927, typ: "media", size: 0, md5: vec![], http: false,
+                                     path: String::new(), name: String::new(), code: None };
+        assert!(!is_exempt_as_currently_playing_layout(&media, current_scheduleid,
+                                                         &fresh_schedule, false));
+    }
+
+    #[test]
+    fn a_zero_current_scheduleid_never_exempts_anything() {
+        // 0 is schedule.rs's own "no real schedule entry" convention
+        // (e.g. currently showing the splash screen or the default
+        // layout, neither of which is a real <layout> schedule entry)
+        // -- there's no genuine schedule slot to match against, so
+        // nothing should ever be exempted on that basis.
+        let fresh_schedule = schedule_with(927, 224);
+        assert!(!is_exempt_as_currently_playing_layout(&layout_file(927), 0,
+                                                         &fresh_schedule, false));
+    }
+}
+
+#[cfg(test)]
+mod screenshot_requested_tests {
+    use super::*;
+
+    fn start_mock_ready() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_screenshot_requested_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Counts how many ToGui::Screenshot messages are currently queued
+    /// (draining the channel), ignoring any other ToGui variant (e.g.
+    /// the ToGui::Settings that update_settings() always also sends).
+    fn count_screenshot_messages(rx: &crossbeam_channel::Receiver<ToGui>) -> usize {
+        let mut n = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ToGui::Screenshot) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn fulfills_a_pending_request_exactly_once_while_the_flag_stays_true() {
+        // The real mechanism this fixes (confirmed via the actual CMS
+        // PHP source, Controller/Display.php's own requestScreenShot()):
+        // screenShotRequested is a fallback for a screenshot request
+        // whose real-time XMR push was lost (e.g. display offline at
+        // the time) -- reported honestly on every subsequent
+        // RegisterDisplay call until fulfilled. Edge-triggered: must
+        // fire once when the flag becomes true, and must NOT fire
+        // again on a later cycle where the CMS's own flag simply
+        // hasn't been reset back to false yet (avoiding a new
+        // screenshot every single collection cycle in that window).
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(10);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        // Drain whatever update_settings() sent during construction.
+        let _ = count_screenshot_messages(&togui_rx);
+
+        handler.settings.screen_shot_requested = true;
+        handler.update_settings();
+        assert_eq!(count_screenshot_messages(&togui_rx), 1,
+                   "must fulfill the pending request exactly once when the flag becomes true");
+
+        // Simulate the flag staying true for a second cycle (CMS
+        // hasn't reset it yet) -- must NOT fire again.
+        handler.update_settings();
+        assert_eq!(count_screenshot_messages(&togui_rx), 0,
+                   "must not repeat the screenshot every cycle while the flag simply stays true");
+
+        // CMS resets the flag once it receives our submission.
+        handler.settings.screen_shot_requested = false;
+        handler.update_settings();
+        assert_eq!(count_screenshot_messages(&togui_rx), 0);
+
+        // A genuinely new request later must fire again.
+        handler.settings.screen_shot_requested = true;
+        handler.update_settings();
+        assert_eq!(count_screenshot_messages(&togui_rx), 1,
+                   "a new request (flag re-transitioning false -> true) must fire again");
     }
 }

@@ -85,6 +85,30 @@ pub struct PlayerSettings {
     // autoinstall image intending to force it).
     #[serde(default)]
     pub display_time_zone: String,
+    // Confirmed real mechanism from the reference client's own source
+    // (Logic/ScheduleManager.cs): during each collection cycle's
+    // validity check of cached layouts, the *currently playing* layout
+    // is normally exempted from that check (so an in-progress
+    // modification doesn't interrupt what's already on screen) --
+    // UNLESS this is true, in which case even the currently playing
+    // layout gets checked and refreshed immediately if modified.
+    // Defaults to false (exempt the current layout), matching the
+    // reference client's own default and the CMS's own default of "0".
+    #[serde(default)]
+    pub expire_modified_layouts: bool,
+    // Confirmed real mechanism from the actual CMS PHP source
+    // (Controller/Display.php's own requestScreenShot()): when an
+    // admin requests a screenshot, the CMS sets this flag in its own
+    // database AND separately tries to push a real-time XMR action
+    // (which arexibo already handles, see xmr::Message::Screenshot in
+    // mainloop.rs). If the display was offline/disconnected when the
+    // XMR push was sent, that push is lost -- but this flag persists
+    // and gets reported honestly on the *next* RegisterDisplay call
+    // (guaranteed, polled every collection cycle regardless of XMR
+    // state), acting as a fallback so the request eventually gets
+    // fulfilled instead of being silently dropped.
+    #[serde(default)]
+    pub screen_shot_requested: bool,
     #[serde(default = "default_embedded_server_port")]
     pub embedded_server_port: u16,
     #[serde(default)]
@@ -153,6 +177,8 @@ impl fmt::Debug for PlayerSettings {
             .field("download_start_window", &self.download_start_window)
             .field("download_end_window", &self.download_end_window)
             .field("display_time_zone", &self.display_time_zone)
+            .field("expire_modified_layouts", &self.expire_modified_layouts)
+            .field("screen_shot_requested", &self.screen_shot_requested)
             .field("embedded_server_port", &self.embedded_server_port)
             .field("prevent_sleep", &self.prevent_sleep)
             .field("display_name", &self.display_name)
@@ -461,7 +487,7 @@ mod tests {
             "xmr_cms_key", "log_level", "screenshot_interval", "screenshot_size",
             "send_current_layout_as_status_update", "is_adspace_enabled",
             "download_start_window", "download_end_window", "display_time_zone",
-            "embedded_server_port",
+            "expire_modified_layouts", "screen_shot_requested", "embedded_server_port",
             "prevent_sleep", "display_name", "size_x", "size_y", "pos_x", "pos_y",
             "commands", "enable_shell_commands", "shell_command_allow_list",
         ] {
