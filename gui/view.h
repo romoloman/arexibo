@@ -9,6 +9,7 @@
 #include <QtWebEngineCore/QWebEngineScript>
 #include <QtWebEngineCore/QWebEngineScriptCollection>
 #include <QtWebChannel/QWebChannel>
+#include <QTimer>
 #include <iostream>
 #include <cstdlib>
 
@@ -84,6 +85,44 @@ public:
                        << ") -- exiting so systemd (Restart=always) can start a fresh instance"
                        << std::endl;
             std::exit(1);
+        });
+
+        // BUG fix (found from a real report: a native browser widget or
+        // any other view loading an EXTERNAL url -- most relevantly, a
+        // `webpage render="native"` widget, see jsNativeWebShowImpl --
+        // can fail to load (DNS hiccup, connection timeout, remote
+        // server briefly down) and is then just left showing whatever
+        // it had before (a blank/error page), with no attempt of its
+        // own to recover). `loadFinished(false)` fires for exactly this
+        // -- a failed navigation, as opposed to `loadFinished(true)`
+        // for a successful one. Retried after a short, fixed delay
+        // rather than immediately -- an instant retry against a
+        // server/network that's *currently* failing would likely just
+        // fail again right away, so a couple of seconds gives a
+        // transient blip a real chance to have cleared. Retries
+        // indefinitely (there's no attempt counter/backoff) rather than
+        // giving up after N tries -- a kiosk display is meant to run
+        // unattended for a long time, and continuing to retry is
+        // strictly better than a widget stuck showing a permanent
+        // error page with no path back to working once the underlying
+        // problem (however long it takes) does clear.
+        //
+        // Uses the QTimer::singleShot(msec, context, functor) overload
+        // (not the 2-argument one) specifically so the pending call is
+        // automatically cancelled if `this` (the QWebEnginePage) is
+        // itself destroyed before the timer fires -- e.g. the widget
+        // this page belongs to is removed from the layout (see
+        // jsNativeWebHideImpl) before the 2.5s delay elapses. Without
+        // passing `this` as the context object, the lambda would still
+        // fire and call triggerAction() on an already-destroyed page,
+        // a use-after-free.
+        connect(this, &QWebEnginePage::loadFinished, this, [this](bool ok) {
+            if (ok) return;
+            std::cout << "WARN : [arexibo::qt] page failed to load (" << url().toString().toStdString()
+                       << ") -- retrying in 2.5s" << std::endl;
+            QTimer::singleShot(2500, this, [this]() {
+                triggerAction(QWebEnginePage::Reload);
+            });
         });
     }
 
