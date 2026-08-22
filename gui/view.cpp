@@ -432,25 +432,11 @@ void JSInterface::jsLayoutInit(int id, int width, int height)
         wnd->cb(wnd->cb_ptr, CB_OVERLAY_LAYOUT_INIT, id, width, height);
         return;
     }
-    // BUG fix (found from a real report): the splash screen (layout 0,
-    // see server.rs's own splash_html()) hardcodes a fixed 1920x1080
-    // (16:9 landscape) size for jsLayoutInit, regardless of the
-    // physical screen's own real resolution/orientation. On a portrait
-    // totem (e.g. 1080x1920), adjustScale() below then computes a
-    // scaled, letterboxed sub-rectangle for the webview sized to that
-    // mismatched 16:9 aspect ratio, leaving the rest of the actual
-    // window (top/bottom bars, in the portrait case) unfilled -- and
-    // since QMainWindow itself has no explicit background color set,
-    // that unfilled area renders black, not the white the splash's own
-    // CSS (100vw/100vh, background-color: #ffffff) intends to fill the
-    // *entire* screen with.
-    //
-    // Fix: for the splash specifically (id == 0), ignore whatever
-    // width/height JS passed and use this window's own real pixel
-    // size instead -- multiplying by devicePixelRatio to cancel out
-    // the division adjustScale() itself performs internally, so it
-    // takes its own "easy case: direct match" branch (zoom 1.0, no
-    // letterboxing) regardless of the screen's actual aspect ratio.
+    // Splash screen (id 0) declares a fixed 1920x1080 size regardless
+    // of real screen orientation -- on portrait screens this makes
+    // adjustScale() letterbox it, showing black bars instead of the
+    // splash's own white background. Override with the real window
+    // size so it always fills the screen exactly.
     if (id == 0) {
         auto ratio = wnd->screen()->devicePixelRatio();
         width = std::round(wnd->width() * ratio);

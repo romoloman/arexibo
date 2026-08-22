@@ -73,57 +73,30 @@ pub struct PlayerSettings {
     pub download_start_window: String,
     #[serde(default)]
     pub download_end_window: String,
-    // The IANA timezone name the CMS's own Display record says this
-    // display should be in (e.g. "Europe/Rome") -- confirmed real
-    // field from an actual RegisterDisplay response. Applied directly
-    // as this process's own TZ environment variable (see
-    // mainloop::apply_process_timezone) so schedules/download windows
-    // are evaluated against what the CMS says this display should be
-    // in, without touching this machine's own system-wide timezone --
-    // self-correcting rather than merely warning, even on a
-    // misconfigured installation (wrong system timezone despite the
-    // autoinstall image intending to force it).
+    // CMS's own timezone for this display -- applied as this process's
+    // TZ env var (see mainloop::apply_process_timezone), not the
+    // system-wide one.
     #[serde(default)]
     pub display_time_zone: String,
-    // Confirmed real mechanism from the reference client's own source
-    // (Logic/ScheduleManager.cs): during each collection cycle's
-    // validity check of cached layouts, the *currently playing* layout
-    // is normally exempted from that check (so an in-progress
-    // modification doesn't interrupt what's already on screen) --
-    // UNLESS this is true, in which case even the currently playing
-    // layout gets checked and refreshed immediately if modified.
-    // Defaults to false (exempt the current layout), matching the
-    // reference client's own default and the CMS's own default of "0".
+    // If true, even the currently-playing layout is refreshed
+    // immediately when modified (default: exempt it, per the
+    // reference client).
     #[serde(default)]
     pub expire_modified_layouts: bool,
-    // Confirmed real mechanism from the actual CMS PHP source
-    // (Controller/Display.php's own requestScreenShot()): when an
-    // admin requests a screenshot, the CMS sets this flag in its own
-    // database AND separately tries to push a real-time XMR action
-    // (which arexibo already handles, see xmr::Message::Screenshot in
-    // mainloop.rs). If the display was offline/disconnected when the
-    // XMR push was sent, that push is lost -- but this flag persists
-    // and gets reported honestly on the *next* RegisterDisplay call
-    // (guaranteed, polled every collection cycle regardless of XMR
-    // state), acting as a fallback so the request eventually gets
-    // fulfilled instead of being silently dropped.
+    // Set by the CMS when a screenshot request's real-time XMR push
+    // was lost (e.g. display offline) -- fallback, seen on the next
+    // RegisterDisplay. See mainloop::attempt_https_upgrade area for
+    // handling.
     #[serde(default)]
     pub screen_shot_requested: bool,
-    // Confirmed real fields (newCmsAddress/newCmsKey) -- a CMS-driven
-    // migration mechanism: when both are non-empty, the CMS wants this
-    // display to switch to a different CMS server. See
-    // mainloop::attempt_cms_migration for the full, deliberately
-    // cautious handling (this is a genuinely risky operation -- a
-    // totem could become unreachable if handled carelessly).
+    // Both non-empty means the CMS wants this display to migrate to a
+    // different server. See mainloop::attempt_cms_migration.
     #[serde(default)]
     pub new_cms_address: String,
     #[serde(default)]
     pub new_cms_key: String,
-    // Confirmed real mechanism from a real Xibo project issue
-    // (xibo-linux#247): "If a HTTP link has been configured as the CMS
-    // URL, it should be swapped over to a HTTPS link, after testing
-    // that connection would work." See
-    // mainloop::attempt_https_upgrade for the handling.
+    // If true and our address is http://, upgrade to https:// after
+    // confirming it works. See mainloop::attempt_https_upgrade.
     #[serde(default)]
     pub force_https: bool,
     #[serde(default = "default_embedded_server_port")]

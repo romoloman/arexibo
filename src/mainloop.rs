@@ -167,36 +167,16 @@ pub struct Handler {
     /// with its own accurate log message (this isn't a CMS
     /// authorization issue).
     pending_network: bool,
-    /// Set once GetWeather comes back with a "Procedure ... not
-    /// present" SOAP fault (see `is_method_not_present_fault`'s own
-    /// doc comment) -- found from a real report: our own XMDS
-    /// endpoint URL is hardcoded to `?v=5` (see xmds::Cms::new), but
-    /// GetWeather/GetDependency/GetData are v6/v7-only additions, so a
-    /// CMS whose v5 SOAP endpoint genuinely has no such method call
-    /// will fail this way on *every single* collection cycle forever
-    /// -- not a transient error worth retrying, logging a fresh
-    /// warning about indefinitely. Once set, collect_once() skips the
-    /// call entirely instead of repeating the same failed attempt.
+    /// Set once GetWeather fails with "not present" (v6/v7-only on our
+    /// v5 endpoint) -- avoids retrying every cycle once known.
     weather_unsupported: bool,
-    /// The display_time_zone value actually applied to this process's
-    /// own TZ environment variable so far this run (see
-    /// apply_process_timezone's own doc comment) -- None until the
-    /// first successful registration provides one. Tracked so a LATER
-    /// change to the CMS's own setting is detected and reported (a
-    /// restart is required to pick it up) rather than either silently
-    /// ignored, or unsafely re-applied from update_settings()'s own
-    /// later, multi-threaded calls (collect_once() runs on a separate
-    /// thread from the one that first constructed this Handler).
+    /// TZ value already applied this run (see apply_process_timezone),
+    /// or None if not yet applied. Tracked so a later CMS-side change
+    /// is reported (needs a restart) instead of re-applied unsafely
+    /// from a different thread.
     process_timezone_applied: Option<String>,
-    /// Tracks whether this run has already triggered a screenshot for
-    /// the *current* true value of settings.screen_shot_requested (see
-    /// that field's own doc comment in config.rs) -- edge-triggered
-    /// (fires once when the flag transitions false -> true), not
-    /// level-triggered, so a flag that happens to stay true across
-    /// several collection cycles (e.g. some delay before the CMS
-    /// resets it after receiving our submission) doesn't cause a new
-    /// screenshot every single cycle. Reset back to false once the
-    /// flag itself goes back to false, ready to fire again next time.
+    /// Edge-triggered: fires once when screen_shot_requested goes
+    /// false->true, not on every cycle it stays true.
     screenshot_requested_seen: bool,
     /// Timer for hiding/advancing the currently-shown overlay. Moved
     /// here (was local to `run()`) since `schedule_check()` needs to
@@ -1011,20 +991,10 @@ impl Handler {
         self.schedule = schedule;
         let _ = self.schedule.to_file(self.envdir.join("sched.json"));
 
-        // Weather-derived Schedule Criteria (see xmds::Cms::get_weather's
-        // own doc comment) -- a periodic pull, complementing (not
-        // replacing) the existing xmr::Message::CriteriaUpdate push
-        // path, both feeding the same self.criteria store. Errors here
-        // are logged, not propagated -- a failed weather fetch
-        // shouldn't fail this otherwise-successful collection cycle.
-        // Skipped proactively while the known, hardcoded XMDS endpoint
-        // version doesn't have GetWeather at all (see
-        // xmds::xmds_supports_v6_v7_methods's own doc comment) -- no
-        // point even trying a call known in advance to always fail.
-        // weather_unsupported stays as a runtime-learned fallback for
-        // the (currently not expected) case where that assumption
-        // turns out wrong for some CMS -- once either signal is true,
-        // stop calling for the rest of this session.
+        // Weather-derived Schedule Criteria, complementing (not
+        // replacing) the xmr::Message::CriteriaUpdate push path.
+        // Skipped if the endpoint version doesn't support it, or if
+        // already learned unsupported at runtime.
         if xmds::xmds_supports_v6_v7_methods() && !self.weather_unsupported {
             match self.xmds.get_weather() {
                 Ok(json) => {
@@ -1099,22 +1069,9 @@ impl Handler {
                 return;
             }
         };
-        // BUG fix (found from a real report, confirmed via a real
-        // Xibo issue -- #983, "the player should provide its timezone
-        // to RegisterDisplay... stored on the display record" -- and
-        // a real Android player bug report describing the exact same
-        // symptom): reporting the *raw system* timezone here
-        // unconditionally means an admin's manual displayTimeZone
-        // override in the CMS gets silently overwritten on the very
-        // next NotifyStatus (which happens often -- every collection
-        // cycle, and immediately on every layout change). Reporting
-        // the *effective* timezone we're already using (the CMS's own
-        // display_time_zone, once it's told us one) instead means our
-        // own report never fights a value the CMS already gave us --
-        // only a brand-new, never-configured display (empty
-        // display_time_zone) falls back to the system's own timezone,
-        // preserving the original auto-detection use case for that
-        // case specifically.
+        // Report the CMS's own timezone, not the raw system one --
+        // otherwise the CMS overwrites an admin's manual override
+        // (Xibo issue #983).
         let system_tz = util::timezone();
         let reported_tz = timezone_to_report(&self.settings.display_time_zone, &system_tz);
         let status = xmds::Status {
@@ -1378,21 +1335,9 @@ impl Handler {
                 self.process_timezone_applied = Some(tz);
             }
             TimezoneAction::WarnRestartNeeded { was, now } => {
-                // Deliberately exits the whole process (rather than
-                // just logging and continuing with the stale timezone
-                // indefinitely) -- these totems are remote, unattended
-                // kiosks, so a warning that requires someone to notice
-                // it and manually restart is of little practical use.
-                // A timezone change is rare, so a brief service
-                // interruption for a clean restart (systemd's own
-                // Restart=always, see arexibo.service) is a reasonable
-                // trade-off against silently running with the wrong
-                // timezone -- affecting schedule/download-window
-                // evaluations -- until someone happens to notice.
-                // Exit code 1 (not 0) for compatibility with either
-                // Restart=always or Restart=on-failure policies,
-                // matching the same convention already used for the
-                // mainloop thread panic/exit handling in main.rs.
+                // Remote unattended kiosks -- exit for a clean systemd
+                // restart rather than logging and running with a stale
+                // timezone indefinitely.
                 log::error!("the CMS's own display timezone changed from {was:?} to \
                              {now:?} since this process started -- exiting so systemd \
                              can restart cleanly and pick up the change (changing a \
@@ -1402,11 +1347,8 @@ impl Handler {
             }
         }
 
-        // Fallback for a screenshot request lost while offline (see
-        // screen_shot_requested's own doc comment in config.rs) --
-        // edge-triggered (see screenshot_requested_seen's own doc
-        // comment) to avoid repeating this every cycle while the CMS's
-        // own flag stays true.
+        // Fallback for a screenshot request lost while offline --
+        // edge-triggered, not repeated every cycle.
         if self.settings.screen_shot_requested {
             if !self.screenshot_requested_seen {
                 log::info!("CMS has a pending screenshot request (screenShotRequested) -- \
@@ -1436,16 +1378,10 @@ impl Handler {
         self.to_gui.send(ToGui::Settings(Box::new(self.settings.clone()))).unwrap();
     }
 
-    /// Upgrades this display's own CMS address from http:// to https://
-    /// when the CMS says forceHttps is on -- see that field's own doc
-    /// comment in config.rs. Validates the https:// address actually
-    /// works first (reusing validate_new_cms, same reasoning as CMS
-    /// migration -- READY *or* WAITING both count as success), only
-    /// persisting and restarting on a confirmed-working upgrade. A
-    /// failed validation is logged and left alone (still working over
-    /// http, not broken) -- retried again next cycle for free, since
-    /// this naturally stops being attempted at all once the address is
-    /// already https://.
+    /// Upgrades http:// to https:// when the CMS's forceHttps is on,
+    /// validating the https:// address works first (reusing
+    /// validate_new_cms). On failure stays on http and retries next
+    /// cycle.
     fn attempt_https_upgrade(&mut self) {
         if !self.settings.force_https {
             return;
@@ -1487,15 +1423,10 @@ impl Handler {
         }
     }
 
-    /// Attempts a CMS migration if the CMS has told us to (see
-    /// new_cms_address/new_cms_key's own doc comment in config.rs).
-    /// Validates the new CMS *before* committing anything -- a genuine
-    /// SOAP-level success (READY *or* WAITING; a freshly-migrated
-    /// display is very likely not yet authorized on the new CMS, and
-    /// that alone must not be treated as a validation failure) confirms
-    /// the new server is reachable and accepts this display's own
-    /// identity, before any files on disk change. Does nothing at all
-    /// (not even a log entry) if no migration is currently requested.
+    /// Attempts a CMS migration if requested (new_cms_address/
+    /// new_cms_key). Validates the new CMS first -- READY or WAITING
+    /// both count as success, since a freshly-migrated display is
+    /// likely not yet authorized. No-op if no migration is requested.
     fn attempt_cms_migration(&mut self) {
         if !should_attempt_cms_migration(&self.settings.new_cms_address, &self.settings.new_cms_key) {
             return;
@@ -1550,18 +1481,9 @@ impl Handler {
     }
 }
 
-/// Validates that a candidate new CMS is reachable and accepts this
-/// display's own registration -- extracted as its own free function
-/// (rather than inline in attempt_cms_migration) specifically so it
-/// can be unit-tested directly against a real mock server, without
-/// needing to go through the surrounding method that ends in
-/// std::process::exit() on success. Ok(Some(_)) (READY, already
-/// authorized) and Ok(None) (WAITING, not yet authorized) are both
-/// treated as a successful Ok(()) -- see attempt_cms_migration's own
-/// comment on why "not yet authorized" must not count as a validation
-/// failure (a freshly-migrated display is very likely not yet
-/// authorized on the new CMS, and that alone says nothing about
-/// whether the new CMS is reachable/correctly configured).
+/// Confirms a candidate CMS is reachable and accepts this display.
+/// READY or WAITING both count as success -- "not yet authorized"
+/// says nothing about whether the CMS itself is reachable/correct.
 fn validate_new_cms(candidate: &CmsSettings, pub_key: String, no_verify: bool,
                      xml_dir: PathBuf) -> Result<()> {
     let mut validation_cms = xmds::Cms::new(candidate, pub_key, no_verify, xml_dir)
@@ -1570,51 +1492,29 @@ fn validate_new_cms(candidate: &CmsSettings, pub_key: String, no_verify: bool,
     Ok(())
 }
 
-/// Computes the https:// equivalent of `address` if it's currently
-/// http:// -- literal scheme swap only, keeping host/port/path exactly
-/// as configured (a deliberately simple interpretation of the real
-/// mechanism confirmed via a real Xibo project issue, xibo-linux#247:
-/// "swapped over to a HTTPS link" -- not attempting to guess a
-/// different default port). Returns None if `address` doesn't start
-/// with "http://" (already https://, or some other/unrecognized
-/// scheme) -- nothing to upgrade.
+/// Literal http:// -> https:// scheme swap, keeping host/port/path as
+/// configured. None if already https:// or another scheme.
 fn https_upgrade_address(address: &str) -> Option<String> {
     address.strip_prefix("http://").map(|rest| format!("https://{rest}"))
 }
 
-/// Whether a CMS migration should be attempted -- both a new address
-/// and a new key must be present (an empty value on either side means
-/// no migration is currently requested by the CMS).
 fn should_attempt_cms_migration(new_address: &str, new_key: &str) -> bool {
     !new_address.is_empty() && !new_key.is_empty()
 }
 
-/// The actual, disk-mutating part of a CMS migration -- separated from
-/// attempt_cms_migration's own validation (network I/O against the new
-/// CMS) and from the final process::exit() so this specific part can
-/// be unit-tested directly (constructing a real temp directory,
-/// checking the resulting files) without needing a real network call
-/// or risking killing the test process. Only ever called *after* the
-/// new CMS has already been validated as reachable and accepting.
+/// Disk-mutating part of a CMS migration, separated from validation
+/// and the final process::exit() so it's testable on its own. Only
+/// called after the new CMS is already confirmed reachable.
 fn commit_cms_migration(envdir: &Path, new_cms: &CmsSettings) -> Result<()> {
     let cms_path = envdir.join("cms.json");
     let backup_path = envdir.join("cms.json.bak");
-    // A failed backup is logged but doesn't abort an otherwise-valid
-    // migration -- losing the ability to manually inspect the old
-    // settings later is a lesser problem than failing to migrate at
-    // all after the new CMS has already confirmed it will accept us.
     if let Err(e) = fs::copy(&cms_path, backup_path) {
         log::warn!("backing up cms.json before CMS migration: {e:#}");
     }
     new_cms.to_file(&cms_path).context("writing new cms.json")?;
 
-    // Stale cache (layouts/media/resources) from the *old* CMS is at
-    // best irrelevant and at worst actively misleading against a
-    // different CMS (e.g. the same numeric layout id could mean
-    // something completely different there) -- same clearing
-    // mechanism already used for the existing --clear-cache flag (see
-    // Cache::new's own `clear` parameter), just triggered here instead
-    // of via a CLI flag on next start.
+    // Stale cache from the old CMS could be misleading (same layout id
+    // can mean something else there) -- same clearing as --clear-cache.
     let cache_dir = envdir.join("res");
     if cache_dir.is_dir() {
         if let Err(e) = fs::remove_dir_all(&cache_dir) {
@@ -1690,17 +1590,10 @@ fn apply_weather_criteria(criteria: &mut CriteriaStore, json: &str, ttl: i64) ->
     Ok(())
 }
 
-/// Decides which timezone value to report to the CMS via NotifyStatus
-/// -- see send_status_update's own comment at its call site for the
-/// full context (a real report + a real Xibo issue confirming the CMS
-/// stores whatever the player reports here back onto the display
-/// record, silently overwriting an admin's manual override if we
-/// always report the raw system timezone unconditionally). Prefers the
-/// CMS's own display_time_zone (once it's told us one -- non-empty),
-/// so our own report never fights a value the CMS already gave us;
-/// falls back to the system's own timezone only for a brand-new,
-/// never-configured display, preserving the original auto-detection
-/// use case for that case specifically.
+/// Which timezone to report via NotifyStatus. Prefers the CMS's own
+/// display_time_zone once set (else our own report would overwrite an
+/// admin's manual change), falling back to the system timezone only
+/// for a never-configured display.
 fn timezone_to_report(cms_display_time_zone: &str, system_timezone: &str) -> String {
     if !cms_display_time_zone.is_empty() {
         cms_display_time_zone.to_string()
@@ -1715,49 +1608,24 @@ mod timezone_to_report_tests {
 
     #[test]
     fn prefers_the_cms_own_value_once_it_has_provided_one() {
-        // The exact fix for the real report: once the CMS has told us
-        // a display_time_zone, our own report must echo that same
-        // value back -- never the raw system one -- so it can never
-        // silently overwrite an admin's manual CMS-side override.
         assert_eq!(timezone_to_report("Europe/London", "Europe/Rome"), "Europe/London");
     }
 
     #[test]
     fn falls_back_to_the_system_timezone_for_a_never_configured_display() {
-        // A brand-new display the CMS has never told a timezone --
-        // preserves the original auto-detection use case (Xibo issue
-        // #983: "the player should provide its timezone... stored on
-        // the display record").
         assert_eq!(timezone_to_report("", "Europe/Rome"), "Europe/Rome");
     }
 }
 
-/// Whether `file` should be exempted from this cycle's re-download,
-/// even though `Cache::has()` says it's stale (modified) -- because it
-/// occupies the *same schedule slot* currently on screen, and
-/// `expire_modified_layouts` says an in-progress modification/publish
-/// should not interrupt it.
-///
-/// Uses `scheduleid`, NOT the raw layout id, to identify "the same
-/// schedule slot" -- confirmed via two real schedule.xml samples taken
-/// directly before and after a real publish of the layout being shown:
-/// the layout id changed (925 -> 927, a new published version), but
-/// `scheduleid="224"` stayed exactly the same. Comparing raw layout
-/// ids (as an earlier version of this function did) can never detect
-/// this common case at all, since publishing a layout is *specifically
-/// what changes its id* -- the previous, id-based check only ever
-/// caught the rarer case of a layout modified in place without a
-/// separate publish step.
-///
-/// `current_scheduleid` must be looked up in the *previous* schedule
-/// (before it gets replaced by the fresh one) -- the currently-playing
-/// layout id may no longer even appear in the fresh schedule at all
-/// (it's been superseded). `fresh_schedule` is then checked for
-/// whether `file`'s own (new) layout id occupies that same scheduleid
-/// now. A `current_scheduleid` of 0 (schedule.rs's own "no real
-/// schedule entry" convention, e.g. currently showing the splash or
-/// default layout) never exempts anything -- there's no real schedule
-/// slot to match against.
+/// Whether `file` (a possibly-modified layout) occupies the same
+/// schedule slot as what's currently on screen, so it can be exempted
+/// from re-download this cycle instead of interrupting playback.
+/// Uses scheduleid, not the raw layout id -- publishing a layout
+/// changes its id but keeps the same scheduleid (confirmed via real
+/// schedule.xml before/after a publish). `current_scheduleid` must
+/// come from the *previous* schedule (the old layout id may no longer
+/// exist in the fresh one); 0 means no real schedule entry, never
+/// exempt.
 fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64,
                                           fresh_schedule: &Schedule,
                                           expire_modified_layouts: bool) -> bool {
@@ -1771,65 +1639,24 @@ fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64
     }
 }
 
-/// Whether an error's own message indicates a "Procedure ... not
-/// present" SOAP fault -- found from a real report: our own XMDS
-/// endpoint URL is hardcoded to `?v=5` (see xmds::Cms::new), but
-/// GetWeather/GetDependency/GetData are v6/v7-only additions, so a CMS
-/// whose v5 SOAP endpoint genuinely has no such method call fails
-/// this way -- permanently, not transiently, since retrying the exact
-/// same call against the exact same endpoint version will never
-/// succeed. This exact string is PHP SOAP's own generic "unknown
-/// method" fault wording (not something Xibo-specific), so this same
-/// check is reusable for any v6/v7-only method call, not just
-/// GetWeather.
+/// Whether an error is a "Procedure ... not present" SOAP fault --
+/// happens when a v6/v7-only method (GetWeather/GetDependency/GetData)
+/// is called against our v5 endpoint. Permanent, not worth retrying.
 fn is_method_not_present_fault(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("not present")
 }
 
-// POSIX's own tzset(3) -- glibc does NOT re-parse the TZ environment
-// variable just because it changed; without calling this explicitly
-// after std::env::set_var("TZ", ...), time::OffsetDateTime::now_local()
-// keeps returning the offset it had before the change. Verified
-// experimentally (a standalone check, not just reasoning from docs):
-// without this call, three different TZ values in a row all produced
-// the same, unchanged +00:00:00 offset -- setting TZ alone silently
-// had no effect at all. A single extern "C" declaration for one POSIX
-// function, rather than pulling in the whole `libc` crate as a new
-// dependency just for this.
+// tzset(3): glibc doesn't re-parse TZ on its own after set_var(). One
+// extern fn instead of pulling in `libc` just for this.
 extern "C" {
     fn tzset();
 }
 
-/// Sets *this process's own* TZ environment variable to the CMS's
-/// display_time_zone (e.g. "Europe/Rome") -- so `arexibo`'s own
-/// schedule/download-window evaluations (which read
-/// time::OffsetDateTime::now_local(), itself respecting TZ) use the
-/// CMS-specified timezone directly, without needing to touch this
-/// machine's own system-wide /etc/localtime or /etc/timezone, and
-/// without affecting any other process on the same machine. This is
-/// the standard POSIX mechanism for "override one process's own idea
-/// of local time" -- setting TZ does not change the system timezone.
-///
-/// Self-correcting rather than merely alerting: even a totem whose
-/// system timezone ended up wrong (despite an autoinstall image
-/// intending to force it -- manual setup, hardware clock issue, human
-/// error) still evaluates schedules/download windows correctly, using
-/// what the CMS's own Display record says this display should be in,
-/// rather than requiring someone to notice a warning in the logs and
-/// go fix the system's own configuration.
-///
-/// SAFETY-ADJACENT: only call this once, very early, before any other
-/// thread has been spawned (main.rs's own Handler::new() call, before
-/// its own `std::thread::spawn` and before gui::run()) -- mutating
-/// process environment variables concurrently with another thread
-/// reading them is a real, platform-level hazard regardless of
-/// whether a given Rust toolchain's std::env::set_var happens to
-/// require an `unsafe` block or not (this crate's own `time`
-/// dependency gates its equivalent functionality behind an opt-in
-/// "local-offset" feature for exactly this reason). See
-/// process_timezone_applied's own doc comment for how the *caller*
-/// (update_settings) avoids ever calling this again from a later,
-/// multi-threaded context.
+/// Sets this process's own TZ env var to the CMS's display_time_zone,
+/// so schedule/download-window checks use it without touching the
+/// system-wide timezone. Only call once, before any other thread
+/// exists -- mutating env vars concurrently with another thread
+/// reading them is unsafe regardless of what the compiler enforces.
 fn apply_process_timezone(tz: &str) {
     match util::read_system_timezone() {
         Some(sys_tz) if sys_tz != tz => log::info!(
@@ -1840,35 +1667,20 @@ fn apply_process_timezone(tz: &str) {
                           own display_time_zone setting)"),
     }
     std::env::set_var("TZ", tz);
-    // SAFETY: tzset() only reads the TZ environment variable and
-    // updates process-global libc state describing the current
-    // timezone rules -- it does not take/return pointers we own, and
-    // is safe to call from a single thread (see apply_process_timezone's
-    // own SAFETY-ADJACENT doc comment for why this whole function is
-    // only ever called once, early, before any other thread exists).
+    // SAFETY: only reads TZ and updates process-global libc state; safe
+    // single-threaded, per this function's own doc comment.
     unsafe { tzset(); }
 }
 
-/// What update_settings should do about the CMS's own display_time_zone,
-/// given what (if anything) has already been applied this run -- see
-/// apply_process_timezone's own doc comment for the full context.
-/// Extracted as its own pure decision (computed, not acted upon) so it
-/// can be unit-tested directly without mutating this whole test
-/// binary's own real TZ environment variable, which is process-global
-/// and would risk flaky interference with any other test that also
-/// happens to read it.
+/// Pure decision so this can be unit-tested without touching the real
+/// (process-global) TZ env var.
 #[derive(Debug, PartialEq, Eq)]
 enum TimezoneAction {
-    /// Nothing to do -- either the CMS didn't send one, or it matches
-    /// what's already applied.
     DoNothing,
-    /// Not yet applied this run -- safe to apply now (only ever
-    /// reached from the single-threaded window at startup, see
-    /// apply_process_timezone's own SAFETY-ADJACENT note).
     Apply(String),
-    /// Already applied a *different* value this run -- changing it
-    /// again from here would be from a later, potentially
-    /// multi-threaded context, so report instead of acting.
+    /// Already applied a different value this run -- changing it again
+    /// would happen from a later, possibly multi-threaded context, so
+    /// report instead of acting.
     WarnRestartNeeded { was: String, now: String },
 }
 
@@ -2837,10 +2649,6 @@ mod is_method_not_present_fault_tests {
 
     #[test]
     fn recognizes_the_real_reported_error_message() {
-        // The exact real report: our own v5-hardcoded XMDS endpoint
-        // (see xmds::Cms::new) genuinely has no GetWeather method
-        // (v6/v7-only) -- confirmed via a real warning log from an
-        // actual totem.
         let err = anyhow::anyhow!("getting weather: parsing GetWeather SOAP response: \
                                     got SOAP fault: Procedure 'GetWeather' not present");
         assert!(is_method_not_present_fault(&err));
@@ -2848,9 +2656,6 @@ mod is_method_not_present_fault_tests {
 
     #[test]
     fn does_not_misclassify_an_unrelated_error() {
-        // A genuine network/auth failure must NOT be treated as
-        // "permanently unsupported" -- it should keep retrying
-        // normally, unlike a real method-not-present fault.
         let err = anyhow::anyhow!("getting weather: io: connection refused");
         assert!(!is_method_not_present_fault(&err));
     }
@@ -2862,9 +2667,6 @@ mod decide_timezone_action_tests {
 
     #[test]
     fn applies_on_first_registration() {
-        // The safe, single-threaded window at startup (see
-        // apply_process_timezone's own SAFETY-ADJACENT note) -- nothing
-        // applied yet this run, the CMS sent a real value.
         assert_eq!(decide_timezone_action(&None, "Europe/Rome"),
                    TimezoneAction::Apply("Europe/Rome".to_string()));
     }
@@ -2878,11 +2680,6 @@ mod decide_timezone_action_tests {
 
     #[test]
     fn warns_instead_of_reapplying_when_the_cms_value_changes_later() {
-        // Must NOT call apply_process_timezone again here -- this path
-        // is reached from update_settings() being called repeatedly
-        // from collect_once(), which runs on a separate thread from
-        // the one that first constructed this Handler (see
-        // process_timezone_applied's own doc comment).
         assert_eq!(
             decide_timezone_action(&Some("Europe/Rome".to_string()), "America/New_York"),
             TimezoneAction::WarnRestartNeeded {
@@ -2892,8 +2689,6 @@ mod decide_timezone_action_tests {
 
     #[test]
     fn does_nothing_when_the_cms_sends_nothing() {
-        // An empty value is "the CMS didn't send this field", not "the
-        // CMS wants an empty timezone" -- nothing to apply.
         assert_eq!(decide_timezone_action(&None, ""), TimezoneAction::DoNothing);
         assert_eq!(decide_timezone_action(&Some("Europe/Rome".to_string()), ""),
                    TimezoneAction::DoNothing);
@@ -2906,19 +2701,10 @@ mod apply_process_timezone_tests {
 
     #[test]
     fn genuinely_changes_this_processs_own_local_offset() {
-        // End-to-end check, not just the decision logic above --
-        // std::env::set_var("TZ", ...) alone was verified experimentally
-        // to have NO effect on time::OffsetDateTime::now_local() without
-        // also calling tzset() afterward (three different TZ values in
-        // a row all produced the same unchanged offset without it) --
-        // this test exists specifically to catch that exact class of
-        // regression, which a pure decision-logic test can't.
-        //
-        // NOTE: TZ is process-global process state; no other test in
-        // this codebase currently reads/sets it, so this is safe today,
-        // but a new test relying on a *specific* current offset without
-        // itself pinning TZ could flake if it happens to run
-        // concurrently with this one.
+        // End-to-end: catches missing tzset() calls that a pure
+        // decision-logic test can't. TZ is process-global, so this
+        // could flake if run concurrently with another test relying on
+        // a specific offset -- none currently do.
         apply_process_timezone("Europe/Rome");
         let offset = time::OffsetDateTime::now_local().unwrap().offset();
         assert_eq!(offset.whole_hours(), 2, "August in Europe/Rome must be UTC+2 (CEST)");
@@ -2939,11 +2725,8 @@ mod is_exempt_as_currently_playing_layout_tests {
                         path: String::new(), name: String::new(), code: None }
     }
 
-    /// Builds a real Schedule from XML, same wide-open from/to window
-    /// convention as the real schedule.xml samples this whole fix is
-    /// based on (`fromdt="1970-01-01 01:00:00" todt="2038-01-19
-    /// 04:14:07"` -- always "currently active" regardless of when the
-    /// test itself runs).
+    // Same wide-open from/to window as real schedule.xml samples --
+    // always "currently active" regardless of when the test runs.
     fn schedule_with(layout_file_id: i64, scheduleid: i64) -> Schedule {
         let xml = format!(
             r#"<schedule generated="2026-08-21 11:53:13" filterFrom="2026-08-21 11:00:00" filterTo="2026-08-23 11:00:00">
@@ -2956,29 +2739,17 @@ mod is_exempt_as_currently_playing_layout_tests {
 
     #[test]
     fn exempts_a_republished_layout_occupying_the_same_schedule_slot() {
-        // The exact real scenario confirmed via two real schedule.xml
-        // samples taken directly before/after a real publish: layout
-        // 925 got republished as 927 (a NEW layout id -- publishing is
-        // specifically what changes it), but scheduleid="224" stayed
-        // exactly the same in both. current_scheduleid is looked up in
-        // the *old* schedule (925 -> 224); the fresh schedule now maps
-        // 927 -> 224 too -- same slot, must be exempted.
         let old_schedule = schedule_with(925, 224);
         let fresh_schedule = schedule_with(927, 224);
         let current_scheduleid = old_schedule.scheduleid_for(925);
-        assert_eq!(current_scheduleid, 224, "sanity check on the old schedule's own lookup");
+        assert_eq!(current_scheduleid, 224);
         assert!(is_exempt_as_currently_playing_layout(&layout_file(927), current_scheduleid,
                                                         &fresh_schedule, false),
-                "a republished layout occupying the same schedule slot must be exempted -- \
-                 comparing raw layout ids (925 != 927) would incorrectly NOT exempt this, \
-                 which is the exact bug this fix addresses");
+                "a republished layout occupying the same schedule slot must be exempted");
     }
 
     #[test]
     fn does_not_exempt_a_genuinely_different_schedule_slot() {
-        // A DIFFERENT layout (different scheduleid) being modified must
-        // still get its normal validity check -- only the slot
-        // currently on screen is exempted.
         let old_schedule = schedule_with(925, 224);
         let fresh_schedule = schedule_with(913, 225);
         let current_scheduleid = old_schedule.scheduleid_for(925);
@@ -2988,8 +2759,6 @@ mod is_exempt_as_currently_playing_layout_tests {
 
     #[test]
     fn does_not_exempt_anything_when_expire_modified_layouts_is_true() {
-        // The CMS explicitly wants even the currently playing schedule
-        // slot refreshed immediately when modified/republished.
         let old_schedule = schedule_with(925, 224);
         let fresh_schedule = schedule_with(927, 224);
         let current_scheduleid = old_schedule.scheduleid_for(925);
@@ -2999,9 +2768,6 @@ mod is_exempt_as_currently_playing_layout_tests {
 
     #[test]
     fn does_not_exempt_non_layout_files() {
-        // Only layout-type files participate in this mechanism -- a
-        // media file happening to share the same numeric id as the
-        // republished layout must not be exempted.
         let old_schedule = schedule_with(925, 224);
         let fresh_schedule = schedule_with(927, 224);
         let current_scheduleid = old_schedule.scheduleid_for(925);
@@ -3013,11 +2779,6 @@ mod is_exempt_as_currently_playing_layout_tests {
 
     #[test]
     fn a_zero_current_scheduleid_never_exempts_anything() {
-        // 0 is schedule.rs's own "no real schedule entry" convention
-        // (e.g. currently showing the splash screen or the default
-        // layout, neither of which is a real <layout> schedule entry)
-        // -- there's no genuine schedule slot to match against, so
-        // nothing should ever be exempted on that basis.
         let fresh_schedule = schedule_with(927, 224);
         assert!(!is_exempt_as_currently_playing_layout(&layout_file(927), 0,
                                                          &fresh_schedule, false));
@@ -3060,9 +2821,8 @@ mod screenshot_requested_tests {
         dir
     }
 
-    /// Counts how many ToGui::Screenshot messages are currently queued
-    /// (draining the channel), ignoring any other ToGui variant (e.g.
-    /// the ToGui::Settings that update_settings() always also sends).
+    // Counts queued ToGui::Screenshot messages, ignoring other variants
+    // (e.g. ToGui::Settings, always also sent).
     fn count_screenshot_messages(rx: &crossbeam_channel::Receiver<ToGui>) -> usize {
         let mut n = 0;
         while let Ok(msg) = rx.try_recv() {
@@ -3075,16 +2835,6 @@ mod screenshot_requested_tests {
 
     #[test]
     fn fulfills_a_pending_request_exactly_once_while_the_flag_stays_true() {
-        // The real mechanism this fixes (confirmed via the actual CMS
-        // PHP source, Controller/Display.php's own requestScreenShot()):
-        // screenShotRequested is a fallback for a screenshot request
-        // whose real-time XMR push was lost (e.g. display offline at
-        // the time) -- reported honestly on every subsequent
-        // RegisterDisplay call until fulfilled. Edge-triggered: must
-        // fire once when the flag becomes true, and must NOT fire
-        // again on a later cycle where the CMS's own flag simply
-        // hasn't been reset back to false yet (avoiding a new
-        // screenshot every single collection cycle in that window).
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -3094,19 +2844,15 @@ mod screenshot_requested_tests {
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx).unwrap();
-        // Drain whatever update_settings() sent during construction.
         let _ = count_screenshot_messages(&togui_rx);
 
         handler.settings.screen_shot_requested = true;
         handler.update_settings();
-        assert_eq!(count_screenshot_messages(&togui_rx), 1,
-                   "must fulfill the pending request exactly once when the flag becomes true");
+        assert_eq!(count_screenshot_messages(&togui_rx), 1);
 
-        // Simulate the flag staying true for a second cycle (CMS
-        // hasn't reset it yet) -- must NOT fire again.
+        // Flag stays true for a second cycle -- must not fire again.
         handler.update_settings();
-        assert_eq!(count_screenshot_messages(&togui_rx), 0,
-                   "must not repeat the screenshot every cycle while the flag simply stays true");
+        assert_eq!(count_screenshot_messages(&togui_rx), 0);
 
         // CMS resets the flag once it receives our submission.
         handler.settings.screen_shot_requested = false;
@@ -3127,14 +2873,10 @@ mod https_upgrade_address_tests {
 
     #[test]
     fn swaps_http_to_https_keeping_everything_else() {
-        // Deliberately literal scheme swap only -- confirmed real
-        // mechanism (xibo-linux#247): "swapped over to a HTTPS link",
-        // not a different default port.
         assert_eq!(https_upgrade_address("http://cms.example.com"),
                    Some("https://cms.example.com".to_string()));
         assert_eq!(https_upgrade_address("http://192.168.2.138:9092"),
-                   Some("https://192.168.2.138:9092".to_string()),
-                   "an explicit port must be kept exactly as configured");
+                   Some("https://192.168.2.138:9092".to_string()));
     }
 
     #[test]
@@ -3186,12 +2928,10 @@ mod commit_cms_migration_tests {
         let written = CmsSettings::from_file(envdir.join("cms.json")).unwrap();
         assert_eq!(written.address, "https://new.example.com");
         assert_eq!(written.key, "newkey");
-        assert_eq!(written.display_id, "stable-hw-id-123",
-                   "the stable hardware identity must be preserved, not the old CMS's own value");
+        assert_eq!(written.display_id, "stable-hw-id-123");
 
         let backed_up = CmsSettings::from_file(envdir.join("cms.json.bak")).unwrap();
-        assert_eq!(backed_up.address, "https://old.example.com",
-                   "the old settings must be backed up before being overwritten");
+        assert_eq!(backed_up.address, "https://old.example.com");
     }
 
     #[test]
@@ -3207,17 +2947,11 @@ mod commit_cms_migration_tests {
                                      proxy: None };
         commit_cms_migration(&envdir, &new_cms).unwrap();
 
-        assert!(!cache_dir.join("stale_layout.xlf.html").exists(),
-                "stale cache from the old CMS must be cleared -- it's at best irrelevant and \
-                 at worst actively misleading against a different CMS");
+        assert!(!cache_dir.join("stale_layout.xlf.html").exists());
     }
 
     #[test]
     fn succeeds_even_without_a_pre_existing_cache_directory() {
-        // A totem that has never actually downloaded anything yet (or
-        // one where "res" was already removed for some other reason)
-        // must not fail the migration just because there's nothing to
-        // clear.
         let envdir = test_envdir();
         old_cms().to_file(envdir.join("cms.json")).unwrap();
         let new_cms = CmsSettings { address: "https://new.example.com".into(), key: "newkey".into(),
@@ -3266,24 +3000,14 @@ mod validate_new_cms_tests {
 
     #[test]
     fn a_waiting_not_yet_authorized_response_is_also_a_successful_validation() {
-        // The exact scenario flagged directly: a freshly-migrated
-        // display is very likely not yet authorized on the new CMS --
-        // that alone must not block the migration, since it says
-        // nothing about whether the new CMS is reachable/correctly
-        // configured. Matches the same "not an error, just not ready
-        // yet" reasoning pending_auth already uses elsewhere.
         let port = start_mock(r#"<ActivationMessage code="WAITING"/>"#);
         let candidate = CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "k".into(),
                                        display_id: "d".into(), display_name: None, proxy: None };
-        assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_ok(),
-                "WAITING (not yet authorized) must count as a successful validation, not a failure");
+        assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_ok());
     }
 
     #[test]
     fn an_unreachable_server_fails_validation() {
-        // A genuinely unreachable address (nothing listening) --
-        // simulates the new CMS being misconfigured/down, which must
-        // block the migration.
         let unreachable_port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -3291,7 +3015,6 @@ mod validate_new_cms_tests {
         let candidate = CmsSettings { address: format!("http://127.0.0.1:{unreachable_port}"),
                                        key: "k".into(), display_id: "d".into(), display_name: None,
                                        proxy: None };
-        assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_err(),
-                "an unreachable new CMS must fail validation, not be silently treated as OK");
+        assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_err());
     }
 }

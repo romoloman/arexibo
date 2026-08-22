@@ -20,37 +20,19 @@ use crate::resource::ReqFile;
 use crate::schedule::Schedule;
 use crate::logger::LogEntry;
 
-/// XMDS endpoint version this client currently connects with. Each
-/// XMDS version is a genuinely separate PHP class server-side
-/// (Soap5.php, Soap6.php, Soap7.php, ...), not a single class with
-/// clientType/clientCode-conditional behavior -- confirmed via a real
-/// report (a genuine "Procedure 'GetWeather' not present" SOAP fault
-/// against this exact v5 endpoint) and the CMS's own architecture
-/// docs ("web/xmds.php creates the appropriate SOAP handler based on
-/// the requested version"). GetDependency/GetData/GetWeather are
-/// v6/v7-only additions -- v5's own handler class doesn't have them
-/// at all, so calling them against this endpoint version will always
-/// fail, not just sometimes.
+/// XMDS endpoint version -- each version is a separate server-side
+/// handler (Soap5.php, Soap6.php...), so v6/v7-only methods
+/// (GetWeather/GetDependency/GetData) always fail against v5.
 ///
-/// IMPORTANT if this ever gets bumped: CMS v4+'s own Data Widget
-/// JSON/HTML splitting (RequiredFiles entries with type="widget",
-/// consumed via GetData) is *also* gated by this same endpoint
-/// version, not by clientType/clientCode -- v5's handler class simply
-/// doesn't generate those entries, which is *why* Data Widgets
-/// currently render correctly via the older, everything-embedded-in-
-/// the-.htm path (see xmds::Cms::get_data's own doc comment for the
-/// full context). Bumping this without first finishing GetData's own
-/// end-to-end integration (recognizing type="widget", saving as
-/// <id>.json, serving it via the local webserver) would break Data
-/// Widgets, not just leave GetWeather/GetDependency still unsupported.
+/// WARNING if bumping this: CMS v4+'s Data Widget JSON/HTML splitting
+/// is also gated by this version, not by clientType/clientCode -- v5
+/// just doesn't generate those entries, which is why Data Widgets
+/// currently work via the embedded-HTML path. Bumping without first
+/// finishing GetData integration would break them.
 const XMDS_ENDPOINT_VERSION: u32 = 5;
 
-/// Whether the current XMDS endpoint version has GetWeather (and, as
-/// far as confirmed, GetDependency/GetData too -- all three were added
-/// together) available at all -- see XMDS_ENDPOINT_VERSION's own doc
-/// comment. Lets callers skip even the first attempt at a call that's
-/// known in advance to always fail, rather than only discovering this
-/// via a failed SOAP round-trip.
+/// Whether the endpoint has GetWeather/GetDependency/GetData -- lets
+/// callers skip a call known to always fail.
 pub fn xmds_supports_v6_v7_methods() -> bool {
     XMDS_ENDPOINT_VERSION >= 6
 }
@@ -276,26 +258,11 @@ impl Cms {
                                                                   String::new())?,
                 download_end_window: tree.def_child::<String>("downloadEndWindow",
                                                                 String::new())?,
-                // Confirmed real element name and format from an actual
-                // RegisterDisplay response ("Europe/Rome") -- see the
-                // field's own doc comment in config.rs.
                 display_time_zone: tree.def_child::<String>("displayTimeZone", String::new())?,
-                // Confirmed real element name from an actual
-                // RegisterDisplay response -- see the field's own doc
-                // comment in config.rs for the full mechanism.
                 expire_modified_layouts: tree.def_child::<i32>("expireModifiedLayouts", 0)? != 0,
-                // Confirmed real element name from an actual
-                // RegisterDisplay response -- see the field's own doc
-                // comment in config.rs for the full mechanism.
                 screen_shot_requested: tree.def_child::<i32>("screenShotRequested", 0)? != 0,
-                // Confirmed real element names from an actual
-                // RegisterDisplay response (both empty when no
-                // migration is pending) -- see the fields' own doc
-                // comment in config.rs.
                 new_cms_address: tree.def_child::<String>("newCmsAddress", String::new())?,
                 new_cms_key: tree.def_child::<String>("newCmsKey", String::new())?,
-                // Confirmed real element name from an actual
-                // RegisterDisplay response.
                 force_https: tree.def_child::<i32>("forceHttps", 0)? != 0,
                 // embeddedServerPort from the CMS is effectively
                 // vestigial regardless -- main.rs immediately overwrites
@@ -1094,15 +1061,9 @@ mod xmds_supports_v6_v7_methods_tests {
 
     #[test]
     fn correctly_reflects_the_current_hardcoded_endpoint_version() {
-        // Trip-wire, not a guarantee: if XMDS_ENDPOINT_VERSION is ever
-        // bumped past 5, this test starts failing -- a deliberate
-        // prompt to go re-read that constant's own doc comment (Data
-        // Widgets would need GetData's own end-to-end integration
-        // finished first, not just this flag flipping) before updating
-        // the expected value here.
-        assert!(!xmds_supports_v6_v7_methods(),
-                "XMDS_ENDPOINT_VERSION is 5 -- GetWeather/GetDependency/GetData must not \
-                 be considered supported yet");
+        // Trip-wire: if XMDS_ENDPOINT_VERSION is bumped, re-read its
+        // doc comment before updating this expected value.
+        assert!(!xmds_supports_v6_v7_methods());
     }
 }
 
