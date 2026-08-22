@@ -111,7 +111,7 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
     // widget-box-overflow issue, and separately QT_FONT_DPI (changes
     // what QScreen reports but was empirically confirmed to have zero
     // effect on QtWebEngine's own actual rendered CSS font-size), were
-    // all investigated and ruled out (see AREXIBO_STATO_LAVORO.md) --
+    // all investigated and ruled out --
     // the likely remaining explanation (QtWebEngine not honoring
     // mobile-style meta viewport tags the way CEF apparently does) was
     // identified but not implemented (would need a Chrome DevTools

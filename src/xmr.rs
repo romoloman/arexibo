@@ -1087,7 +1087,7 @@ mod wss_tls_hostname_tests {
         // Regression test for a real, live report against a genuine
         // CMS with a real TLS certificate: "invalid peer certificate:
         // certificate not valid for name 'localhost'; certificate is
-        // only valid for DnsName('xibotest.tmaxlab.it')" -- the SNI/
+        // only valid for DnsName('cms.example.com')" -- the SNI/
         // certificate-validation hostname was hardcoded to the literal
         // string "localhost" regardless of the actual host being
         // connected to, meaning a properly *verified* wss:// connection

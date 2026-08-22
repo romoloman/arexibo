@@ -631,6 +631,199 @@ impl<W> Write for HashingWriter<W> where W: Write {
 const PDFJS_LIB: &[u8] = include_bytes!("../assets/pdfjs/pdf.min.mjs");
 const PDFJS_WORKER: &[u8] = include_bytes!("../assets/pdfjs/pdf.worker.min.mjs");
 
+// --- Data Widget recognition (v7 GetData groundwork) ----------------
+//
+// Not yet wired into the real collection cycle -- collect_once() never
+// calls parse_data_widgets/needs_get_data today. Stays inert on v5:
+// GetResource's own generated HTML always has data already embedded
+// there (confirmed via real CMS comparison), so needs_get_data()
+// never returns true against a real v5 CMS. Written now so a future
+// v7 branch has this ready rather than starting from scratch.
+
+/// One `widgetData.push({...})` entry found in a widget's own rendered
+/// HTML (see xmds::Cms::get_resource) -- only the fields relevant to
+/// deciding whether GetData is needed, not the full object (which also
+/// carries template/style content irrelevant here).
+#[allow(dead_code)] // groundwork for v7, see module-level comment above
+#[derive(Debug, Clone, PartialEq)]
+struct DataWidgetInfo {
+    widget_id: i64,
+    /// True when `data` is JSON null *and* `url` is a real path (not
+    /// the literal string "null") -- confirmed real v7 shape:
+    /// `"url":"4543.json","data":null`. On v5, `data` is the actual
+    /// embedded payload and `url` is the literal string "null", so
+    /// this is false.
+    needs_get_data: bool,
+}
+
+/// Finds every `widgetData.push({...})` call in `html` and parses each
+/// as JSON, returning the ones that look like real data widgets (have
+/// a `widgetId`). Malformed/unparseable entries are skipped rather
+/// than failing the whole scan -- one broken widget's markup
+/// shouldn't hide the others in the same resource (Elements designer
+/// can combine several widgets into one resource file).
+#[allow(dead_code)] // groundwork for v7, see module-level comment above
+fn parse_data_widgets(html: &str) -> Vec<DataWidgetInfo> {
+    const MARKER: &str = "widgetData.push(";
+    let mut found = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = html[pos..].find(MARKER) {
+        let obj_start = pos + rel + MARKER.len();
+        let Some(json_str) = extract_balanced_json_object(&html[obj_start..]) else {
+            break; // unbalanced/truncated -- nothing more to find reliably
+        };
+        pos = obj_start + json_str.len();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
+        let Some(widget_id) = value.get("widgetId").and_then(|v| v.as_i64()) else { continue };
+        let url_is_real_path = matches!(value.get("url"), Some(serde_json::Value::String(s)) if s != "null");
+        let data_is_null = matches!(value.get("data"), Some(serde_json::Value::Null) | None);
+        found.push(DataWidgetInfo { widget_id, needs_get_data: url_is_real_path && data_is_null });
+    }
+    found
+}
+
+/// Given `s` starting (after optional leading whitespace) with a JSON
+/// object literal `{`, returns the exact matching substring for that
+/// object -- correctly tracking string literals (respecting `\"`
+/// escapes) so braces *inside* a string value (e.g. a CSS `styleSheet`
+/// property containing literal `{`/`}` characters, confirmed present
+/// in real widget data) don't get miscounted as structural nesting.
+/// A naive "count all braces" scan, or any regex-based approach, would
+/// break exactly on this real, observed shape.
+#[allow(dead_code)] // groundwork for v7, see module-level comment above
+fn extract_balanced_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    if bytes.get(i) != Some(&b'{') { return None; }
+    let start = i;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if escaped { escaped = false; }
+            else if c == b'\\' { escaped = true; }
+            else if c == b'"' { in_string = false; }
+        } else {
+            match c {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 { return Some(&s[start..=i]); }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod extract_balanced_json_object_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_a_simple_object() {
+        assert_eq!(extract_balanced_json_object(r#"{"a":1});"#), Some(r#"{"a":1}"#));
+    }
+
+    #[test]
+    fn handles_braces_inside_a_string_value() {
+        // Adversarial case: an UNMATCHED closing brace inside a string
+        // value, followed by real content that must still be included.
+        // A naive brace-count (or any regex) would hit depth 0 at that
+        // stray `}` and truncate the object early, right in the middle
+        // of the styleSheet string -- exactly the kind of real,
+        // observed shape (CSS containing braces) this guards against.
+        let input = r#"{"a":1,"styleSheet":"width: 1080px; }","b":2});"#;
+        assert_eq!(extract_balanced_json_object(input),
+                   Some(r#"{"a":1,"styleSheet":"width: 1080px; }","b":2}"#));
+    }
+
+    #[test]
+    fn handles_escaped_quotes_inside_a_string_value() {
+        let input = r#"{"template":"<td class=\"cella\">[NOME]</td>"});"#;
+        assert_eq!(extract_balanced_json_object(input),
+                   Some(r#"{"template":"<td class=\"cella\">[NOME]</td>"}"#));
+    }
+
+    #[test]
+    fn handles_nested_objects() {
+        let input = r#"{"a":1,"properties":{"b":2,"c":{"d":3}}});"#;
+        assert_eq!(extract_balanced_json_object(input),
+                   Some(r#"{"a":1,"properties":{"b":2,"c":{"d":3}}}"#));
+    }
+
+    #[test]
+    fn returns_none_for_unbalanced_input() {
+        assert_eq!(extract_balanced_json_object(r#"{"a":1"#), None);
+    }
+
+    #[test]
+    fn returns_none_when_not_starting_with_a_brace() {
+        assert_eq!(extract_balanced_json_object("not json"), None);
+    }
+}
+
+#[cfg(test)]
+mod parse_data_widgets_tests {
+    use super::*;
+
+    #[test]
+    fn a_real_v5_resource_does_not_need_get_data() {
+        // Trimmed from a real GetResource response (a real CMS,
+        // v5, widget 4543, dataset "numeriutili") -- data is embedded
+        // directly, url is the literal string "null".
+        let html = r#"<script>
+        var widgetData = [];
+        widgetData.push({"widgetId":4543,"templateId":"custom_numeriutili","url":"null","data":{"data":[{"NOME":"Mario Rossi"}],"meta":{}}});
+        var elements = [];
+        </script>"#;
+        let widgets = parse_data_widgets(html);
+        assert_eq!(widgets, vec![DataWidgetInfo { widget_id: 4543, needs_get_data: false }]);
+    }
+
+    #[test]
+    fn a_real_v7_resource_needs_get_data() {
+        // Same real widget, same CMS, only the endpoint version
+        // differs -- confirmed real v7 shape: url is a real path,
+        // data is JSON null.
+        let html = r#"<script>
+        var widgetData = [];
+        widgetData.push({"widgetId":4543,"templateId":"custom_numeriutili","url":"4543.json","data":null});
+        var elements = [];
+        </script>"#;
+        let widgets = parse_data_widgets(html);
+        assert_eq!(widgets, vec![DataWidgetInfo { widget_id: 4543, needs_get_data: true }]);
+    }
+
+    #[test]
+    fn finds_multiple_pushes_in_one_elements_designer_resource() {
+        // Elements designer can combine several widgets into one
+        // resource file (see find_nested_widget_resource's own doc
+        // comment) -- must not stop after the first push().
+        let html = r#"<script>
+        widgetData.push({"widgetId":100,"url":"null","data":{"x":1}});
+        widgetData.push({"widgetId":200,"url":"200.json","data":null});
+        </script>"#;
+        let widgets = parse_data_widgets(html);
+        assert_eq!(widgets, vec![
+            DataWidgetInfo { widget_id: 100, needs_get_data: false },
+            DataWidgetInfo { widget_id: 200, needs_get_data: true },
+        ]);
+    }
+
+    #[test]
+    fn ignores_content_with_no_widget_data_at_all() {
+        let html = r#"<html><body>plain layout, no data widgets here</body></html>"#;
+        assert_eq!(parse_data_widgets(html), vec![]);
+    }
+}
+
 #[cfg(test)]
 mod purge_tests {
     use super::*;
