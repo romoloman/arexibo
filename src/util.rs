@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn hex_roundtrip() {
-        let original = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let original = [0xDE, 0xAD, 0xBE, 0xEF];
         let json = serde_json::to_string(&hex::encode(&original)).unwrap();
         let back: String = serde_json::from_str(&json).unwrap();
         assert_eq!(hex::decode(back).unwrap(), original);

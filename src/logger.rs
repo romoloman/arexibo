@@ -91,7 +91,7 @@ mod tests {
         // resulting String for both destinations) rather than only at
         // that one call site, so this can never recur for any other
         // current or future log:: call in this codebase.
-        let items = vec![925, 913, 805];
+        let items = [925, 913, 805];
         let formatted_once = items.iter().format(", ");
 
         // Must not panic -- this is the actual assertion. Calling this
