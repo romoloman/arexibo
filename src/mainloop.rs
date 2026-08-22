@@ -1690,33 +1690,6 @@ fn apply_weather_criteria(criteria: &mut CriteriaStore, json: &str, ttl: i64) ->
     Ok(())
 }
 
-/// Whether `file` should be exempted from this cycle's re-download,
-/// even though `Cache::has()` says it's stale (modified) -- because it
-/// occupies the *same schedule slot* currently on screen, and
-/// `expire_modified_layouts` says an in-progress modification/publish
-/// should not interrupt it.
-///
-/// Uses `scheduleid`, NOT the raw layout id, to identify "the same
-/// schedule slot" -- confirmed via two real schedule.xml samples taken
-/// directly before and after a real publish of the layout being shown:
-/// the layout id changed (925 -> 927, a new published version), but
-/// `scheduleid="224"` stayed exactly the same. Comparing raw layout
-/// ids (as an earlier version of this function did) can never detect
-/// this common case at all, since publishing a layout is *specifically
-/// what changes its id* -- the previous, id-based check only ever
-/// caught the rarer case of a layout modified in place without a
-/// separate publish step.
-///
-/// `current_scheduleid` must be looked up in the *previous* schedule
-/// (before it gets replaced by the fresh one) -- the currently-playing
-/// layout id may no longer even appear in the fresh schedule at all
-/// (it's been superseded). `fresh_schedule` is then checked for
-/// whether `file`'s own (new) layout id occupies that same scheduleid
-/// now. A `current_scheduleid` of 0 (schedule.rs's own "no real
-/// schedule entry" convention, e.g. currently showing the splash or
-/// default layout) never exempts anything -- there's no real schedule
-/// slot to match against.
-
 /// Decides which timezone value to report to the CMS via NotifyStatus
 /// -- see send_status_update's own comment at its call site for the
 /// full context (a real report + a real Xibo issue confirming the CMS
@@ -1759,6 +1732,32 @@ mod timezone_to_report_tests {
     }
 }
 
+/// Whether `file` should be exempted from this cycle's re-download,
+/// even though `Cache::has()` says it's stale (modified) -- because it
+/// occupies the *same schedule slot* currently on screen, and
+/// `expire_modified_layouts` says an in-progress modification/publish
+/// should not interrupt it.
+///
+/// Uses `scheduleid`, NOT the raw layout id, to identify "the same
+/// schedule slot" -- confirmed via two real schedule.xml samples taken
+/// directly before and after a real publish of the layout being shown:
+/// the layout id changed (925 -> 927, a new published version), but
+/// `scheduleid="224"` stayed exactly the same. Comparing raw layout
+/// ids (as an earlier version of this function did) can never detect
+/// this common case at all, since publishing a layout is *specifically
+/// what changes its id* -- the previous, id-based check only ever
+/// caught the rarer case of a layout modified in place without a
+/// separate publish step.
+///
+/// `current_scheduleid` must be looked up in the *previous* schedule
+/// (before it gets replaced by the fresh one) -- the currently-playing
+/// layout id may no longer even appear in the fresh schedule at all
+/// (it's been superseded). `fresh_schedule` is then checked for
+/// whether `file`'s own (new) layout id occupies that same scheduleid
+/// now. A `current_scheduleid` of 0 (schedule.rs's own "no real
+/// schedule entry" convention, e.g. currently showing the splash or
+/// default layout) never exempts anything -- there's no real schedule
+/// slot to match against.
 fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64,
                                           fresh_schedule: &Schedule,
                                           expire_modified_layouts: bool) -> bool {
