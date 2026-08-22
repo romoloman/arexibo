@@ -357,7 +357,7 @@ impl Cms {
                     typ: match typ { "media" => "media", "layout" => "layout",
                                       _ => unreachable!() },
                     size: file.parse_attr("size")?,
-                    md5: hex::decode(&file.parse_attr::<String>("md5")?)?,
+                    md5: hex::decode(file.parse_attr::<String>("md5")?)?,
                     code: file.get_attr("code").map(Into::into),
                     path, name, http,
                 });

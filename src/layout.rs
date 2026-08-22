@@ -1175,7 +1175,7 @@ mod transition_tests {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         html
     }
 
@@ -1349,7 +1349,7 @@ mod native_webpage_tests {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         html
     }
 
@@ -1421,7 +1421,7 @@ mod per_widget_transition_tests {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         html
     }
 
@@ -1617,7 +1617,7 @@ mod zindex_regression_test {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         assert!(html.contains("el.style.zIndex = '9999'"),
                 "fadeOut must bump z-index so the fade is actually visible, \
                  not hidden behind the already-shown next widget");
@@ -1642,7 +1642,7 @@ mod loop_tests {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         html
     }
 
@@ -1925,7 +1925,7 @@ mod action_tests {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         assert!(html.contains("document.addEventListener('keydown'"),
                 "must bind a keydown listener for the touch+triggerCode Key Press feature");
         assert!(html.contains("e.code === \"Space\""));
@@ -1957,7 +1957,7 @@ mod action_tests {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, 0).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         assert!(html.contains("performAction(\"navLayout\", \"screen\", 0, 999)"));
     }
 }
@@ -1982,7 +1982,7 @@ mod html_sharding_tests {
         let t = Translator::new(1, &xlf_path, &html_path, &map, None, port).unwrap();
         t.translate().unwrap();
         let mut html = String::new();
-        fs::File::open(&html_path).unwrap().read_to_string(&mut html).unwrap();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         html
     }
 
