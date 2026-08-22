@@ -1603,7 +1603,7 @@ fn commit_cms_migration(envdir: &Path, new_cms: &CmsSettings) -> Result<()> {
     // migration -- losing the ability to manually inspect the old
     // settings later is a lesser problem than failing to migrate at
     // all after the new CMS has already confirmed it will accept us.
-    if let Err(e) = fs::copy(&cms_path, &backup_path) {
+    if let Err(e) = fs::copy(&cms_path, backup_path) {
         log::warn!("backing up cms.json before CMS migration: {e:#}");
     }
     new_cms.to_file(&cms_path).context("writing new cms.json")?;

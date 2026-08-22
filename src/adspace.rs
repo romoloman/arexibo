@@ -354,7 +354,7 @@ pub fn download_creative(agent: &ureq::Agent, cache_dir: &Path, url: &str) -> Re
     std::io::copy(&mut body.into_reader(), &mut file)
         .context("writing creative to disk")?;
     drop(file);
-    fs::rename(&tmp_path, &path)?;
+    fs::rename(tmp_path, &path)?;
     Ok(path)
 }
 
