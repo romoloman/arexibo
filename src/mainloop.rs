@@ -2095,10 +2095,8 @@ mod deauthorization_tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         std::thread::spawn(move || {
-            let mut n = 0usize;
-            for request in server.incoming_requests() {
+            for (n, request) in server.incoming_requests().enumerate() {
                 let code = codes.get(n).copied().unwrap_or(*codes.last().unwrap());
-                n += 1;
                 let activation = format!(r#"<ActivationMessage code="{code}"/>"#);
                 let escaped = activation.replace('&', "&amp;").replace('<', "&lt;")
                                          .replace('>', "&gt;").replace('"', "&quot;");
