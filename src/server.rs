@@ -295,6 +295,7 @@ impl Server {
                 let ctype = match ext {
                     Some("html") => "text/html",
                     Some("js" | "mjs") => "text/javascript",
+                    Some("json") => "application/json",
                     Some("ttf" | "otf") => "application/font-sfnt",
                     Some("jpg" | "jpeg") => "image/jpeg",
                     Some("png") => "image/png",
@@ -542,6 +543,37 @@ mod no_cache_header_tests {
         // wrapper as everything else, verified directly on the
         // successful-response case above.
         assert!(matches!(resp, Err(ureq::Error::StatusCode(404))));
+    }
+}
+
+#[cfg(test)]
+mod json_content_type_tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn a_json_file_gets_the_correct_content_type() {
+        // v7 GetData polling groundwork writes widget data as
+        // <widgetId>.json into this same cache directory -- without a
+        // correct Content-Type, the widget's own client-side JS
+        // (fetching that file, likely via jQuery's $.getJSON or
+        // similar) could fail to parse the response correctly.
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_json_ctype_test_{}_{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("4543.json"), r#"{"data":[]}"#).unwrap();
+        let (tx, _rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let server = Server::new(dir, "127.0.0.1", 0, tx, local_data).unwrap();
+        let port = server.port();
+        server.start_pool();
+
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/4543.json")).call().unwrap();
+        let content_type = resp.headers().get("Content-Type").map(|v| v.to_str().unwrap());
+        assert_eq!(content_type, Some("application/json"));
     }
 }
 
