@@ -1030,6 +1030,20 @@ impl Handler {
                                 (v6/v7-only) -- not retrying every cycle");
                     self.weather_unsupported = true;
                 }
+                Err(e) if is_weather_provider_not_configured_fault(&e) => {
+                    // A real CMS-side PHP bug (a non-nullable `string`
+                    // return type on a method that legitimately needs
+                    // to return null when there's no weather data for
+                    // this display's own location) -- but "no weather
+                    // data for this location" is itself a normal,
+                    // expected, valid outcome (e.g. the CMS's weather
+                    // module is configured for a different area than
+                    // this display), not something worth alerting an
+                    // admin about. Keep retrying every cycle (the
+                    // config could change), just never above debug.
+                    log::debug!("getting weather (no data for this display's own location): \
+                                 {e:#}");
+                }
                 Err(e) => log::warn!("getting weather: {e:#}"),
             }
         }
@@ -1708,6 +1722,20 @@ fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64
 /// is called against our v5 endpoint. Permanent, not worth retrying.
 fn is_method_not_present_fault(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains("not present")
+}
+
+/// Whether an error is the CMS's own weather module returning no data
+/// for this display -- a real observed PHP TypeError (the endpoint
+/// exists and gets called, but its internal weather data source
+/// returns null where a string is expected). Confirmed to happen both
+/// with no provider configured at all, and with a provider configured
+/// but for a different geographic area than this display's own
+/// location -- either way, same fault shape. Unlike
+/// is_method_not_present_fault, this can resolve itself if the CMS's
+/// own configuration changes later -- worth continuing to retry, just
+/// not worth warning about every single cycle.
+fn is_weather_provider_not_configured_fault(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("getWeatherData(): Return value must be of type string")
 }
 
 // tzset(3): glibc doesn't re-parse TZ on its own after set_var(). One
@@ -2722,6 +2750,35 @@ mod is_method_not_present_fault_tests {
     fn does_not_misclassify_an_unrelated_error() {
         let err = anyhow::anyhow!("getting weather: io: connection refused");
         assert!(!is_method_not_present_fault(&err));
+    }
+}
+
+#[cfg(test)]
+mod is_weather_provider_not_configured_fault_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_the_real_reported_error_message() {
+        let err = anyhow::anyhow!("getting weather: getting weather: parsing GetWeather \
+                                    SOAP response: got SOAP fault: \
+                                    Xibo\\Event\\XmdsWeatherRequestEvent::getWeatherData(): \
+                                    Return value must be of type string, null returned");
+        assert!(is_weather_provider_not_configured_fault(&err));
+    }
+
+    #[test]
+    fn does_not_misclassify_a_method_not_present_fault() {
+        // The two must stay distinct -- one is permanent (v5, never
+        // retry), the other can resolve itself (CMS-side config).
+        let err = anyhow::anyhow!("getting weather: parsing GetWeather SOAP response: \
+                                    got SOAP fault: Procedure 'GetWeather' not present");
+        assert!(!is_weather_provider_not_configured_fault(&err));
+    }
+
+    #[test]
+    fn does_not_misclassify_an_unrelated_error() {
+        let err = anyhow::anyhow!("getting weather: io: connection refused");
+        assert!(!is_weather_provider_not_configured_fault(&err));
     }
 }
 
