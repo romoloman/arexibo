@@ -1338,8 +1338,17 @@ impl Handler {
     fn refresh_due_data_widgets(&mut self) {
         let now = std::time::Instant::now();
         for widget_id in self.cache.data_widgets_due(now) {
-            if let Err(e) = self.cache.refresh_data_widget(widget_id, &mut self.xmds, now) {
-                log::warn!("refreshing data widget {widget_id}: {e:#}");
+            match self.cache.refresh_data_widget(widget_id, &mut self.xmds, now) {
+                // Without this, a freshly-written <widgetId>.json would
+                // sit on disk unnoticed -- the already-loaded page has
+                // no reason to re-fetch it on its own. Same mechanism
+                // already used for the XMR-pushed DataUpdate case
+                // above, reused here for consistency rather than
+                // inventing a lighter in-page re-render.
+                Ok(resource_id) => {
+                    self.to_gui.send(ToGui::ReloadWidget(resource_id)).unwrap();
+                }
+                Err(e) => log::warn!("refreshing data widget {widget_id}: {e:#}"),
             }
         }
         self.rearm_data_refresh_timer();
@@ -3150,5 +3159,58 @@ mod data_refresh_timer_tests {
         // (re-confirms rearm gets called even with nothing to do).
         handler.refresh_due_data_widgets();
         assert!(handler.next_data_refresh.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn a_successful_refresh_notifies_the_gui_to_reload_the_containing_resource() {
+        // The gap this test guards against: writing a fresh
+        // <widgetId>.json to disk does nothing on its own -- the
+        // already-loaded widget page has no reason to re-fetch it
+        // unless told to. Must reuse the same ToGui::ReloadWidget
+        // mechanism the XMR-pushed DataUpdate path already uses.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let mut request = request;
+                let mut body = String::new();
+                std::io::Read::read_to_string(request.as_reader(), &mut body).unwrap();
+                let is_get_data = body.contains("GetData");
+                let body = if is_get_data {
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><GetDataResponse><data>{"data":[]}</data></GetDataResponse></soap:Body>
+</soap:Envelope>"#.to_string()
+                } else {
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#.to_string()
+                };
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        // Drain whatever update_settings() sent during construction
+        // (a ToGui::Settings) so it doesn't get mistaken for the
+        // ReloadWidget message this test is actually checking for.
+        while togui_rx.try_recv().is_ok() {}
+
+        // resource_id 1, widget_id 4543 -- deliberately different
+        // numbers, matching the real observed case, so this test can't
+        // pass by accident from confusing the two.
+        handler.cache.discover_data_widgets(
+            r#"<script>widgetData.push({"widgetId":4543,"url":"4543.json","data":null});</script>"#,
+            1);
+
+        handler.refresh_due_data_widgets();
+
+        let msg = togui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(msg, ToGui::ReloadWidget(1)),
+                "expected ToGui::ReloadWidget(1) (the resource id)");
     }
 }

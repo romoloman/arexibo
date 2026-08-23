@@ -598,7 +598,7 @@ impl Cache {
     /// independently of the hardcoded endpoint version -- see this
     /// module's own tests for both halves: this method's own logic,
     /// and `download`'s own confirmed-closed gate today.
-    fn discover_data_widgets(&mut self, html: &str, resource_id: i64) {
+    pub(crate) fn discover_data_widgets(&mut self, html: &str, resource_id: i64) {
         for w in parse_data_widgets(html) {
             if !w.needs_get_data { continue; }
             let interval = Duration::from_secs(
@@ -689,8 +689,12 @@ impl Cache {
     /// served by the local webserver at the relative `url` the
     /// widget's own rendered HTML references. Updates the widget's own
     /// last-refreshed time on success.
+    /// Returns the containing resource's own id on success (matching
+    /// `refresh_resource`'s own pattern) -- the caller needs this to
+    /// tell the GUI *which* iframe/webview to reload, since that's
+    /// identified by resource id, not the raw widget id.
     pub fn refresh_data_widget(&mut self, widget_id: i64, cms: &mut xmds::Cms,
-                                now: Instant) -> Result<()> {
+                                now: Instant) -> Result<i64> {
         let json = cms.get_data(widget_id)?;
         // Write to a sibling .tmp file, then rename atomically -- same
         // convention as adspace.rs's own download_creative. The local
@@ -704,10 +708,10 @@ impl Cache {
         let tmp_path = path.with_extension("tmp");
         fs::write(&tmp_path, json)?;
         fs::rename(&tmp_path, &path)?;
-        if let Some(state) = self.data_widgets.get_mut(&widget_id) {
-            state.last_refreshed = Some(now);
-        }
-        Ok(())
+        let state = self.data_widgets.get_mut(&widget_id)
+            .ok_or_else(|| anyhow::anyhow!("widget {widget_id} is no longer tracked"))?;
+        state.last_refreshed = Some(now);
+        Ok(state.resource_id)
     }
 }
 
@@ -1337,12 +1341,15 @@ mod data_widget_polling_tests {
     #[test]
     fn refresh_writes_the_json_file_and_clears_due_status() {
         let (mut cache, dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1); // resource_id 1, widget_id 4543
 
         let mut data_cms = make_cms_with_mock_getdata(r#"{"data":[{"NOME":"Mario Rossi"}]}"#);
         let now = Instant::now();
-        cache.refresh_data_widget(4543, &mut data_cms, now).unwrap();
+        let resource_id = cache.refresh_data_widget(4543, &mut data_cms, now).unwrap();
 
+        assert_eq!(resource_id, 1,
+                   "must return the containing resource's own id, not the widget id -- \
+                    the GUI needs the resource id to know which iframe to reload");
         let saved = fs::read_to_string(dir.join("4543.json")).unwrap();
         assert_eq!(saved, r#"{"data":[{"NOME":"Mario Rossi"}]}"#);
         assert!(cache.data_widgets_due(now).is_empty(),
