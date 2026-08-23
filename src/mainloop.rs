@@ -209,6 +209,13 @@ pub struct Handler {
     /// Drained by the same `resource_retry_timer`.
     dataupdate_retry_queue: Vec<(i64, u32)>,
     resource_retry_timer: Receiver<std::time::Instant>,
+    /// v7 GetData polling groundwork -- fires when the soonest tracked
+    /// data widget (see resource::Cache's own data_widgets) is due for
+    /// a refresh. Stays `never()` (re-armed to that via
+    /// `rearm_data_refresh_timer`) whenever no data widgets are
+    /// currently tracked -- which is always true on v5, given the
+    /// endpoint-version gate in Cache::download.
+    next_data_refresh: Receiver<std::time::Instant>,
 }
 
 /// See `Handler::resource_retry_queue`'s own doc comment.
@@ -348,6 +355,7 @@ impl Handler {
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
                                  resource_retry_timer: never(),
+                                 next_data_refresh: never(),
                                  pending_auth: false,
                                  pending_network: false,
                                  weather_unsupported: false,
@@ -389,6 +397,7 @@ impl Handler {
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
                                  resource_retry_timer: never(),
+                                 next_data_refresh: never(),
                                  pending_auth: !network_pending,
                                  pending_network: network_pending,
                                  weather_unsupported: false,
@@ -436,6 +445,11 @@ impl Handler {
                     if let Err(e) = self.collect_once() {
                         log::error!("during collect: {e:#}");
                     }
+                    // A fresh collection may have discovered new data
+                    // widgets (v7 GetData polling) whose own interval
+                    // is sooner than whatever's currently armed --
+                    // harmless no-op if nothing changed.
+                    self.rearm_data_refresh_timer();
                     // While waiting for CMS authorization or a working
                     // network (see pending_auth/pending_network), retry
                     // much sooner than the normal collect_interval (which
@@ -501,6 +515,14 @@ impl Handler {
                 // `resource_retry_queue`'s own doc comment.
                 recv(self.resource_retry_timer) -> _ => {
                     self.retry_failed_resources();
+                },
+                // timer channel that fires when the soonest tracked
+                // data widget (v7 GetData polling) is due for a
+                // refresh -- see `rearm_data_refresh_timer`'s own doc
+                // comment. Never fires on v5 (nothing is ever tracked
+                // there), so this whole arm stays practically inert.
+                recv(self.next_data_refresh) -> _ => {
+                    self.refresh_due_data_widgets();
                 },
                 // channel for XMR messages
                 recv(self.xmr) -> msg => match msg {
@@ -1302,6 +1324,39 @@ impl Handler {
             never()
         } else {
             after(RESOURCE_RETRY_DELAY)
+        };
+    }
+
+    /// v7 GetData polling groundwork -- refreshes every currently-due
+    /// tracked data widget (see resource::Cache's own data_widgets),
+    /// then re-arms `next_data_refresh` for whatever becomes due next.
+    /// A failed refresh is logged, not retried on its own separate
+    /// schedule -- the widget stays tracked with its old
+    /// last_refreshed time, so it's simply due again (and retried)
+    /// the next time this fires, rather than needing a dedicated retry
+    /// queue like `resource_retry_queue`'s own.
+    fn refresh_due_data_widgets(&mut self) {
+        let now = std::time::Instant::now();
+        for widget_id in self.cache.data_widgets_due(now) {
+            if let Err(e) = self.cache.refresh_data_widget(widget_id, &mut self.xmds, now) {
+                log::warn!("refreshing data widget {widget_id}: {e:#}");
+            }
+        }
+        self.rearm_data_refresh_timer();
+    }
+
+    /// Arms `next_data_refresh` to fire when the soonest tracked data
+    /// widget is next due, or `never()` if none are currently tracked
+    /// -- called both after `refresh_due_data_widgets` itself (so it
+    /// keeps firing for the *next* due widget) and after every
+    /// `collect_once()` (since that's when new data widgets get
+    /// discovered, and a newly-found widget's own interval might be
+    /// sooner than whatever was already armed).
+    fn rearm_data_refresh_timer(&mut self) {
+        let now = std::time::Instant::now();
+        self.next_data_refresh = match self.cache.next_data_widget_due_in(now) {
+            Some(d) => after(d),
+            None => never(),
         };
     }
 
@@ -3016,5 +3071,84 @@ mod validate_new_cms_tests {
                                        key: "k".into(), display_id: "d".into(), display_name: None,
                                        proxy: None };
         assert!(validate_new_cms(&candidate, "dummy-pub-key".into(), true, test_xml_dir()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod data_refresh_timer_tests {
+    use super::*;
+
+    fn start_mock_ready() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(), display_id: "test-display".into(),
+            display_name: None, proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_data_refresh_timer_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Only what's actually reachable via the public Handler/Cache API
+    // today (XMDS_ENDPOINT_VERSION hardcoded to 5, see xmds.rs) is
+    // testable from here -- no data widget can ever get tracked via
+    // the real download() path in this build, so these two tests
+    // confirm the v5 safety property at the mainloop integration
+    // level, complementing resource.rs's own more detailed tests of
+    // Cache's refresh/expiry logic directly (which bypass the gate to
+    // test that logic on its own merits).
+
+    #[test]
+    fn rearm_leaves_the_timer_disarmed_when_nothing_is_tracked() {
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        handler.rearm_data_refresh_timer();
+
+        // never() never fires -- a short timeout confirms this without
+        // making the test itself slow.
+        assert!(handler.next_data_refresh.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn refresh_due_data_widgets_is_a_safe_no_op_with_nothing_tracked() {
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        // Must not panic, and must leave the timer disarmed afterward
+        // (re-confirms rearm gets called even with nothing to do).
+        handler.refresh_due_data_widgets();
+        assert!(handler.next_data_refresh.recv_timeout(Duration::from_millis(50)).is_err());
     }
 }

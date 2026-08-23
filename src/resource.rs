@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::{fs, io, io::Write, path::PathBuf, sync::Arc};
+use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use elementtree::Element;
 use md5::{Md5, Digest};
@@ -162,6 +163,26 @@ pub struct Cache {
     /// translated -- 0 is not a meaningful/valid port and would only
     /// appear here if that wiring were ever skipped by mistake.
     pub html_port: u16,
+    /// v7 GetData polling state, one entry per discovered data widget
+    /// needing GetData (see parse_data_widgets/DataWidgetInfo). Not
+    /// persisted across restarts -- a fresh collection re-discovers
+    /// the same widgets from re-downloaded resources anyway, so
+    /// serializing this isn't worth the complexity. Cleaned up by
+    /// `purge`/`purge_some` alongside their containing resource, so
+    /// this never accumulates entries for widgets no longer scheduled.
+    data_widgets: HashMap<i64, DataWidgetState>,
+}
+
+/// Polling state for one data widget (see `data_widgets`'s own doc
+/// comment). `resource_id` is the containing resource's own numeric
+/// id (matching its `"{id}.html"` filename) -- lets `purge_some`
+/// remove this entry when that specific resource is purged, without
+/// needing to re-scan any HTML.
+struct DataWidgetState {
+    resource_id: i64,
+    update_interval: Duration,
+    /// None means never refreshed yet -- due immediately.
+    last_refreshed: Option<Instant>,
 }
 
 impl Cache {
@@ -205,7 +226,8 @@ impl Cache {
         }).collect();
 
         let cache = Self { dir, agent: cms.make_agent(no_verify)?, content, code_map,
-                           adspace_enabled: false, adspace_partner: None, html_port: 0 };
+                           adspace_enabled: false, adspace_partner: None, html_port: 0,
+                           data_widgets: HashMap::new() };
         cache.install_pdfjs()?;
         Ok(cache)
     }
@@ -260,6 +282,16 @@ impl Cache {
                 let data = cms.get_resource(layoutid, &regionid.to_string(),
                                             &mediaid.to_string())?;
                 let fname = format!("{id}.html");
+
+                // v7 GetData polling groundwork -- explicitly gated
+                // even though the trigger (needs_get_data) never fires
+                // against a real v5 CMS anyway (confirmed via real
+                // comparison): v5's own generated HTML always has data
+                // embedded directly. This gate is defense in depth,
+                // not the only thing keeping this inert on v5.
+                if xmds::xmds_supports_v6_v7_methods() {
+                    self.discover_data_widgets(&data, id);
+                }
 
                 // TODO: re-download after given updateInterval
                 let duration = data.find("<!-- DURATION=").and_then(|index| {
@@ -558,6 +590,30 @@ impl Cache {
         Ok(())
     }
 
+    /// Discovers data widgets (v7 GetData polling) inside a resource's
+    /// own rendered HTML and starts/updates tracking for each one that
+    /// needs GetData. Separated from its own call site in `download`
+    /// (which gates this behind `xmds::xmds_supports_v6_v7_methods()`)
+    /// specifically so this logic can be unit-tested directly,
+    /// independently of the hardcoded endpoint version -- see this
+    /// module's own tests for both halves: this method's own logic,
+    /// and `download`'s own confirmed-closed gate today.
+    fn discover_data_widgets(&mut self, html: &str, resource_id: i64) {
+        for w in parse_data_widgets(html) {
+            if !w.needs_get_data { continue; }
+            let interval = Duration::from_secs(
+                w.update_interval_minutes.filter(|m| *m > 0).unwrap_or(1) as u64 * 60);
+            // Update resource_id/interval but preserve last_refreshed
+            // if already tracked -- a widget rediscovered because its
+            // containing resource was re-downloaded shouldn't have its
+            // own refresh timer reset.
+            self.data_widgets.entry(w.widget_id)
+                .and_modify(|s| { s.resource_id = resource_id; s.update_interval = interval; })
+                .or_insert(DataWidgetState { resource_id, update_interval: interval,
+                                              last_refreshed: None });
+        }
+    }
+
     pub fn purge_some(&mut self, list: &[String]) -> Result<()> {
         let mut changed = false;
         for name in list {
@@ -573,8 +629,16 @@ impl Cache {
                 }
                 Err(e) => log::warn!("could not purge {name}: {e:#}"),
             }
-            if self.content.remove(name).is_some() {
+            if let Some(removed) = self.content.remove(name) {
                 changed = true;
+                // A purged resource might have been the container for
+                // tracked data widgets (v7 GetData polling, see
+                // data_widgets's own doc comment) -- without this,
+                // we'd keep polling GetData for a widget belonging to
+                // a layout/region that's no longer scheduled at all.
+                if let Resource::Resource(info) = &removed {
+                    self.data_widgets.retain(|_, s| s.resource_id != info.id);
+                }
             }
         }
         if changed {
@@ -592,9 +656,57 @@ impl Cache {
             }
         }
         self.content.clear();
+        self.data_widgets.clear();
         self.save()?;
         // Re-install bundled assets after purge
         self.install_pdfjs()?;
+        Ok(())
+    }
+
+    /// Which tracked data widgets (v7 GetData polling) are due for a
+    /// refresh right now -- never refreshed yet, or their own
+    /// update_interval has elapsed since the last one.
+    pub fn data_widgets_due(&self, now: Instant) -> Vec<i64> {
+        self.data_widgets.iter()
+            .filter(|(_, s)| s.last_refreshed
+                    .map_or(true, |t| now.duration_since(t) >= s.update_interval))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// How long until the *soonest* tracked data widget is due -- for
+    /// arming a re-check timer. None if no data widgets are currently
+    /// tracked at all (timer should stay disarmed).
+    pub fn next_data_widget_due_in(&self, now: Instant) -> Option<Duration> {
+        self.data_widgets.values().map(|s| match s.last_refreshed {
+            None => Duration::ZERO, // due immediately
+            Some(t) => s.update_interval.saturating_sub(now.duration_since(t)),
+        }).min()
+    }
+
+    /// Fetches fresh data for one tracked widget via GetData and writes
+    /// it as `<widget_id>.json` in the cache directory -- ready to be
+    /// served by the local webserver at the relative `url` the
+    /// widget's own rendered HTML references. Updates the widget's own
+    /// last-refreshed time on success.
+    pub fn refresh_data_widget(&mut self, widget_id: i64, cms: &mut xmds::Cms,
+                                now: Instant) -> Result<()> {
+        let json = cms.get_data(widget_id)?;
+        // Write to a sibling .tmp file, then rename atomically -- same
+        // convention as adspace.rs's own download_creative. The local
+        // webserver could be serving this exact file to the widget's
+        // own fetch concurrently with this refresh; a direct fs::write
+        // on the final path risks a reader observing a truncated/
+        // partial file mid-write. rename() on POSIX filesystems
+        // guarantees a reader always sees either the complete old file
+        // or the complete new one, never a mix.
+        let path = self.dir.join(format!("{widget_id}.json"));
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, json)?;
+        fs::rename(&tmp_path, &path)?;
+        if let Some(state) = self.data_widgets.get_mut(&widget_id) {
+            state.last_refreshed = Some(now);
+        }
         Ok(())
     }
 }
@@ -654,6 +766,10 @@ struct DataWidgetInfo {
     /// embedded payload and `url` is the literal string "null", so
     /// this is false.
     needs_get_data: bool,
+    /// From `properties.updateInterval` (minutes) -- confirmed real
+    /// field, e.g. `5` in an actual v7 widget. None if missing/not a
+    /// number.
+    update_interval_minutes: Option<i64>,
 }
 
 /// Finds every `widgetData.push({...})` call in `html` and parses each
@@ -677,7 +793,10 @@ fn parse_data_widgets(html: &str) -> Vec<DataWidgetInfo> {
         let Some(widget_id) = value.get("widgetId").and_then(|v| v.as_i64()) else { continue };
         let url_is_real_path = matches!(value.get("url"), Some(serde_json::Value::String(s)) if s != "null");
         let data_is_null = matches!(value.get("data"), Some(serde_json::Value::Null) | None);
-        found.push(DataWidgetInfo { widget_id, needs_get_data: url_is_real_path && data_is_null });
+        let update_interval_minutes = value.get("properties")
+            .and_then(|p| p.get("updateInterval")).and_then(|v| v.as_i64());
+        found.push(DataWidgetInfo { widget_id, needs_get_data: url_is_real_path && data_is_null,
+                                     update_interval_minutes });
     }
     found
 }
@@ -784,21 +903,23 @@ mod parse_data_widgets_tests {
         var elements = [];
         </script>"#;
         let widgets = parse_data_widgets(html);
-        assert_eq!(widgets, vec![DataWidgetInfo { widget_id: 4543, needs_get_data: false }]);
+        assert_eq!(widgets, vec![DataWidgetInfo { widget_id: 4543, needs_get_data: false,
+                                                    update_interval_minutes: None }]);
     }
 
     #[test]
     fn a_real_v7_resource_needs_get_data() {
         // Same real widget, same CMS, only the endpoint version
         // differs -- confirmed real v7 shape: url is a real path,
-        // data is JSON null.
+        // data is JSON null, properties.updateInterval is 5 (minutes).
         let html = r#"<script>
         var widgetData = [];
-        widgetData.push({"widgetId":4543,"templateId":"custom_numeriutili","url":"4543.json","data":null});
+        widgetData.push({"widgetId":4543,"templateId":"custom_numeriutili","properties":{"updateInterval":5},"url":"4543.json","data":null});
         var elements = [];
         </script>"#;
         let widgets = parse_data_widgets(html);
-        assert_eq!(widgets, vec![DataWidgetInfo { widget_id: 4543, needs_get_data: true }]);
+        assert_eq!(widgets, vec![DataWidgetInfo { widget_id: 4543, needs_get_data: true,
+                                                    update_interval_minutes: Some(5) }]);
     }
 
     #[test]
@@ -808,12 +929,12 @@ mod parse_data_widgets_tests {
         // comment) -- must not stop after the first push().
         let html = r#"<script>
         widgetData.push({"widgetId":100,"url":"null","data":{"x":1}});
-        widgetData.push({"widgetId":200,"url":"200.json","data":null});
+        widgetData.push({"widgetId":200,"properties":{"updateInterval":10},"url":"200.json","data":null});
         </script>"#;
         let widgets = parse_data_widgets(html);
         assert_eq!(widgets, vec![
-            DataWidgetInfo { widget_id: 100, needs_get_data: false },
-            DataWidgetInfo { widget_id: 200, needs_get_data: true },
+            DataWidgetInfo { widget_id: 100, needs_get_data: false, update_interval_minutes: None },
+            DataWidgetInfo { widget_id: 200, needs_get_data: true, update_interval_minutes: Some(10) },
         ]);
     }
 
@@ -1115,5 +1236,207 @@ mod dependency_download_tests {
         cache.download(req, &mut cms).unwrap();
         let saved = fs::read(dir.join("roboto-regular.ttf")).unwrap();
         assert_eq!(saved, b"actual font file bytes");
+    }
+}
+
+#[cfg(test)]
+mod data_widget_polling_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn make_cache() -> (Cache, PathBuf) {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_data_widget_test_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cms = CmsSettings {
+            address: "https://example.com".into(), key: "k".into(),
+            display_id: "d".into(), display_name: None, proxy: None,
+        };
+        let cache = Cache::new(&cms, dir.clone(), false, true).unwrap();
+        (cache, dir)
+    }
+
+    fn make_cms_with_mock_getresource(html: &'static str) -> xmds::Cms {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = html.replace('&', "&amp;").replace('<', "&lt;")
+                                   .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><GetResourceResponse><resource>{escaped}</resource></GetResourceResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        test_cms_at(port)
+    }
+
+    fn make_cms_with_mock_getdata(json: &'static str) -> xmds::Cms {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = json.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><GetDataResponse><data>{escaped}</data></GetDataResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        test_cms_at(port)
+    }
+
+    fn test_cms_at(port: u16) -> xmds::Cms {
+        let cms_settings = CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "k".into(), display_id: "d".into(), display_name: None, proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_data_widget_xmds_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&xml_dir).unwrap();
+        xmds::Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    const V7_WIDGET_HTML: &str = r#"<script>
+    widgetData.push({"widgetId":4543,"properties":{"updateInterval":5},"url":"4543.json","data":null});
+    </script>"#;
+
+    // The following tests exercise discover_data_widgets/purge*
+    // directly, independently of the endpoint-version gate in
+    // `download` -- that gate is confirmed separately, at the very
+    // end of this module, to actually be closed today (hardcoded v5).
+
+    #[test]
+    fn discover_starts_tracking_a_widget_that_needs_get_data() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        let due = cache.data_widgets_due(Instant::now());
+        assert_eq!(due, vec![4543], "a never-refreshed widget must be due immediately");
+    }
+
+    #[test]
+    fn discover_does_not_track_a_v5_shaped_widget() {
+        // Real v5 shape: data already embedded, url is the literal
+        // string "null" -- needs_get_data is false.
+        let (mut cache, _dir) = make_cache();
+        let v5_html = r#"<script>
+        widgetData.push({"widgetId":4543,"url":"null","data":{"data":[{"NOME":"Mario Rossi"}]}});
+        </script>"#;
+        cache.discover_data_widgets(v5_html, 1);
+        assert!(cache.data_widgets_due(Instant::now()).is_empty());
+        assert_eq!(cache.next_data_widget_due_in(Instant::now()), None);
+    }
+
+    #[test]
+    fn refresh_writes_the_json_file_and_clears_due_status() {
+        let (mut cache, dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+
+        let mut data_cms = make_cms_with_mock_getdata(r#"{"data":[{"NOME":"Mario Rossi"}]}"#);
+        let now = Instant::now();
+        cache.refresh_data_widget(4543, &mut data_cms, now).unwrap();
+
+        let saved = fs::read_to_string(dir.join("4543.json")).unwrap();
+        assert_eq!(saved, r#"{"data":[{"NOME":"Mario Rossi"}]}"#);
+        assert!(cache.data_widgets_due(now).is_empty(),
+                "must not be due again immediately after a successful refresh");
+        assert!(!dir.join("4543.tmp").exists(),
+                "the temp file used for the atomic rename must not linger afterward");
+    }
+
+    #[test]
+    fn becomes_due_again_after_its_own_update_interval_elapses() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1); // updateInterval: 5 (minutes)
+
+        let mut data_cms = make_cms_with_mock_getdata(r#"{"data":[]}"#);
+        let refreshed_at = Instant::now();
+        cache.refresh_data_widget(4543, &mut data_cms, refreshed_at).unwrap();
+
+        let just_under_5_min = refreshed_at + Duration::from_secs(5 * 60 - 1);
+        assert!(cache.data_widgets_due(just_under_5_min).is_empty());
+
+        let just_over_5_min = refreshed_at + Duration::from_secs(5 * 60 + 1);
+        assert_eq!(cache.data_widgets_due(just_over_5_min), vec![4543]);
+    }
+
+    #[test]
+    fn next_due_in_is_none_when_nothing_is_tracked() {
+        let (cache, _dir) = make_cache();
+        assert_eq!(cache.next_data_widget_due_in(Instant::now()), None);
+    }
+
+    #[test]
+    fn next_due_in_reflects_the_remaining_time() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+
+        let mut data_cms = make_cms_with_mock_getdata(r#"{"data":[]}"#);
+        let refreshed_at = Instant::now();
+        cache.refresh_data_widget(4543, &mut data_cms, refreshed_at).unwrap();
+
+        let one_minute_later = refreshed_at + Duration::from_secs(60);
+        // 5 minute interval, 1 minute elapsed -- ~4 minutes remaining.
+        let remaining = cache.next_data_widget_due_in(one_minute_later).unwrap();
+        assert!(remaining <= Duration::from_secs(4 * 60) &&
+                remaining > Duration::from_secs(4 * 60 - 5),
+                "expected ~4 minutes remaining, got {remaining:?}");
+    }
+
+    #[test]
+    fn purge_some_stops_tracking_a_widget_whose_resource_was_purged() {
+        let (mut cache, dir) = make_cache();
+        // purge_some looks up the resource's own id via self.content,
+        // so a real cached ResourceInfo entry (not just the tracked
+        // data widget) is needed for this specific test.
+        fs::write(dir.join("1.html"), V7_WIDGET_HTML).unwrap();
+        cache.content.insert("1.html".to_string(), Resource::Resource(Arc::new(
+            ResourceInfo { id: 1, layoutid: 940, regionid: 4542, mediaid: 4543,
+                           updated: 0, duration: None, numitems: None })));
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543]);
+
+        cache.purge_some(&["1.html".to_string()]).unwrap();
+
+        assert!(cache.data_widgets_due(Instant::now()).is_empty(),
+                "a widget whose containing resource was purged must stop being tracked");
+        assert_eq!(cache.next_data_widget_due_in(Instant::now()), None);
+    }
+
+    #[test]
+    fn purge_stops_tracking_every_widget() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543]);
+
+        cache.purge().unwrap();
+
+        assert!(cache.data_widgets_due(Instant::now()).is_empty());
+    }
+
+    // This is the test that actually matters for today's real-world
+    // safety: confirms the production code path (download, not
+    // discover_data_widgets directly) does NOT start tracking anything
+    // right now, because XMDS_ENDPOINT_VERSION is hardcoded to 5. If
+    // this test ever starts failing on its own (without the version
+    // constant having been deliberately bumped), that's a sign the
+    // gate in `download` got removed or broken.
+    #[test]
+    fn download_does_not_discover_data_widgets_while_the_version_gate_is_closed() {
+        let (mut cache, _dir) = make_cache();
+        let mut cms = make_cms_with_mock_getresource(V7_WIDGET_HTML);
+        let req = ReqFile::Resource { id: 1, layoutid: 940, regionid: 4542, mediaid: 4543,
+                                       updated: 0 };
+        cache.download(req, &mut cms).unwrap();
+        assert!(cache.data_widgets_due(Instant::now()).is_empty(),
+                "nothing should be tracked via the real download() path while \
+                 xmds_supports_v6_v7_methods() is false");
     }
 }
