@@ -24,11 +24,17 @@ use crate::logger::LogEntry;
 /// handler (Soap5.php, Soap6.php...), so v6/v7-only methods
 /// (GetWeather/GetDependency/GetData) always fail against v5.
 ///
-/// WARNING if bumping this: CMS v4+'s Data Widget JSON/HTML splitting
-/// is also gated by this version, not by clientType/clientCode -- v5
-/// just doesn't generate those entries, which is why Data Widgets
-/// currently work via the embedded-HTML path. Bumping without first
-/// finishing GetData integration would break them.
+/// CMS v4+'s Data Widget JSON/HTML splitting is also gated by this
+/// version, not by clientType/clientCode -- v5 just doesn't generate
+/// those entries, which is why Data Widgets currently work via the
+/// embedded-HTML path. The player-side GetData integration this would
+/// require (discovery, independent polling, atomic writes, GUI
+/// reload notification, downloading files[] entries, retry backoff,
+/// pruning against the active schedule, coordination with the
+/// XMR-pushed dataUpdate path) is done and verified against a real
+/// CMS -- staying on v5 here is a deliberate choice, not a missing
+/// prerequisite. See the project's own status document for the
+/// current reasoning on when to actually bump this.
 const XMDS_ENDPOINT_VERSION: u32 = 5;
 
 /// Whether the endpoint has GetWeather/GetDependency/GetData -- lets
