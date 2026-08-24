@@ -13,11 +13,17 @@ use rustls_pki_types::CertificateDer;
 use crate::command::Command;
 use crate::util::fingerprint;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlayerSettings {
     #[serde(default = "default_collect_interval")]
     pub collect_interval: u64,
-    #[serde(default)]
+    // Matches the real RegisterDisplay parsing fallback (def_child's
+    // own `1` -- see xmds.rs) for the same field, same reasoning as
+    // send_current_layout_as_status_update's own default_true just
+    // below: a cached settings file missing this field should default
+    // to the same "on" assumption a real CMS response omitting it
+    // would get, not silently to off.
+    #[serde(default = "default_true")]
     pub stats_enabled: bool,
     #[serde(default)]
     pub xmr_network_address: String,
@@ -135,6 +141,60 @@ pub struct PlayerSettings {
     // configured, so only gated by enable_shell_commands itself).
     #[serde(default)]
     pub shell_command_allow_list: String,
+}
+
+/// Manual `Default` impl -- deliberately *not* derived. A derived
+/// Default gives every field its own type's default (false for every
+/// bool, regardless of any #[serde(default = ...)] customization --
+/// that attribute only affects Deserialize, a completely separate
+/// mechanism). PlayerSettings::default() is used as a real placeholder
+/// while a display is pending authorization or waiting for the network
+/// (see mainloop.rs's own pending_auth/pending_network handling), not
+/// just as an inert fallback -- so its fields should match the same
+/// fallback semantics already trusted for a *real* RegisterDisplay
+/// response that simply omits a given field (see xmds.rs's own
+/// def_child calls), not each field's own type default. Found from a
+/// real report: a newly-registered, not-yet-authorized display showed
+/// an empty "Current Layout" in the CMS, updating only on the regular
+/// ~5-minute collection cycle instead of immediately on layout change
+/// -- traced to stats_enabled/send_current_layout_as_status_update
+/// silently defaulting to false here (this exact placeholder path),
+/// even though both are documented and confirmed to default to true
+/// when a *real* CMS response omits them.
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        PlayerSettings {
+            collect_interval: default_collect_interval(),
+            stats_enabled: true,
+            xmr_network_address: String::new(),
+            xmr_web_socket_address: String::new(),
+            xmr_web_socket_address_in_use: String::new(),
+            xmr_cms_key: String::new(),
+            log_level: default_log_level(),
+            screenshot_interval: 0,
+            screenshot_size: 0,
+            send_current_layout_as_status_update: true,
+            is_adspace_enabled: false,
+            download_start_window: String::new(),
+            download_end_window: String::new(),
+            display_time_zone: String::new(),
+            expire_modified_layouts: false,
+            screen_shot_requested: false,
+            new_cms_address: String::new(),
+            new_cms_key: String::new(),
+            force_https: false,
+            embedded_server_port: default_embedded_server_port(),
+            prevent_sleep: false,
+            display_name: default_display_name(),
+            size_x: 0,
+            size_y: 0,
+            pos_x: 0,
+            pos_y: 0,
+            commands: HashMap::new(),
+            enable_shell_commands: false,
+            shell_command_allow_list: String::new(),
+        }
+    }
 }
 
 /// Manual `Debug` impl -- deliberately *not* derived. `xmr_cms_key` is
@@ -562,7 +622,11 @@ mod tests {
         assert_eq!(s.log_level, "debug");
         assert_eq!(s.embedded_server_port, 9696);
         assert_eq!(s.display_name, "Xibo");
-        assert!(!s.stats_enabled);
+        // Matches the real RegisterDisplay parsing fallback for the
+        // same field (def_child's own `1`) -- a CMS response or a
+        // cached settings file omitting this shouldn't silently turn
+        // stats off.
+        assert!(s.stats_enabled);
         assert!(!s.prevent_sleep);
         // security: fail closed if these are somehow absent
         assert!(!s.enable_shell_commands);
@@ -580,6 +644,40 @@ mod tests {
         assert_eq!(s.display_name, "Lobby");
         // defaults for unspecified fields
         assert_eq!(s.log_level, "debug");
+    }
+
+    #[test]
+    fn player_settings_struct_default_matches_registerdisplay_fallbacks() {
+        // PlayerSettings::default() (the struct-level Default, distinct
+        // from serde's own per-field defaults tested above -- a derived
+        // Default would silently ignore #[serde(default = ...)]
+        // entirely) is used as a real placeholder while a display is
+        // pending authorization or waiting for the network (see
+        // mainloop.rs's own pending_auth/pending_network handling), not
+        // just an inert fallback. Found from a real report: a
+        // newly-registered, not-yet-authorized display showed an empty
+        // "Current Layout" in the CMS, only updating on the regular
+        // ~5-minute collection cycle instead of immediately on layout
+        // change -- traced to this exact placeholder silently giving
+        // stats_enabled/send_current_layout_as_status_update `false`
+        // via a derived Default, contradicting the `true` fallback
+        // already trusted for a real RegisterDisplay response omitting
+        // either field.
+        let s = PlayerSettings::default();
+        assert!(s.stats_enabled);
+        assert!(s.send_current_layout_as_status_update);
+        // The rest should fail closed, matching RegisterDisplay's own
+        // real fallbacks for these (all 0/false there too).
+        assert!(!s.is_adspace_enabled);
+        assert!(!s.expire_modified_layouts);
+        assert!(!s.screen_shot_requested);
+        assert!(!s.force_https);
+        assert!(!s.prevent_sleep);
+        assert!(!s.enable_shell_commands);
+        assert_eq!(s.collect_interval, 900);
+        assert_eq!(s.log_level, "debug");
+        assert_eq!(s.embedded_server_port, 9696);
+        assert_eq!(s.display_name, "Xibo");
     }
 
     #[test]
