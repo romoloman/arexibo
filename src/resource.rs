@@ -180,6 +180,15 @@ pub struct Cache {
 /// needing to re-scan any HTML.
 struct DataWidgetState {
     resource_id: i64,
+    /// The layout this widget's own containing resource belongs to --
+    /// used to stop tracking (and polling GetData for) a widget once
+    /// its layout falls out of the *current* schedule, even without an
+    /// explicit CMS purge (a layout can simply stop being scheduled,
+    /// e.g. outside its own time window, without ever being purged --
+    /// confirmed via a real report: GetData kept being called forever
+    /// for widgets belonging to no-longer-active layouts, each call
+    /// failing with a "Requested an invalid file" SOAP fault).
+    layoutid: LayoutId,
     update_interval: Duration,
     /// None means never refreshed yet -- due immediately.
     last_refreshed: Option<Instant>,
@@ -301,7 +310,7 @@ impl Cache {
                 // embedded directly. This gate is defense in depth,
                 // not the only thing keeping this inert on v5.
                 if xmds::xmds_supports_v6_v7_methods() {
-                    self.discover_data_widgets(&data, id);
+                    self.discover_data_widgets(&data, id, layoutid);
                 }
 
                 // TODO: re-download after given updateInterval
@@ -609,18 +618,20 @@ impl Cache {
     /// independently of the hardcoded endpoint version -- see this
     /// module's own tests for both halves: this method's own logic,
     /// and `download`'s own confirmed-closed gate today.
-    pub(crate) fn discover_data_widgets(&mut self, html: &str, resource_id: i64) {
+    pub(crate) fn discover_data_widgets(&mut self, html: &str, resource_id: i64,
+                                         layoutid: LayoutId) {
         for w in parse_data_widgets(html) {
             if !w.needs_get_data { continue; }
             let interval = Duration::from_secs(
                 w.update_interval_minutes.filter(|m| *m > 0).unwrap_or(1) as u64 * 60);
-            // Update resource_id/interval but preserve last_refreshed
-            // if already tracked -- a widget rediscovered because its
-            // containing resource was re-downloaded shouldn't have its
-            // own refresh timer reset.
+            // Update resource_id/layoutid/interval but preserve
+            // last_refreshed if already tracked -- a widget
+            // rediscovered because its containing resource was
+            // re-downloaded shouldn't have its own refresh timer reset.
             self.data_widgets.entry(w.widget_id)
-                .and_modify(|s| { s.resource_id = resource_id; s.update_interval = interval; })
-                .or_insert(DataWidgetState { resource_id, update_interval: interval,
+                .and_modify(|s| { s.resource_id = resource_id; s.layoutid = layoutid;
+                                   s.update_interval = interval; })
+                .or_insert(DataWidgetState { resource_id, layoutid, update_interval: interval,
                                               last_refreshed: None,
                                               last_attempt_failed_at: None });
         }
@@ -645,9 +656,12 @@ impl Cache {
                 changed = true;
                 // A purged resource might have been the container for
                 // tracked data widgets (v7 GetData polling, see
-                // data_widgets's own doc comment) -- without this,
-                // we'd keep polling GetData for a widget belonging to
-                // a layout/region that's no longer scheduled at all.
+                // data_widgets's own doc comment) -- covers the case
+                // of an explicit CMS purge specifically. A layout
+                // simply falling out of the current schedule *without*
+                // being purged is a separate case, handled instead by
+                // prune_data_widgets_not_in (called from
+                // mainloop.rs's own schedule_check).
                 if let Resource::Resource(info) = &removed {
                     self.data_widgets.retain(|_, s| s.resource_id != info.id);
                 }
@@ -673,6 +687,32 @@ impl Cache {
         // Re-install bundled assets after purge
         self.install_pdfjs()?;
         Ok(())
+    }
+
+    /// Stops tracking (and polling GetData for) any data widget whose
+    /// own layout isn't in `active_layouts` -- confirmed from a real
+    /// report: a layout can simply stop being scheduled (e.g. outside
+    /// its own time window) without the CMS ever purging its resource,
+    /// so `purge`/`purge_some` alone don't catch this case. Without
+    /// this, GetData kept being called forever for widgets belonging
+    /// to no-longer-active layouts, each failing with a real "Requested
+    /// an invalid file" SOAP fault -- harmless (the existing backoff,
+    /// see `last_attempt_failed_at`'s own doc comment, already prevents
+    /// a tight retry loop) but genuinely pointless network traffic and
+    /// log noise that would otherwise continue indefinitely.
+    pub fn prune_data_widgets_not_in(&mut self, active_layouts: &[LayoutId]) {
+        self.data_widgets.retain(|_, s| active_layouts.contains(&s.layoutid));
+    }
+
+    /// Whether `widget_id` is one we're independently polling via
+    /// GetData (v7 groundwork, see `discover_data_widgets`) -- lets a
+    /// caller avoid attempting GetData for every XMR dataUpdate
+    /// message indiscriminately (that XMR mechanism predates and is
+    /// unrelated to v7 specifically, so most widgets it fires for
+    /// aren't tracked here at all, and a v5 CMS wouldn't support
+    /// GetData in the first place).
+    pub fn is_tracked_data_widget(&self, widget_id: i64) -> bool {
+        self.data_widgets.contains_key(&widget_id)
     }
 
     /// Which tracked data widgets (v7 GetData polling) are due for a
@@ -1418,7 +1458,7 @@ mod data_widget_polling_tests {
     #[test]
     fn discover_starts_tracking_a_widget_that_needs_get_data() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
         let due = cache.data_widgets_due(Instant::now());
         assert_eq!(due, vec![4543], "a never-refreshed widget must be due immediately");
     }
@@ -1431,7 +1471,7 @@ mod data_widget_polling_tests {
         let v5_html = r#"<script>
         widgetData.push({"widgetId":4543,"url":"null","data":{"data":[{"NOME":"Mario Rossi"}]}});
         </script>"#;
-        cache.discover_data_widgets(v5_html, 1);
+        cache.discover_data_widgets(v5_html, 1, 940);
         assert!(cache.data_widgets_due(Instant::now()).is_empty());
         assert_eq!(cache.next_data_widget_due_in(Instant::now()), None);
     }
@@ -1439,7 +1479,7 @@ mod data_widget_polling_tests {
     #[test]
     fn refresh_writes_the_json_file_and_clears_due_status() {
         let (mut cache, dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1); // resource_id 1, widget_id 4543
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940); // resource_id 1, widget_id 4543
 
         let mut data_cms = make_cms_with_mock_getdata(r#"{"data":[{"NOME":"Mario Rossi"}]}"#);
         let now = Instant::now();
@@ -1459,7 +1499,7 @@ mod data_widget_polling_tests {
     #[test]
     fn becomes_due_again_after_its_own_update_interval_elapses() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1); // updateInterval: 5 (minutes)
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940); // updateInterval: 5 (minutes)
 
         let mut data_cms = make_cms_with_mock_getdata(r#"{"data":[]}"#);
         let refreshed_at = Instant::now();
@@ -1481,7 +1521,7 @@ mod data_widget_polling_tests {
     #[test]
     fn next_due_in_reflects_the_remaining_time() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
 
         let mut data_cms = make_cms_with_mock_getdata(r#"{"data":[]}"#);
         let refreshed_at = Instant::now();
@@ -1505,7 +1545,7 @@ mod data_widget_polling_tests {
         cache.content.insert("1.html".to_string(), Resource::Resource(Arc::new(
             ResourceInfo { id: 1, layoutid: 940, regionid: 4542, mediaid: 4543,
                            updated: 0, duration: None, numitems: None })));
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
         assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543]);
 
         cache.purge_some(&["1.html".to_string()]).unwrap();
@@ -1518,7 +1558,7 @@ mod data_widget_polling_tests {
     #[test]
     fn purge_stops_tracking_every_widget() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
         assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543]);
 
         cache.purge().unwrap();
@@ -1566,7 +1606,7 @@ mod data_widget_polling_tests {
     #[test]
     fn refresh_downloads_a_file_referenced_in_files_not_yet_cached() {
         let (mut cache, dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
 
         let content = b"fake image bytes";
         let md5_hex = hex::encode(Md5::digest(content));
@@ -1586,7 +1626,7 @@ mod data_widget_polling_tests {
     #[test]
     fn refresh_skips_a_file_already_correctly_cached() {
         let (mut cache, dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
 
         // Pre-populate the cache exactly as a prior real download would
         // have left it -- content map *and* the file on disk.
@@ -1616,7 +1656,7 @@ mod data_widget_polling_tests {
     #[test]
     fn refresh_does_not_write_json_if_a_referenced_file_fails_to_download() {
         let (mut cache, dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
 
         // A path nothing is listening on, and no matching XMDS fallback
         // mock either -- both download paths must fail.
@@ -1634,7 +1674,7 @@ mod data_widget_polling_tests {
     #[test]
     fn refresh_tolerates_a_malformed_files_entry() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
 
         // Missing "md5" entirely -- skipped rather than failing the
         // whole refresh.
@@ -1666,7 +1706,7 @@ mod data_widget_polling_tests {
     #[test]
     fn a_failed_refresh_is_not_immediately_due_again() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
         let mut broken_cms = make_cms_with_broken_getdata();
 
         let now = Instant::now();
@@ -1680,7 +1720,7 @@ mod data_widget_polling_tests {
     #[test]
     fn becomes_due_again_once_the_backoff_delay_elapses() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
         let mut broken_cms = make_cms_with_broken_getdata();
 
         let failed_at = Instant::now();
@@ -1698,7 +1738,7 @@ mod data_widget_polling_tests {
     #[test]
     fn a_success_after_a_prior_failure_clears_the_backoff() {
         let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
         let mut broken_cms = make_cms_with_broken_getdata();
 
         let failed_at = Instant::now();
@@ -1715,5 +1755,59 @@ mod data_widget_polling_tests {
         // interval (5 minutes), not the short retry backoff.
         let just_under_5_min = succeeded_at + Duration::from_secs(5 * 60 - 1);
         assert!(cache.data_widgets_due(just_under_5_min).is_empty());
+    }
+
+    // The following tests cover pruning by active schedule -- found
+    // from a real report: a layout can simply stop being scheduled
+    // (e.g. outside its own time window) without the CMS ever purging
+    // its resource, so purge/purge_some alone don't stop GetData being
+    // polled forever for widgets belonging to it -- each call failing
+    // with a real "Requested an invalid file" SOAP fault.
+
+    #[test]
+    fn prune_stops_tracking_a_widget_whose_layout_left_the_schedule() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940); // layout 940
+        assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543]);
+
+        // Layout 940 is no longer part of the active schedule (some
+        // other layout, e.g. 947, took over) -- no purge involved.
+        cache.prune_data_widgets_not_in(&[947]);
+
+        assert!(cache.data_widgets_due(Instant::now()).is_empty(),
+                "a widget must stop being tracked once its own layout leaves the \
+                 active schedule, even without an explicit CMS purge");
+        assert_eq!(cache.next_data_widget_due_in(Instant::now()), None);
+    }
+
+    #[test]
+    fn prune_keeps_tracking_a_widget_whose_layout_is_still_active() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
+
+        // 940 is still one of several layouts currently in rotation.
+        cache.prune_data_widgets_not_in(&[940, 947]);
+
+        assert_eq!(cache.data_widgets_due(Instant::now()), vec![4543],
+                   "must not prune a widget whose own layout is still active");
+    }
+
+    #[test]
+    fn prune_is_a_safe_no_op_with_nothing_tracked() {
+        let (mut cache, _dir) = make_cache();
+        cache.prune_data_widgets_not_in(&[940, 947]);
+        assert!(cache.data_widgets_due(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn is_tracked_data_widget_reflects_discovery() {
+        let (mut cache, _dir) = make_cache();
+        assert!(!cache.is_tracked_data_widget(4543),
+                "must not report a widget as tracked before it's ever discovered");
+
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
+        assert!(cache.is_tracked_data_widget(4543));
+        assert!(!cache.is_tracked_data_widget(9999),
+                "must not report an unrelated widget id as tracked");
     }
 }

@@ -544,6 +544,28 @@ impl Handler {
                         self.run_command(&code);
                     }
                     Ok(xmr::Message::DataUpdate(widget_id)) => {
+                        // For a v7 data widget we're independently
+                        // polling via GetData (see refresh_data_widget),
+                        // refresh its own JSON *before* reloading the
+                        // resource below -- otherwise there's a real
+                        // race: the reloaded iframe's own JS fetches
+                        // <widgetId>.json immediately, which might not
+                        // exist yet if our own independent polling
+                        // timer simply hasn't caught up (confirmed via
+                        // a real report: a transient 404 on every
+                        // XMR-pushed data update for a v7 widget, until
+                        // either our own timer or the widget's own
+                        // client-side freshnessTimer eventually
+                        // recovers on its own). Best-effort -- a
+                        // failure here doesn't block the resource
+                        // reload below, which must proceed regardless.
+                        if self.cache.is_tracked_data_widget(widget_id) {
+                            if let Err(e) = self.cache.refresh_data_widget(
+                                widget_id, &mut self.xmds, std::time::Instant::now()) {
+                                log::warn!("refreshing data widget {widget_id} \
+                                            after dataUpdate: {e:#}");
+                            }
+                        }
                         // Targeted refresh of a single widget's cached
                         // HTML -- deliberately does NOT touch the stored
                         // `updated` timestamp (see Cache::refresh_resource),
@@ -1209,6 +1231,13 @@ impl Handler {
             self.to_gui.send(ToGui::Layouts(new_layouts.clone())).unwrap();
             self.layouts = new_layouts;
         }
+        // Stop polling GetData for any data widget whose own layout
+        // isn't in the current schedule anymore -- run unconditionally
+        // (not just when the schedule actually changed above), a cheap
+        // no-op call otherwise, and more robust against other paths
+        // that could change what's active without going through the
+        // check just above.
+        self.cache.prune_data_widgets_not_in(&self.layouts);
         self.recheck_schedule_overlays();
     }
 
@@ -3262,7 +3291,7 @@ mod data_refresh_timer_tests {
         // pass by accident from confusing the two.
         handler.cache.discover_data_widgets(
             r#"<script>widgetData.push({"widgetId":4543,"url":"4543.json","data":null});</script>"#,
-            1);
+            1, 940);
 
         handler.refresh_due_data_widgets();
 
