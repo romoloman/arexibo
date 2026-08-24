@@ -224,7 +224,7 @@ pub struct Handler {
 /// in a real case where the CMS's "Cache not ready" fault persisted
 /// well over a minute. ~3 minute total window gives the CMS more
 /// realistic room while still eventually giving up.
-const RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(20);
+pub(crate) const RESOURCE_RETRY_DELAY: Duration = Duration::from_secs(20);
 const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
 /// See `Handler::pending_auth`'s own doc comment. 30s strikes a balance
 /// between responsiveness (someone actively watching for the display

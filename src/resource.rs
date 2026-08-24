@@ -11,7 +11,7 @@ use elementtree::Element;
 use md5::{Md5, Digest};
 use serde::{Serialize, Deserialize};
 use ureq::Agent;
-use crate::{util, layout, layout::TRANSLATOR_VERSION, xmds};
+use crate::{util, layout, layout::TRANSLATOR_VERSION, xmds, mainloop};
 use crate::config::CmsSettings;
 
 
@@ -183,6 +183,17 @@ struct DataWidgetState {
     update_interval: Duration,
     /// None means never refreshed yet -- due immediately.
     last_refreshed: Option<Instant>,
+    /// Set when the most recent refresh attempt failed (GetData fault,
+    /// a referenced file failing to download, etc.) -- without this,
+    /// a widget that keeps failing would never advance last_refreshed
+    /// and would stay "due" forever, causing the mainloop's own timer
+    /// to rearm to essentially zero and busy-loop retrying with no
+    /// backoff at all (confirmed via a real report: hundreds of
+    /// GetData calls in a tight loop against a CMS returning a
+    /// transient "Cache not ready" fault). Enforces a minimum
+    /// RESOURCE_RETRY_DELAY between attempts instead. Cleared on a
+    /// successful refresh.
+    last_attempt_failed_at: Option<Instant>,
 }
 
 impl Cache {
@@ -610,7 +621,8 @@ impl Cache {
             self.data_widgets.entry(w.widget_id)
                 .and_modify(|s| { s.resource_id = resource_id; s.update_interval = interval; })
                 .or_insert(DataWidgetState { resource_id, update_interval: interval,
-                                              last_refreshed: None });
+                                              last_refreshed: None,
+                                              last_attempt_failed_at: None });
         }
     }
 
@@ -668,8 +680,13 @@ impl Cache {
     /// update_interval has elapsed since the last one.
     pub fn data_widgets_due(&self, now: Instant) -> Vec<i64> {
         self.data_widgets.iter()
-            .filter(|(_, s)| s.last_refreshed
-                    .map_or(true, |t| now.duration_since(t) >= s.update_interval))
+            .filter(|(_, s)| {
+                let due_by_interval = s.last_refreshed
+                    .map_or(true, |t| now.duration_since(t) >= s.update_interval);
+                let not_in_backoff = s.last_attempt_failed_at
+                    .map_or(true, |t| now.duration_since(t) >= mainloop::RESOURCE_RETRY_DELAY);
+                due_by_interval && not_in_backoff
+            })
             .map(|(id, _)| *id)
             .collect()
     }
@@ -678,24 +695,73 @@ impl Cache {
     /// arming a re-check timer. None if no data widgets are currently
     /// tracked at all (timer should stay disarmed).
     pub fn next_data_widget_due_in(&self, now: Instant) -> Option<Duration> {
-        self.data_widgets.values().map(|s| match s.last_refreshed {
-            None => Duration::ZERO, // due immediately
-            Some(t) => s.update_interval.saturating_sub(now.duration_since(t)),
+        self.data_widgets.values().map(|s| {
+            let interval_remaining = match s.last_refreshed {
+                None => Duration::ZERO,
+                Some(t) => s.update_interval.saturating_sub(now.duration_since(t)),
+            };
+            let backoff_remaining = match s.last_attempt_failed_at {
+                None => Duration::ZERO,
+                Some(t) => mainloop::RESOURCE_RETRY_DELAY.saturating_sub(now.duration_since(t)),
+            };
+            // Whichever clears last -- a widget that just failed is
+            // still "due" by its own interval (it never successfully
+            // refreshed), but must also wait out the backoff before
+            // being retried.
+            interval_remaining.max(backoff_remaining)
         }).min()
     }
 
     /// Fetches fresh data for one tracked widget via GetData and writes
     /// it as `<widget_id>.json` in the cache directory -- ready to be
     /// served by the local webserver at the relative `url` the
-    /// widget's own rendered HTML references. Updates the widget's own
-    /// last-refreshed time on success.
+    /// widget's own rendered HTML references.
     /// Returns the containing resource's own id on success (matching
     /// `refresh_resource`'s own pattern) -- the caller needs this to
     /// tell the GUI *which* iframe/webview to reload, since that's
     /// identified by resource id, not the raw widget id.
+    ///
+    /// On failure, records the attempt (see `last_attempt_failed_at`'s
+    /// own doc comment) so the caller's own re-check timer backs off
+    /// instead of retrying immediately -- found from a real report: a
+    /// CMS-side transient fault ("Cache not ready") caused hundreds of
+    /// GetData calls in a tight loop with no delay at all, since
+    /// nothing was advancing away from "due right now" on failure.
     pub fn refresh_data_widget(&mut self, widget_id: i64, cms: &mut xmds::Cms,
                                 now: Instant) -> Result<i64> {
+        match self.try_refresh_data_widget(widget_id, cms) {
+            Ok(resource_id) => {
+                if let Some(state) = self.data_widgets.get_mut(&widget_id) {
+                    state.last_refreshed = Some(now);
+                    state.last_attempt_failed_at = None;
+                }
+                Ok(resource_id)
+            }
+            Err(e) => {
+                if let Some(state) = self.data_widgets.get_mut(&widget_id) {
+                    state.last_attempt_failed_at = Some(now);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The actual refresh logic, separated from `refresh_data_widget`'s
+    /// own success/failure bookkeeping above -- lets that wrapper
+    /// update the right timestamp regardless of *where* inside this
+    /// the failure happened (GetData itself, a referenced file's own
+    /// download, or the final write).
+    fn try_refresh_data_widget(&mut self, widget_id: i64, cms: &mut xmds::Cms) -> Result<i64> {
         let json = cms.get_data(widget_id)?;
+        // Download any files this data references (typically images
+        // used by dataset rows) *before* writing the widget's own
+        // JSON -- this data-widget refresh timer runs independently
+        // of the normal collect_once()/RequiredFiles cycle, so a file
+        // referenced here isn't guaranteed to already be cached via
+        // that other path. A failed download here means the widget
+        // keeps showing its previous (working) data instead of
+        // referencing an image that doesn't exist yet.
+        self.download_data_widget_files(&json, cms)?;
         // Write to a sibling .tmp file, then rename atomically -- same
         // convention as adspace.rs's own download_creative. The local
         // webserver could be serving this exact file to the widget's
@@ -708,10 +774,42 @@ impl Cache {
         let tmp_path = path.with_extension("tmp");
         fs::write(&tmp_path, json)?;
         fs::rename(&tmp_path, &path)?;
-        let state = self.data_widgets.get_mut(&widget_id)
+        let state = self.data_widgets.get(&widget_id)
             .ok_or_else(|| anyhow::anyhow!("widget {widget_id} is no longer tracked"))?;
-        state.last_refreshed = Some(now);
         Ok(state.resource_id)
+    }
+
+    /// Downloads every file referenced in a GetData response's own
+    /// `files` array that isn't already correctly cached -- same shape
+    /// as a RequiredFiles `type="media"` entry, so this reuses
+    /// `download()` directly (same direct-then-XMDS-fallback retry
+    /// logic as every other media file). A malformed individual entry
+    /// is skipped rather than failing the whole refresh -- genuinely
+    /// malformed CMS output isn't expected in practice, and being
+    /// lenient here is more useful than blocking an otherwise-valid
+    /// refresh over one bad entry. A genuine download failure,
+    /// though, propagates -- that's the whole point of checking this
+    /// before writing the widget's own JSON.
+    fn download_data_widget_files(&mut self, json: &str, cms: &mut xmds::Cms) -> Result<()> {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else { return Ok(()) };
+        let Some(files) = value.get("files").and_then(|f| f.as_array()) else { return Ok(()) };
+        for f in files {
+            let (Some(id), Some(size), Some(md5_hex), Some(save_as), Some(path)) = (
+                f.get("id").and_then(|v| v.as_i64()),
+                f.get("size").and_then(|v| v.as_u64()),
+                f.get("md5").and_then(|v| v.as_str()),
+                f.get("saveAs").and_then(|v| v.as_str()),
+                f.get("path").and_then(|v| v.as_str()),
+            ) else { continue };
+            let Ok(md5) = hex::decode(md5_hex) else { continue };
+            let req = ReqFile::File { id, typ: "media", size, md5, http: true,
+                                       path: path.to_string(), name: save_as.to_string(),
+                                       code: None };
+            if !self.has(&req) {
+                self.download(req, cms)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1445,5 +1543,177 @@ mod data_widget_polling_tests {
         assert!(cache.data_widgets_due(Instant::now()).is_empty(),
                 "nothing should be tracked via the real download() path while \
                  xmds_supports_v6_v7_methods() is false");
+    }
+
+    // The following tests cover files[] (see GetData's own real shape,
+    // confirmed via a real CMS with an image dataset column) -- files
+    // referenced by dataset rows that must be downloaded *before* the
+    // widget's own JSON is written, since this refresh timer runs
+    // independently of the normal collect_once()/RequiredFiles cycle
+    // and isn't guaranteed to have already picked such a file up.
+
+    fn start_mock_http_file(content: &'static [u8]) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let _ = request.respond(tiny_http::Response::from_data(content));
+            }
+        });
+        format!("http://127.0.0.1:{port}/")
+    }
+
+    #[test]
+    fn refresh_downloads_a_file_referenced_in_files_not_yet_cached() {
+        let (mut cache, dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+
+        let content = b"fake image bytes";
+        let md5_hex = hex::encode(Md5::digest(content));
+        let file_url = start_mock_http_file(content);
+        let get_data_json: String = format!(
+            r#"{{"data":[],"files":[{{"id":99,"size":{},"md5":"{md5_hex}","saveAs":"99.png","path":"{file_url}"}}]}}"#,
+            content.len());
+        let json_static: &'static str = Box::leak(get_data_json.into_boxed_str());
+        let mut data_cms = make_cms_with_mock_getdata(json_static);
+
+        cache.refresh_data_widget(4543, &mut data_cms, Instant::now()).unwrap();
+
+        let saved = fs::read(dir.join("99.png")).unwrap();
+        assert_eq!(saved, content, "the referenced file must actually be downloaded to disk");
+    }
+
+    #[test]
+    fn refresh_skips_a_file_already_correctly_cached() {
+        let (mut cache, dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+
+        // Pre-populate the cache exactly as a prior real download would
+        // have left it -- content map *and* the file on disk.
+        let content = b"already cached bytes";
+        let md5 = Md5::digest(content).to_vec();
+        fs::write(dir.join("99.png"), content).unwrap();
+        cache.content.insert("99.png".to_string(), Resource::Media(Arc::new(
+            MediaInfo { id: 99, size: content.len() as u64, md5: md5.clone() })));
+
+        let md5_hex = hex::encode(&md5);
+        let get_data_json: String = format!(
+            r#"{{"data":[],"files":[{{"id":99,"size":{},"md5":"{md5_hex}","saveAs":"99.png","path":"http://127.0.0.1:1/unreachable"}}]}}"#,
+            content.len());
+        let json_static: &'static str = Box::leak(get_data_json.into_boxed_str());
+        // Deliberately no download mock at all -- if the file weren't
+        // correctly recognized as already cached, this would fail
+        // trying to reach an address nothing is listening on.
+        let mut data_cms = make_cms_with_mock_getdata(json_static);
+
+        cache.refresh_data_widget(4543, &mut data_cms, Instant::now()).unwrap();
+
+        // Untouched -- still the pre-populated content, not overwritten.
+        let saved = fs::read(dir.join("99.png")).unwrap();
+        assert_eq!(saved, content);
+    }
+
+    #[test]
+    fn refresh_does_not_write_json_if_a_referenced_file_fails_to_download() {
+        let (mut cache, dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+
+        // A path nothing is listening on, and no matching XMDS fallback
+        // mock either -- both download paths must fail.
+        let get_data_json = r#"{"data":[],"files":[{"id":99,"size":5,"md5":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","saveAs":"99.png","path":"http://127.0.0.1:1/unreachable"}]}"#;
+        let mut data_cms = make_cms_with_mock_getdata(get_data_json);
+
+        let result = cache.refresh_data_widget(4543, &mut data_cms, Instant::now());
+
+        assert!(result.is_err(), "must propagate the download failure");
+        assert!(!dir.join("4543.json").exists(),
+                "the widget's own JSON must not be written if a referenced file fails");
+        assert!(!dir.join("4543.tmp").exists());
+    }
+
+    #[test]
+    fn refresh_tolerates_a_malformed_files_entry() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+
+        // Missing "md5" entirely -- skipped rather than failing the
+        // whole refresh.
+        let get_data_json = r#"{"data":[],"files":[{"id":99,"size":5,"saveAs":"99.png","path":"http://127.0.0.1:1/unreachable"}]}"#;
+        let mut data_cms = make_cms_with_mock_getdata(get_data_json);
+
+        cache.refresh_data_widget(4543, &mut data_cms, Instant::now()).unwrap();
+    }
+
+    // The following tests cover the backoff-after-failure fix -- found
+    // from a real report: a widget that keeps failing to refresh (e.g.
+    // the CMS returning a transient "Cache not ready" SOAP fault) must
+    // NOT be retried immediately, or it busy-loops with no delay at
+    // all, hammering the CMS with hundreds of calls per second.
+
+    fn make_cms_with_broken_getdata() -> xmds::Cms {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                // Not valid SOAP at all -- any well-formed request
+                // against this must fail to parse.
+                let _ = request.respond(tiny_http::Response::from_string("not xml"));
+            }
+        });
+        test_cms_at(port)
+    }
+
+    #[test]
+    fn a_failed_refresh_is_not_immediately_due_again() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        let mut broken_cms = make_cms_with_broken_getdata();
+
+        let now = Instant::now();
+        assert!(cache.refresh_data_widget(4543, &mut broken_cms, now).is_err());
+
+        assert!(cache.data_widgets_due(now).is_empty(),
+                "a widget must not be immediately due again right after a failed attempt -- \
+                 this is the exact bug that caused a real retry busy-loop");
+    }
+
+    #[test]
+    fn becomes_due_again_once_the_backoff_delay_elapses() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        let mut broken_cms = make_cms_with_broken_getdata();
+
+        let failed_at = Instant::now();
+        assert!(cache.refresh_data_widget(4543, &mut broken_cms, failed_at).is_err());
+
+        let just_under_backoff = failed_at + mainloop::RESOURCE_RETRY_DELAY
+            - Duration::from_millis(1);
+        assert!(cache.data_widgets_due(just_under_backoff).is_empty());
+
+        let just_over_backoff = failed_at + mainloop::RESOURCE_RETRY_DELAY
+            + Duration::from_millis(1);
+        assert_eq!(cache.data_widgets_due(just_over_backoff), vec![4543]);
+    }
+
+    #[test]
+    fn a_success_after_a_prior_failure_clears_the_backoff() {
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1);
+        let mut broken_cms = make_cms_with_broken_getdata();
+
+        let failed_at = Instant::now();
+        assert!(cache.refresh_data_widget(4543, &mut broken_cms, failed_at).is_err());
+
+        // A real GetData succeeds shortly after (e.g. the CMS's own
+        // transient state cleared) -- must fully recover, not remain
+        // stuck honoring a backoff from the earlier failure.
+        let mut working_cms = make_cms_with_mock_getdata(r#"{"data":[]}"#);
+        let succeeded_at = failed_at + Duration::from_secs(1);
+        cache.refresh_data_widget(4543, &mut working_cms, succeeded_at).unwrap();
+
+        // Immediately due again only after its own real update
+        // interval (5 minutes), not the short retry backoff.
+        let just_under_5_min = succeeded_at + Duration::from_secs(5 * 60 - 1);
+        assert!(cache.data_widgets_due(just_under_5_min).is_empty());
     }
 }
