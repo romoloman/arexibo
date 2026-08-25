@@ -419,7 +419,7 @@ impl Handler {
                                  screenshot_requested_seen: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key, cms: cms.clone(), no_verify };
-            slf.update_settings();
+            slf.update_settings()?;
             slf.schedule_check();  // only useful in case of cached schedule
             Ok(slf)
         } else {
@@ -462,7 +462,7 @@ impl Handler {
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
                                  cms: cms.clone(), no_verify };
-            slf.update_settings();
+            slf.update_settings()?;
             Ok(slf)
         }
     }
@@ -936,7 +936,7 @@ impl Handler {
             }
             if settings != self.settings {
                 self.settings = settings;
-                self.update_settings();
+                self.update_settings()?;
             }
             if self.pending_auth || self.pending_network {
                 // Just got authorized, or the network/CMS finally
@@ -1501,7 +1501,7 @@ impl Handler {
     }
 
     /// Apply new player settings.
-    fn update_settings(&mut self) {
+    fn update_settings(&mut self) -> Result<()> {
         // CMS's logLevel setting takes effect unless --debug is set
         // locally (an explicit override shouldn't be silently beaten
         // by a remote setting).
@@ -1530,15 +1530,24 @@ impl Handler {
                 self.process_timezone_applied = Some(tz);
             }
             TimezoneAction::WarnRestartNeeded { was, now } => {
-                // Remote unattended kiosks -- exit for a clean systemd
-                // restart rather than logging and running with a stale
-                // timezone indefinitely.
+                // Same reasoning as RestartRequired's own doc comment
+                // -- exiting directly here (std::process::exit) used
+                // to bypass gui::quit()'s own safe shutdown sequencing
+                // whenever this ran from collect_once() (mainloop
+                // thread, GUI already active), risking the same real
+                // segfault RestartRequired was built to avoid. This
+                // specific case can't actually occur during
+                // Handler::new's own initial update_settings call (no
+                // previously-applied timezone yet to differ from), but
+                // unifying on the same marker regardless keeps this
+                // consistent rather than depending on that reasoning
+                // never changing.
                 log::error!("the CMS's own display timezone changed from {was:?} to \
                              {now:?} since this process started -- exiting so systemd \
                              can restart cleanly and pick up the change (changing a \
                              process's own timezone mid-session, from a background \
                              thread, isn't safe to do here)");
-                std::process::exit(1);
+                return Err(RestartRequired.into());
             }
         }
 
@@ -1559,7 +1568,7 @@ impl Handler {
         // -- same validate-before-committing caution as the CMS
         // migration below, and reuses the same validate_new_cms
         // helper. If this succeeds it exits the process too.
-        self.attempt_https_upgrade();
+        self.attempt_https_upgrade()?;
 
         // CMS-driven migration to a different server (see
         // new_cms_address/new_cms_key's own doc comment in config.rs)
@@ -1567,22 +1576,23 @@ impl Handler {
         // would be (a totem could become unreachable). Only attempted
         // here, at the very end, after every other settings-derived
         // action above -- if this succeeds it exits the process.
-        self.attempt_cms_migration();
+        self.attempt_cms_migration()?;
 
         // let the GUI know to reconfigure itself
         self.to_gui.send(ToGui::Settings(Box::new(self.settings.clone()))).unwrap();
+        Ok(())
     }
 
     /// Upgrades http:// to https:// when the CMS's forceHttps is on,
     /// validating the https:// address works first (reusing
     /// validate_new_cms). On failure stays on http and retries next
     /// cycle.
-    fn attempt_https_upgrade(&mut self) {
+    fn attempt_https_upgrade(&mut self) -> Result<()> {
         if !self.settings.force_https {
-            return;
+            return Ok(());
         }
         let Some(https_address) = https_upgrade_address(&self.cms.address) else {
-            return; // already https://, or some other/unrecognized scheme
+            return Ok(()); // already https://, or some other/unrecognized scheme
         };
 
         log::info!("CMS has forceHttps enabled and our own address ({}) is still http:// \
@@ -1596,7 +1606,7 @@ impl Handler {
             Err(e) => {
                 log::error!("deriving public key for forceHttps validation, NOT \
                              switching: {e:#}");
-                return;
+                return Ok(());
             }
         };
 
@@ -1607,24 +1617,33 @@ impl Handler {
                 if let Err(e) = candidate.to_file(self.envdir.join("cms.json")) {
                     log::error!("writing cms.json for forceHttps upgrade: {e:#} -- NOT \
                                  exiting, will retry next cycle");
-                    return;
+                    return Ok(());
                 }
-                std::process::exit(1);
+                // See RestartRequired's own doc comment -- this can
+                // genuinely occur during Handler::new's own initial
+                // update_settings call (before gui::run() ever starts,
+                // where a direct exit would be safe too), or from
+                // collect_once() (mainloop thread, GUI already
+                // active, where it isn't) -- unified on the same
+                // marker either way rather than depending on knowing
+                // which context called this.
+                return Err(RestartRequired.into());
             }
             Err(e) => {
                 log::warn!("the https:// equivalent of our own CMS address didn't work, \
                             staying on http:// for now (will retry next cycle): {e:#}");
             }
         }
+        Ok(())
     }
 
     /// Attempts a CMS migration if requested (new_cms_address/
     /// new_cms_key). Validates the new CMS first -- READY or WAITING
     /// both count as success, since a freshly-migrated display is
     /// likely not yet authorized. No-op if no migration is requested.
-    fn attempt_cms_migration(&mut self) {
+    fn attempt_cms_migration(&mut self) -> Result<()> {
         if !should_attempt_cms_migration(&self.settings.new_cms_address, &self.settings.new_cms_key) {
-            return;
+            return Ok(());
         }
 
         log::info!("CMS requested migration to a new server ({}) -- validating before \
@@ -1649,7 +1668,7 @@ impl Handler {
             Err(e) => {
                 log::error!("deriving public key for CMS migration validation, NOT \
                              migrating: {e:#}");
-                return;
+                return Ok(());
             }
         };
 
@@ -1660,7 +1679,10 @@ impl Handler {
                     Ok(()) => {
                         log::error!("CMS migration complete -- exiting so systemd restarts \
                                      cleanly against the new CMS");
-                        std::process::exit(1);
+                        // See attempt_https_upgrade's own comment on
+                        // why RestartRequired is used uniformly here
+                        // regardless of which context called this.
+                        return Err(RestartRequired.into());
                     }
                     Err(e) => {
                         log::error!("committing CMS migration (validation had already \
@@ -1673,6 +1695,7 @@ impl Handler {
                              (will retry next cycle): {e:#}");
             }
         }
+        Ok(())
     }
 }
 
@@ -3299,21 +3322,21 @@ mod screenshot_requested_tests {
         let _ = count_screenshot_messages(&togui_rx);
 
         handler.settings.screen_shot_requested = true;
-        handler.update_settings();
+        handler.update_settings().unwrap();
         assert_eq!(count_screenshot_messages(&togui_rx), 1);
 
         // Flag stays true for a second cycle -- must not fire again.
-        handler.update_settings();
+        handler.update_settings().unwrap();
         assert_eq!(count_screenshot_messages(&togui_rx), 0);
 
         // CMS resets the flag once it receives our submission.
         handler.settings.screen_shot_requested = false;
-        handler.update_settings();
+        handler.update_settings().unwrap();
         assert_eq!(count_screenshot_messages(&togui_rx), 0);
 
         // A genuinely new request later must fire again.
         handler.settings.screen_shot_requested = true;
-        handler.update_settings();
+        handler.update_settings().unwrap();
         assert_eq!(count_screenshot_messages(&togui_rx), 1,
                    "a new request (flag re-transitioning false -> true) must fire again");
     }
@@ -3410,6 +3433,96 @@ mod commit_cms_migration_tests {
                                      display_id: "stable-hw-id-123".into(), display_name: None,
                                      proxy: None };
         assert!(commit_cms_migration(&envdir, &new_cms).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod attempt_cms_migration_tests {
+    use super::*;
+
+    // Confirms the fix for a real report: the success path of both
+    // attempt_https_upgrade and attempt_cms_migration used to call
+    // std::process::exit() directly, which (a) segfaulted when this
+    // ran from collect_once() with Qt's own event loop still fully
+    // active (see RestartRequired's own doc comment), and (b) made
+    // this exact path fundamentally untestable, since a stray
+    // process::exit() during a test run would kill the test runner
+    // itself. Now that it returns Result instead, this is directly
+    // testable for the first time.
+
+    fn start_ready_mock() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_envdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_attempt_migration_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_successful_migration_returns_restart_required_not_a_process_exit() {
+        let initial_port = start_ready_mock();
+        let cms = CmsSettings { address: format!("http://127.0.0.1:{initial_port}"),
+                                 key: "testkey".into(), display_id: "test-display".into(),
+                                 display_name: None, proxy: None };
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        // A second, independent CMS to "migrate" to -- also validates
+        // successfully.
+        let new_port = start_ready_mock();
+        handler.settings.new_cms_address = format!("http://127.0.0.1:{new_port}");
+        handler.settings.new_cms_key = "newkey".into();
+
+        let err = handler.attempt_cms_migration().expect_err(
+            "a successful migration must return an error, not silently continue");
+        assert!(err.root_cause().downcast_ref::<RestartRequired>().is_some(),
+                "must be specifically RestartRequired, not some other error");
+
+        // The migration itself must have actually been committed
+        // *before* the restart signal, not skipped.
+        let written = CmsSettings::from_file(envdir.join("cms.json")).unwrap();
+        assert_eq!(written.address, format!("http://127.0.0.1:{new_port}"));
+        assert_eq!(written.key, "newkey");
+    }
+
+    #[test]
+    fn no_migration_requested_is_a_quiet_no_op() {
+        let initial_port = start_ready_mock();
+        let cms = CmsSettings { address: format!("http://127.0.0.1:{initial_port}"),
+                                 key: "testkey".into(), display_id: "test-display".into(),
+                                 display_name: None, proxy: None };
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        // new_cms_address/new_cms_key left empty (the default, no
+        // migration requested) -- must not error at all.
+        handler.attempt_cms_migration().unwrap();
     }
 }
 
