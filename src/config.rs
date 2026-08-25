@@ -242,6 +242,7 @@ impl fmt::Debug for PlayerSettings {
             .field("new_cms_key", &self.new_cms_key)
             .field("force_https", &self.force_https)
             .field("embedded_server_port", &self.embedded_server_port)
+            .field("embedded_server_allow_wan", &self.embedded_server_allow_wan)
             .field("prevent_sleep", &self.prevent_sleep)
             .field("display_name", &self.display_name)
             .field("size_x", &self.size_x)
@@ -551,6 +552,7 @@ mod tests {
             "download_start_window", "download_end_window", "display_time_zone",
             "expire_modified_layouts", "screen_shot_requested", "new_cms_address",
             "new_cms_key", "force_https", "embedded_server_port",
+            "embedded_server_allow_wan",
             "prevent_sleep", "display_name", "size_x", "size_y", "pos_x", "pos_y",
             "commands", "enable_shell_commands", "shell_command_allow_list",
         ] {

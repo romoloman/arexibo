@@ -91,14 +91,6 @@ fn main() {
         // defensive fallback (harmless if never triggered) in case
         // NotAuthorized is ever raised again for another reason.
         //
-        // Exit code 3: embedded server port or WAN-access setting
-        // changed mid-session (see RestartRequired's own doc comment)
-        // -- an intentional exit so the supervisor restarts us fresh,
-        // not a genuine error.
-        if e.root_cause().downcast_ref::<mainloop::RestartRequired>().is_some() {
-            log::warn!("{:#}", e);
-            std::process::exit(3);
-        }
         // Exit code 1: actual error (bad config, CMS unreachable, etc.)
         if e.root_cause().downcast_ref::<mainloop::NotAuthorized>().is_some() {
             log::warn!("{:#}", e);
@@ -205,12 +197,24 @@ fn main_inner() -> anyhow::Result<()> {
     // picks a shard per widget deterministically from its id; 127.0.0.1
     // (set up above, shard 1) handles top-level navigation, shards
     // 2..=HTML_SHARD_COUNT get their own listener here.
-    for shard in 2..=server::HTML_SHARD_COUNT {
-        let addr = format!("127.0.0.{shard}");
-        let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
-                                                 duration_tx.clone(), trigger_tx.clone(), local_data.clone())
-            .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
-        shard_server.start_pool();
+    //
+    // Skipped entirely when the main server is bound to 0.0.0.0
+    // (embedded_server_allow_wan): a wildcard listener already accepts
+    // connections addressed to *every* local address on that port,
+    // including 127.0.0.2/.3/.4 -- binding those separately would
+    // always conflict with the already-listening wildcard socket
+    // (confirmed from a real report: "Address already in use (os error
+    // 98)" on startup, every single time, as soon as WAN access got
+    // enabled). The wildcard socket alone already serves every shard
+    // address correctly, no separate listeners needed.
+    if bind_addr != "0.0.0.0" {
+        for shard in 2..=server::HTML_SHARD_COUNT {
+            let addr = format!("127.0.0.{shard}");
+            let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
+                                                     duration_tx.clone(), trigger_tx.clone(), local_data.clone())
+                .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
+            shard_server.start_pool();
+        }
     }
 
     // BUG fix (found from a real report: a totem got stuck showing
@@ -238,7 +242,7 @@ fn main_inner() -> anyhow::Result<()> {
     std::thread::spawn(|| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run()));
         log::error!("{}", mainloop_exit_message(&result));
-        std::process::exit(1);
+        std::process::exit(mainloop_exit_code(&result));
     });
 
     gui::run(settings, args.screen.unwrap_or_default(), args.inspect,
@@ -260,6 +264,23 @@ fn mainloop_exit_message(result: &std::thread::Result<anyhow::Result<()>>) -> St
         Err(_) => "mainloop thread panicked -- exiting so systemd can restart \
                    cleanly".to_string(),
     }
+}
+
+/// Determines the process exit code for the mainloop thread's own
+/// exit -- same testable-pure-function reasoning as
+/// mainloop_exit_message. Exit code 3 specifically for
+/// RestartRequired (see its own doc comment in mainloop.rs): an
+/// intentional exit so the supervisor restarts us fresh to rebind the
+/// embedded webserver's own TCP listener, not a genuine error. Every
+/// other case (a real error, a panic, or the unexpected "exited
+/// normally") uses exit code 1.
+fn mainloop_exit_code(result: &std::thread::Result<anyhow::Result<()>>) -> i32 {
+    if let Ok(Err(e)) = result {
+        if e.root_cause().downcast_ref::<mainloop::RestartRequired>().is_some() {
+            return 3;
+        }
+    }
+    1
 }
 
 #[cfg(test)]
@@ -289,5 +310,39 @@ mod mainloop_exit_message_tests {
         let msg = mainloop_exit_message(&result);
         assert!(msg.contains("unexpected"), "got: {msg}");
         assert!(!msg.contains("panicked"));
+    }
+}
+
+#[cfg(test)]
+mod mainloop_exit_code_tests {
+    use super::mainloop_exit_code;
+
+    #[test]
+    fn restart_required_gets_its_own_distinct_exit_code() {
+        // Wrapping the real marker type, not just an anyhow!() with a
+        // similar-looking message -- must match via root_cause's own
+        // downcast, not string comparison.
+        let result: std::thread::Result<anyhow::Result<()>> =
+            Ok(Err(anyhow::Error::new(crate::mainloop::RestartRequired)));
+        assert_eq!(mainloop_exit_code(&result), 3);
+    }
+
+    #[test]
+    fn a_genuine_error_gets_the_generic_exit_code() {
+        let result: std::thread::Result<anyhow::Result<()>> =
+            Ok(Err(anyhow::anyhow!("network is unreachable")));
+        assert_eq!(mainloop_exit_code(&result), 1);
+    }
+
+    #[test]
+    fn a_panic_gets_the_generic_exit_code() {
+        let result: std::thread::Result<anyhow::Result<()>> = Err(Box::new("boom"));
+        assert_eq!(mainloop_exit_code(&result), 1);
+    }
+
+    #[test]
+    fn an_unexpected_normal_return_gets_the_generic_exit_code() {
+        let result: std::thread::Result<anyhow::Result<()>> = Ok(Ok(()));
+        assert_eq!(mainloop_exit_code(&result), 1);
     }
 }

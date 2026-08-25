@@ -499,6 +499,17 @@ impl Handler {
                 // timer channel that fires when collect is needed
                 recv(collect) -> _ => {
                     if let Err(e) = self.collect_once() {
+                        // RestartRequired must actually propagate out
+                        // of run() -- unlike every other collect_once
+                        // failure here (network hiccups, CMS faults,
+                        // etc.), which are deliberately non-fatal and
+                        // just get retried next cycle, this one can
+                        // never resolve itself: the webserver's own TCP
+                        // listener is already bound, and only a real
+                        // process restart can rebind it.
+                        if e.root_cause().downcast_ref::<RestartRequired>().is_some() {
+                            return Err(e);
+                        }
                         log::error!("during collect: {e:#}");
                     }
                     // A fresh collection may have discovered new data
