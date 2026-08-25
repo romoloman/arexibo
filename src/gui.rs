@@ -174,6 +174,21 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
     }
 }
 
+/// Signals Qt's own event loop (blocking inside run()'s own
+/// `cpp::run()` call, on whichever thread called `run()`) to exit
+/// cleanly -- thread-safe by Qt's own design (see cpp::quit's own doc
+/// comment in gui/lib.h), meant to be called from a *different*
+/// thread than the one running `run()` (typically the mainloop thread,
+/// see main.rs's own shutdown sequencing) once that thread has decided
+/// the whole process should exit. Calling std::process::exit()
+/// directly instead, while Qt/Chromium are still fully active, was
+/// causing a real, reproducible segfault on shutdown.
+pub fn quit() {
+    unsafe {
+        cpp::quit();
+    }
+}
+
 extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _arg3: isize) {
     let cb_data = unsafe { &*(ptr as *const CallbackData) };
 

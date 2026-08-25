@@ -32,6 +32,9 @@ extern "C" {
     pub fn run();
 }
 extern "C" {
+    pub fn quit();
+}
+extern "C" {
     pub fn navigate(file: *const ::std::os::raw::c_char);
 }
 extern "C" {

@@ -25,6 +25,13 @@ const intptr_t CB_OVERLAY_LAYOUT_INIT = 9;
 void setup(const char *base_uri, const char *screen,
            int inspect, int debug, callback cb, void *cb_ptr);
 void run();
+// Thread-safe by Qt's own design (QCoreApplication::quit() posts a
+// quit event internally, safe to call from any thread) -- lets
+// run()'s own blocking the_app->exec() return cleanly instead of the
+// process terminating abruptly (std::process::exit()) while Qt/
+// Chromium are still fully active, which was causing a real,
+// reproducible segfault on shutdown (found from a real report).
+void quit();
 void navigate(const char *file);
 // max_width: downscale to this width (preserving aspect ratio) before
 // submission, 0 = no resize -- see PlayerSettings::screenshot_size.

@@ -21,6 +21,7 @@ pub mod faults;
 pub mod adspace;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use anyhow::{ensure, Context};
 use clap::Parser;
 
@@ -239,15 +240,34 @@ fn main_inner() -> anyhow::Result<()> {
     // relies on elsewhere (e.g. the QtWebEngine renderProcessTerminated
     // handler, gui/view.h) for exactly this class of "can't safely
     // continue, but a full restart fixes it" problem.
-    std::thread::spawn(|| {
+    //
+    // Exiting via std::process::exit() directly from *this* thread,
+    // while gui::run()'s own Qt event loop (on the main thread, below)
+    // is still fully active, was causing a real, reproducible segfault
+    // on shutdown -- Qt/Chromium never got a chance to tear down their
+    // own internal state (GPU process, IPC channels to Chromium
+    // subprocesses) before the whole process vanished out from under
+    // them. Instead: record the exit code here, ask Qt to quit its own
+    // event loop cleanly (gui::quit(), thread-safe by Qt's own design),
+    // and let the main thread -- once gui::run() actually returns
+    // below, meaning Qt's own teardown has already happened -- be the
+    // one that calls std::process::exit(), with nothing left running
+    // that could object to it.
+    let exit_code = Arc::new(Mutex::new(1));
+    let exit_code_for_thread = exit_code.clone();
+    std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run()));
         log::error!("{}", mainloop_exit_message(&result));
-        std::process::exit(mainloop_exit_code(&result));
+        *exit_code_for_thread.lock().unwrap() = mainloop_exit_code(&result);
+        gui::quit();
     });
 
     gui::run(settings, args.screen.unwrap_or_default(), args.inspect,
              args.web_debug, togui_rx, fromgui_tx);
-    Ok(())
+    // gui::run() (cpp::run(), QApplication::exec()) has now returned --
+    // Qt's own event loop exited cleanly via gui::quit() above, so
+    // nothing is left running that a process-wide exit could disrupt.
+    std::process::exit(*exit_code.lock().unwrap());
 }
 
 /// Determines the log message for the mainloop thread's own exit

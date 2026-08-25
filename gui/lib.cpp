@@ -430,6 +430,11 @@ void run() {
     the_app->exec();
 }
 
+void quit() {
+    if (!the_app) return;
+    the_app->quit();
+}
+
 void navigate(const char *file) {
     if (!the_wnd) return;
     emit the_wnd->navigateTo(file);
