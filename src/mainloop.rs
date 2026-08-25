@@ -80,6 +80,12 @@ pub enum ToGui {
     /// Interactive Control duration override for a specific widget --
     /// see server::DurationRequest / layout.rs's `controlDuration`.
     ControlDuration(server::DurationRequest),
+    /// Interactive Control webhook trigger code -- see
+    /// server::TriggerRequest / layout.rs's `write_action`
+    /// (`window.arexibo.triggers[code]`, populated only in the DOM of
+    /// whichever page actually has a matching triggerType="webhook"
+    /// action).
+    Trigger(String),
 }
 
 pub enum Kill {
@@ -146,6 +152,9 @@ pub struct Handler {
     /// handled in `run()`'s select! loop since only that JS run in the
     /// currently-displayed page can actually change a widget's timer.
     duration_rx: Receiver<server::DurationRequest>,
+    /// Same reasoning as duration_rx, for Interactive Control webhook
+    /// triggers (see server.rs's TriggerRequest).
+    trigger_rx: Receiver<server::TriggerRequest>,
     /// Whether `--debug` was passed on the command line -- if so, the
     /// CMS's own `logLevel` Display Profile setting (see
     /// `PlayerSettings::log_level_filter`) is never applied, so the
@@ -263,7 +272,8 @@ impl Handler {
     pub fn new(cms: &CmsSettings, clear_cache: bool, envdir: &Path,
                no_verify: bool, allow_offline: bool, debug_override: bool,
                to_gui: Sender<ToGui>, from_gui: Receiver<FromGui>,
-               duration_rx: Receiver<server::DurationRequest>) -> Result<Self> {
+               duration_rx: Receiver<server::DurationRequest>,
+               trigger_rx: Receiver<server::TriggerRequest>) -> Result<Self> {
         let (privkey, pubkey) = load_or_create_keypair(envdir)?;
         let mut cache = Cache::new(cms, envdir.join("res"), clear_cache, no_verify)
             .context("creating cache")?;
@@ -396,7 +406,7 @@ impl Handler {
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(),
                                  shell_process: None, last_command_success: None,
-                                 duration_rx, overlay_expiry: never(),
+                                 duration_rx, trigger_rx, overlay_expiry: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
@@ -438,7 +448,7 @@ impl Handler {
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(),
                                  shell_process: None, last_command_success: None,
-                                 duration_rx, overlay_expiry: never(),
+                                 duration_rx, trigger_rx, overlay_expiry: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
@@ -777,6 +787,11 @@ impl Handler {
                 // JS in the currently-displayed page.
                 recv(self.duration_rx) -> req => if let Ok(req) = req {
                     self.to_gui.send(ToGui::ControlDuration(req)).unwrap();
+                },
+                // Same reasoning as duration_rx just above, for
+                // Interactive Control webhook triggers.
+                recv(self.trigger_rx) -> req => if let Ok(req) = req {
+                    self.to_gui.send(ToGui::Trigger(req.code)).unwrap();
                 }
             }
         }
@@ -2032,9 +2047,10 @@ mod pending_auth_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx)
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx)
             .expect("must construct successfully, not error out, while pending authorization");
         assert!(handler.pending_auth, "must be marked as pending authorization");
         assert_eq!(handler.player_settings(), PlayerSettings::default(),
@@ -2054,10 +2070,11 @@ mod pending_auth_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         // Call 1 (inside Handler::new itself).
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx)
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx)
             .expect("must construct successfully while pending");
         assert!(handler.pending_auth);
         assert_eq!(mock.call_count(), 1);
@@ -2152,10 +2169,11 @@ mod deauthorization_tests {
         let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         // Call 1 (Handler::new, "READY"): normal, authorized startup.
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert!(!handler.pending_auth);
         // Simulate "already running, showing some real content" --
         // schedule_check() only ever populates this from a real,
@@ -2242,9 +2260,10 @@ mod pending_network_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx)
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx)
             .expect("must construct successfully, not bail out, when the network/CMS \
                      is unreachable and no cache exists yet");
         assert!(handler.pending_network, "must be marked as pending network specifically");
@@ -2335,10 +2354,11 @@ mod sticky_ws_address_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         // Call 1 (inside Handler::new): gets the real address.
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         // Call 2 (collect_once): CMS now says zmq/empty -- must NOT
@@ -2363,9 +2383,10 @@ mod sticky_ws_address_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
@@ -2388,9 +2409,10 @@ mod sticky_ws_address_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "");
 
         let _ = handler.collect_once();
@@ -2412,9 +2434,10 @@ mod sticky_ws_address_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
@@ -2440,9 +2463,10 @@ mod sticky_ws_address_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:8080");
 
         let _ = handler.collect_once();
@@ -2488,10 +2512,8 @@ mod port_change_forces_cache_purge_tests {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
         std::thread::spawn(move || {
-            let mut n = 0;
-            for request in server.incoming_requests() {
+            for (n, request) in server.incoming_requests().enumerate() {
                 let idx = n.min(responses.len() - 1);
-                n += 1;
                 let (embedded_server_port, allow_wan) = responses[idx];
                 let allow_wan_int = allow_wan as u8;
                 let body = format!(
@@ -2535,9 +2557,10 @@ mod port_change_forces_cache_purge_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         assert!(!envdir.join("res").join("leftover.html").exists(),
                 "a changed embedded server port must force a full cache purge -- \
@@ -2562,9 +2585,10 @@ mod port_change_forces_cache_purge_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         assert!(envdir.join("res").join("leftover.html").exists(),
                 "an unchanged effective port must not purge the cache");
@@ -2584,9 +2608,10 @@ mod port_change_forces_cache_purge_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert_eq!(handler.settings.embedded_server_port, 9696);
 
         let err = handler.collect_once().expect_err(
@@ -2607,9 +2632,10 @@ mod port_change_forces_cache_purge_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         assert!(!handler.settings.embedded_server_allow_wan);
 
         let err = handler.collect_once().expect_err(
@@ -2628,9 +2654,10 @@ mod port_change_forces_cache_purge_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         // May still error further down (e.g. RequiredFiles against
         // this minimal mock) -- what matters is it's not RestartRequired.
@@ -2711,9 +2738,10 @@ mod send_status_update_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         // Simulate exactly what FromGui::Showing(layout) does in run()'s
         // own select! loop -- without needing to drive that full,
@@ -2743,9 +2771,10 @@ mod send_status_update_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         handler.settings.send_current_layout_as_status_update = false;
 
         handler.current_layout = 4242;
@@ -2859,9 +2888,10 @@ mod xmr_disconnected_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         // Sanity check: clear whatever xmr_retry_key ended up as from
         // construction (e.g. if the mock's bare "READY" response, with
@@ -2968,9 +2998,10 @@ mod sticky_address_applies_to_first_connection_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx).unwrap();
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         // The in-memory settings must reflect the corrected address...
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, good_address);
@@ -3250,9 +3281,10 @@ mod screenshot_requested_tests {
         let (togui_tx, togui_rx) = crossbeam_channel::bounded(10);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         let _ = count_screenshot_messages(&togui_rx);
 
         handler.settings.screen_shot_requested = true;
@@ -3479,8 +3511,9 @@ mod data_refresh_timer_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         handler.rearm_data_refresh_timer();
 
@@ -3497,8 +3530,9 @@ mod data_refresh_timer_tests {
         let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
 
         // Must not panic, and must leave the timer disarmed afterward
         // (re-confirms rearm gets called even with nothing to do).
@@ -3538,8 +3572,9 @@ mod data_refresh_timer_tests {
         let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
         // Drain whatever update_settings() sent during construction
         // (a ToGui::Settings) so it doesn't get mistaken for the
         // ReloadWidget message this test is actually checking for.

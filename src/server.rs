@@ -34,6 +34,28 @@ pub struct DurationRequest {
     pub duration: Option<i64>,
 }
 
+/// An Interactive Control webhook trigger (via a `POST /trigger?
+/// trigger=<code>` request -- see https://account.xibosignage.com/docs
+/// /developer/creating-a-player/interactive, confirmed from the CMS's
+/// own manual: "To use a Webhook a Trigger Code needs to be entered
+/// which must be present in the URL `trigger=` parameter"). Relayed to
+/// the mainloop, same reasoning as DurationRequest -- actually running
+/// the matching action means executing JS in the currently-displayed
+/// page.
+///
+/// SCOPE NOTE: the docs also mention an optional `widgetId` query
+/// parameter, for restricting a trigger to only fire while a specific
+/// source widget is playing -- not parsed here. `window.arexibo.
+/// triggers[code]` (see layout.rs's own `write_action`) only exists in
+/// the DOM of whichever page actually rendered that action in the
+/// first place, so this scoping happens "for free": a trigger code for
+/// a widget that isn't currently loaded simply doesn't exist in any
+/// page's own lookup table right now, with no separate check needed.
+#[derive(Debug, Clone)]
+pub struct TriggerRequest {
+    pub code: String,
+}
+
 /// How many distinct loopback origins (`127.0.0.1` through
 /// `127.0.0.{HTML_SHARD_COUNT}`) the embedded server is bound to (see
 /// main.rs) -- `layout.rs::write_media` picks one per `render="html"`
@@ -88,6 +110,7 @@ pub struct Server {
     dir: PathBuf,
     server: tiny_http::Server,
     duration_tx: Sender<DurationRequest>,
+    trigger_tx: Sender<TriggerRequest>,
     local_data: LocalDataStore,
 }
 
@@ -97,11 +120,12 @@ impl Server {
     /// several independent `Server` instances, all serving the exact
     /// same `dir`, to different loopback addresses.
     pub fn new(dir: PathBuf, bind_addr: &str, port: u16,
-               duration_tx: Sender<DurationRequest>, local_data: LocalDataStore) -> Result<Self> {
+               duration_tx: Sender<DurationRequest>, trigger_tx: Sender<TriggerRequest>,
+               local_data: LocalDataStore) -> Result<Self> {
         let server = tiny_http::Server::http((bind_addr, port))
             .map_err(|e| anyhow!(e))?;
         let dir = dir.canonicalize().context("getting canonical server dir name")?;
-        Ok(Self { dir, server, duration_tx, local_data })
+        Ok(Self { dir, server, duration_tx, trigger_tx, local_data })
     }
 
     pub fn port(&self) -> u16 {
@@ -114,11 +138,12 @@ impl Server {
             let server = server.clone();
             let dir = self.dir.clone();
             let duration_tx = self.duration_tx.clone();
+            let trigger_tx = self.trigger_tx.clone();
             let local_data = self.local_data.clone();
             thread::spawn(move || {
                 loop {
                     let mut req = server.recv().unwrap();
-                    match Self::serve(&dir, &mut req, &duration_tx, &local_data) {
+                    match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &local_data) {
                         Ok(resp) => {  let _ = req.respond(resp); }
                         Err(e) => {
                             log::warn!("processing HTTP req {}: {:#}", req.url(), e);
@@ -157,6 +182,24 @@ impl Server {
             .boxed())
     }
 
+    /// Handle an Interactive Control webhook trigger (`POST /trigger?
+    /// trigger=<code>` -- a URL query parameter, unlike
+    /// handle_duration's own JSON body, confirmed from the CMS's own
+    /// manual wording quoted on TriggerRequest's own doc comment).
+    /// Same ACK convention as handle_duration (200 `{}`, not 204) for
+    /// the same real-compatibility reason.
+    fn handle_trigger(query: &str, trigger_tx: &Sender<TriggerRequest>) -> Result<ResponseBox> {
+        let code = query.split('&')
+            .find_map(|kv| kv.strip_prefix("trigger="))
+            .map(percent_decode)
+            .context("trigger request missing 'trigger' query parameter")?;
+        // Best-effort, same reasoning as handle_duration's own send.
+        let _ = trigger_tx.send(TriggerRequest { code });
+        Ok(Response::from_data(b"{}".as_slice())
+            .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            .boxed())
+    }
+
     /// Serve a single HTTP request. Thin wrapper around `serve_inner`
     /// (which keeps all of its existing early-return branches
     /// unchanged) purely to apply `Cache-Control: no-store` uniformly
@@ -169,13 +212,13 @@ impl Server {
     /// the same iframe src. Every response here can legitimately change
     /// over time -- no-store is the strongest, least ambiguous fix.
     fn serve(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
-             local_data: &LocalDataStore) -> Result<ResponseBox> {
-        let resp = Self::serve_inner(dir, req, duration_tx, local_data)?;
+             trigger_tx: &Sender<TriggerRequest>, local_data: &LocalDataStore) -> Result<ResponseBox> {
+        let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, local_data)?;
         Ok(resp.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()))
     }
 
     fn serve_inner(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
-                    local_data: &LocalDataStore) -> Result<ResponseBox> {
+                    trigger_tx: &Sender<TriggerRequest>, local_data: &LocalDataStore) -> Result<ResponseBox> {
         log::debug!("HTTP request: {}", req.url());
         let url = req.url();
         let (path_only, query) = url.split_once('?').unwrap_or((url, ""));
@@ -195,6 +238,14 @@ impl Server {
             "/duration/set" => return Self::handle_duration(req, DurationAction::Set, duration_tx),
             "/duration/extend" => return Self::handle_duration(req, DurationAction::Extend, duration_tx),
             "/duration/expire" => return Self::handle_duration(req, DurationAction::Expire, duration_tx),
+
+            // Interactive Control webhook trigger (see TriggerRequest's
+            // own doc comment) -- a GET-shaped query string on what the
+            // real docs describe as a POST request; matches either verb
+            // the same way every other route here does (tiny_http's own
+            // `req.url()` includes the query regardless of method, and
+            // nothing here branches on method at all).
+            "/trigger" => return Self::handle_trigger(query, trigger_tx),
 
             // Real-time DataSet data lookup -- confirmed from a real
             // `bundle.min.js` the user shared: `xiboIC.getData(dataKey,
@@ -409,8 +460,9 @@ mod realtime_tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("testfile.txt"), "static file content\n").unwrap();
         let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, local_data.clone()).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, local_data.clone()).unwrap();
         let port = server.port();
         server.start_pool();
         (port, local_data)
@@ -435,6 +487,73 @@ mod realtime_tests {
             .call().unwrap();
         let body = resp.into_body().read_to_string().unwrap();
         assert_eq!(body, "hello world");
+    }
+
+    #[test]
+    fn trigger_sends_the_code_from_the_query_string() {
+        // Confirmed format from the CMS's own manual: "To use a Webhook
+        // a Trigger Code needs to be entered which must be present in
+        // the URL `trigger=` parameter" -- a query parameter, unlike
+        // /duration/*'s own JSON body.
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_trigger_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        let (duration_tx, _duration_rx) = unbounded();
+        let (trigger_tx, trigger_rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, local_data).unwrap();
+        let port = server.port();
+        server.start_pool();
+
+        let resp = ureq::post(&format!("http://127.0.0.1:{port}/trigger?trigger=my-code"))
+            .send_empty().unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let req = trigger_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(req.code, "my-code");
+    }
+
+    #[test]
+    fn trigger_percent_decodes_the_code() {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_trigger_decode_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        let (duration_tx, _duration_rx) = unbounded();
+        let (trigger_tx, trigger_rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, local_data).unwrap();
+        let port = server.port();
+        server.start_pool();
+
+        // "my code" (with a space), percent-encoded.
+        let resp = ureq::post(&format!("http://127.0.0.1:{port}/trigger?trigger=my%20code"))
+            .send_empty().unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let req = trigger_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(req.code, "my code");
+    }
+
+    #[test]
+    fn trigger_missing_query_param_returns_500_not_a_panic() {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_trigger_missing_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        let (duration_tx, _duration_rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, local_data).unwrap();
+        let port = server.port();
+        server.start_pool();
+
+        let resp = ureq::post(&format!("http://127.0.0.1:{port}/trigger")).send_empty();
+        match resp {
+            Err(ureq::Error::StatusCode(500)) => {} // expected: handled gracefully, not a crash
+            other => panic!("expected a clean 500, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -476,8 +595,9 @@ mod stable_port_tests {
             .join(format!("arexibo_stable_port_test_{}_{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, local_data).unwrap();
         assert_eq!(server.port(), EMBEDDED_SERVER_PORT,
                    "the embedded server must use the fixed, stable port constant, \
                     not a randomly OS-assigned one -- otherwise cached widget iframe \
@@ -499,8 +619,9 @@ mod no_cache_header_tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("testfile.txt"), "hello").unwrap();
         let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, local_data).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -577,8 +698,9 @@ mod json_content_type_tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("4543.json"), r#"{"data":[]}"#).unwrap();
         let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, local_data).unwrap();
         let port = server.port();
         server.start_pool();
 

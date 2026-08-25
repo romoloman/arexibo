@@ -144,6 +144,26 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                         cpp::run_js(code.as_ptr());
                     }
                 }
+                ToGui::Trigger(trigger_code) => {
+                    // Matches layout.rs's own `write_action` -- a
+                    // triggerType="webhook" action registers itself as
+                    // `window.arexibo.triggers[code]`, only in the DOM
+                    // of whichever page actually has that action (see
+                    // TriggerRequest's own doc comment for why this
+                    // means widget-scoping doesn't need a separate
+                    // check here). A non-matching or not-currently-
+                    // loaded code simply does nothing -- not an error,
+                    // an external system firing a trigger nobody's
+                    // listening for right now is a normal occurrence,
+                    // not a bug.
+                    let escaped = serde_json::to_string(&trigger_code).unwrap();
+                    let code = CString::new(format!(
+                        "if (window.arexibo.triggers[{escaped}]) window.arexibo.triggers[{escaped}]();"
+                    )).unwrap();
+                    unsafe {
+                        cpp::run_js(code.as_ptr());
+                    }
+                }
             }
         }
     });
