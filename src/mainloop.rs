@@ -35,6 +35,29 @@ impl fmt::Display for NotAuthorized {
 
 impl std::error::Error for NotAuthorized {}
 
+/// Error indicating embedded_server_port or embedded_server_allow_wan
+/// changed mid-session (detected in collect_once, not just at initial
+/// startup in Handler::new) -- the running webserver's own TCP
+/// listener can't be rebound to a different port/address without
+/// recreating it, so the only reliable fix is a full process exit,
+/// relying on the external supervisor (systemd Restart=always, or an
+/// equivalent restart loop) to start fresh -- which will then bind
+/// correctly and also naturally trigger Handler::new's own
+/// port-change-forces-cache-purge check if the port specifically
+/// changed. Uses a distinct exit code (3) so this shows up in logs as
+/// an intentional restart, not a crash.
+#[derive(Debug)]
+pub struct RestartRequired;
+
+impl fmt::Display for RestartRequired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "embedded server port or WAN-access setting changed -- restarting \
+                    to apply it")
+    }
+}
+
+impl std::error::Error for RestartRequired {}
+
 /// Messages sent to the GUI thread
 pub enum ToGui {
     // Boxed per clippy's own large_enum_variant lint: PlayerSettings is
@@ -242,7 +265,7 @@ impl Handler {
                to_gui: Sender<ToGui>, from_gui: Receiver<FromGui>,
                duration_rx: Receiver<server::DurationRequest>) -> Result<Self> {
         let (privkey, pubkey) = load_or_create_keypair(envdir)?;
-        let cache = Cache::new(cms, envdir.join("res"), clear_cache, no_verify)
+        let mut cache = Cache::new(cms, envdir.join("res"), clear_cache, no_verify)
             .context("creating cache")?;
         let setting_file = envdir.join("settings.json");
         let sched_file = envdir.join("sched.json");
@@ -326,6 +349,29 @@ impl Handler {
                                 (e.g. --clear, or edit settings.json).",
                                 settings.xmr_web_socket_address_in_use, prev.xmr_web_socket_address_in_use);
                     settings.xmr_web_socket_address_in_use = prev.xmr_web_socket_address_in_use;
+                }
+
+                // The embedded webserver's own port changed since the
+                // last run (e.g. the CMS's own embeddedServerPort
+                // setting was just changed, or upgraded firmware now
+                // respects it for the first time where it didn't
+                // before -- see server::effective_port's own doc
+                // comment) -- cached layout HTML bakes in an absolute
+                // http://127.0.0.x:<old port>/... iframe src (see
+                // layout.rs's own write_action/write_media), which
+                // would silently point nowhere once the server starts
+                // listening on the new port instead. Force the same
+                // full cache purge --clear would, rather than leaving
+                // every widget broken until someone notices and clears
+                // it manually.
+                let prev_port = server::effective_port(prev.embedded_server_port);
+                let new_port = server::effective_port(settings.embedded_server_port);
+                if prev_port != new_port {
+                    log::warn!("embedded webserver port changed from {prev_port} to \
+                                {new_port} since last run -- purging the cache, since \
+                                cached layout HTML has the old port baked into its own \
+                                widget iframe URLs");
+                    cache.purge().context("purging cache after a port change")?;
                 }
             }
 
@@ -845,6 +891,22 @@ impl Handler {
                             (e.g. --clear, or edit settings.json).",
                             settings.xmr_web_socket_address_in_use, self.settings.xmr_web_socket_address_in_use);
                 settings.xmr_web_socket_address_in_use = self.settings.xmr_web_socket_address_in_use.clone();
+            }
+            // The webserver's own TCP listener is already bound and
+            // running -- it can't be rebound to a different port or
+            // address without recreating it, so a mid-session change
+            // to either of these needs a full process restart (see
+            // RestartRequired's own doc comment), unlike every other
+            // setting here, which collect_once can just apply directly
+            // in place.
+            if settings.embedded_server_port != self.settings.embedded_server_port
+                || settings.embedded_server_allow_wan != self.settings.embedded_server_allow_wan {
+                log::warn!("embedded server port ({} -> {}) or WAN-access setting ({} -> {}) \
+                            changed mid-session -- exiting so the supervisor restarts us \
+                            fresh and picks it up",
+                            self.settings.embedded_server_port, settings.embedded_server_port,
+                            self.settings.embedded_server_allow_wan, settings.embedded_server_allow_wan);
+                return Err(RestartRequired.into());
             }
             if settings != self.settings {
                 self.settings = settings;
@@ -1903,11 +1965,20 @@ mod pending_auth_tests {
                     let activation = if n < not_ready_count {
                         r#"<ActivationMessage code="WAITING"/>"#.to_string()
                     } else {
-                        // Deliberately minimal -- every field beyond
-                        // `code="READY"` has a graceful fallback default
-                        // (see section 59's own fixes), so this alone
-                        // must be enough to parse successfully.
-                        r#"<ActivationMessage code="READY"/>"#.to_string()
+                        // Deliberately minimal beyond embeddedServerPort
+                        // -- every other field has a graceful fallback
+                        // default (see section 59's own fixes), so this
+                        // alone must be enough to parse successfully.
+                        // embeddedServerPort is set explicitly, matching
+                        // PlayerSettings::default()'s own placeholder
+                        // value used while pending -- without this, the
+                        // transition out of pending would also (quite
+                        // correctly, but not what this test is about)
+                        // trip the port-change-forces-restart check,
+                        // since a real server is already bound to that
+                        // placeholder port the moment main.rs creates it,
+                        // regardless of pending_auth/pending_network.
+                        r#"<ActivationMessage code="READY"><embeddedServerPort>9696</embeddedServerPort></ActivationMessage>"#.to_string()
                     };
                     // The outer envelope's ActivationMessage element
                     // carries the inner XML as escaped *text* (matching
@@ -2379,6 +2450,194 @@ mod sticky_ws_address_tests {
                    "our own derived /xmr default must win, even though it's port-shaped \
                     differently than the previously-cached address -- it's our own \
                     intentional fallback, not a suspicious CMS inconsistency");
+    }
+}
+
+#[cfg(test)]
+mod port_change_forces_cache_purge_tests {
+    use super::*;
+
+    // Found from a real report: switching the embedded webserver from
+    // the fixed EMBEDDED_SERVER_PORT to whatever the CMS's own
+    // embeddedServerPort setting says broke every widget on an
+    // existing installation, because cached layout HTML has the *old*
+    // port baked into its own absolute iframe src URLs (see
+    // layout.rs's own write_action/write_media) -- fixed with a
+    // --clear, but that shouldn't have to be done manually fleet-wide.
+
+    fn start_mock_with_port(embedded_server_port: u16) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"&gt;&lt;embeddedServerPort&gt;{embedded_server_port}&lt;/embeddedServerPort&gt;&lt;/ActivationMessage&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    /// Returns `responses[N]` for the Nth call (0-indexed), clamped to
+    /// the last entry once past the end -- for simulating a setting
+    /// that changes *mid-session*, not just at the very first
+    /// registration inside Handler::new.
+    fn start_mock_with_port_sequence(responses: Vec<(u16, bool)>) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            let mut n = 0;
+            for request in server.incoming_requests() {
+                let idx = n.min(responses.len() - 1);
+                n += 1;
+                let (embedded_server_port, allow_wan) = responses[idx];
+                let allow_wan_int = allow_wan as u8;
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"&gt;&lt;embeddedServerPort&gt;{embedded_server_port}&lt;/embeddedServerPort&gt;&lt;embeddedServerAllowWan type="checkbox"&gt;{allow_wan_int}&lt;/embeddedServerAllowWan&gt;&lt;/ActivationMessage&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "testkey".into(),
+                      display_id: "test-display".into(), display_name: None, proxy: None }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_port_change_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_changed_port_purges_the_cache() {
+        let envdir = test_envdir();
+
+        // Simulate a previous run that used port 9696.
+        PlayerSettings { embedded_server_port: 9696, ..Default::default() }
+            .to_file(envdir.join("settings.json")).unwrap();
+        // A file that a previous run's own cache would have -- must be
+        // gone afterward, proving purge() actually ran.
+        std::fs::create_dir_all(envdir.join("res")).unwrap();
+        std::fs::write(envdir.join("res").join("leftover.html"), b"stale").unwrap();
+
+        // This registration reports a *different* port.
+        let port = start_mock_with_port(34519);
+        let cms = test_cms_settings(port);
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let _handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                     togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        assert!(!envdir.join("res").join("leftover.html").exists(),
+                "a changed embedded server port must force a full cache purge -- \
+                 cached layout HTML has the old port baked into its own iframe URLs");
+    }
+
+    #[test]
+    fn an_unchanged_port_does_not_purge_the_cache() {
+        let envdir = test_envdir();
+
+        PlayerSettings { embedded_server_port: 34519, ..Default::default() }
+            .to_file(envdir.join("settings.json")).unwrap();
+        std::fs::create_dir_all(envdir.join("res")).unwrap();
+        std::fs::write(envdir.join("res").join("leftover.html"), b"stale").unwrap();
+
+        // Same effective port as before (0 from the CMS falls back to
+        // EMBEDDED_SERVER_PORT, matching the previously-recorded
+        // 34519) -- exercises the "both fall back to the same
+        // default" case too, not just an explicit numeric match.
+        let port = start_mock_with_port(0);
+        let cms = test_cms_settings(port);
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let _handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                     togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        assert!(envdir.join("res").join("leftover.html").exists(),
+                "an unchanged effective port must not purge the cache");
+    }
+
+    #[test]
+    fn a_port_change_mid_session_forces_a_restart() {
+        // Distinct from a_changed_port_purges_the_cache above: this
+        // covers the port changing *after* Handler::new (a later
+        // collect_once cycle), where a cache purge alone isn't enough
+        // -- the webserver's own TCP listener is already bound and
+        // running, so only a full process restart can actually rebind
+        // it to the new port.
+        let port = start_mock_with_port_sequence(vec![(9696, false), (34519, false)]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert_eq!(handler.settings.embedded_server_port, 9696);
+
+        let err = handler.collect_once().expect_err(
+            "a mid-session port change must return an error, not silently apply it");
+        assert!(err.root_cause().downcast_ref::<RestartRequired>().is_some(),
+                "must be specifically a RestartRequired, so main.rs can use its own \
+                 distinct exit code (3) instead of a generic error exit (1)");
+    }
+
+    #[test]
+    fn an_allow_wan_change_mid_session_forces_a_restart() {
+        // Same reasoning as the port case, for embedded_server_allow_wan
+        // -- the running webserver is already bound to either
+        // 127.0.0.1 or 0.0.0.0, and can't be rebound without a restart.
+        let port = start_mock_with_port_sequence(vec![(9696, false), (9696, true)]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+        assert!(!handler.settings.embedded_server_allow_wan);
+
+        let err = handler.collect_once().expect_err(
+            "a mid-session WAN-access change must return an error, not silently apply it");
+        assert!(err.root_cause().downcast_ref::<RestartRequired>().is_some());
+    }
+
+    #[test]
+    fn no_port_or_wan_change_does_not_force_a_restart() {
+        // Confirms the check above is specific to these two fields --
+        // an unrelated settings change (or none at all) must not
+        // trigger a restart.
+        let port = start_mock_with_port_sequence(vec![(9696, false), (9696, false)]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx).unwrap();
+
+        // May still error further down (e.g. RequiredFiles against
+        // this minimal mock) -- what matters is it's not RestartRequired.
+        if let Err(e) = handler.collect_once() {
+            assert!(e.root_cause().downcast_ref::<RestartRequired>().is_none(),
+                    "an unchanged port/WAN setting must not be reported as RestartRequired");
+        }
     }
 }
 

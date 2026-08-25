@@ -62,6 +62,17 @@ pub const HTML_SHARD_COUNT: u32 = 4;
 /// error propagation.
 pub const EMBEDDED_SERVER_PORT: u16 = 34519;
 
+/// The port to actually use given the CMS's own reported value (0
+/// meaning "the CMS didn't specify anything") -- shared between
+/// main.rs (deciding what to bind to) and mainloop.rs (deciding
+/// whether the port changed since the last run and the cache needs
+/// clearing, since layout HTML bakes in an absolute
+/// `http://127.0.0.x:<port>/...` URL -- see layout.rs's own iframe
+/// `src` generation) so the two can't silently diverge.
+pub fn effective_port(cms_reported_port: u16) -> u16 {
+    if cms_reported_port != 0 { cms_reported_port } else { EMBEDDED_SERVER_PORT }
+}
+
 /// Shared, in-memory key-value store backing the `/realtime?dataKey=`
 /// endpoint (see `Server::serve`'s own doc comment on that route) --
 /// `Arc<Mutex<...>>` because it must be genuinely shared across *every*

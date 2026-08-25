@@ -91,6 +91,14 @@ fn main() {
         // defensive fallback (harmless if never triggered) in case
         // NotAuthorized is ever raised again for another reason.
         //
+        // Exit code 3: embedded server port or WAN-access setting
+        // changed mid-session (see RestartRequired's own doc comment)
+        // -- an intentional exit so the supervisor restarts us fresh,
+        // not a genuine error.
+        if e.root_cause().downcast_ref::<mainloop::RestartRequired>().is_some() {
+            log::warn!("{:#}", e);
+            std::process::exit(3);
+        }
         // Exit code 1: actual error (bad config, CMS unreachable, etc.)
         if e.root_cause().downcast_ref::<mainloop::NotAuthorized>().is_some() {
             log::warn!("{:#}", e);
@@ -160,8 +168,26 @@ fn main_inner() -> anyhow::Result<()> {
     // shared store, not one per shard.
     let local_data: server::LocalDataStore = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashMap::new()));
-    let webserver = server::Server::new(args.envdir.join("res"), "127.0.0.1",
-                                         server::EMBEDDED_SERVER_PORT,
+    // Only the main server's own bind address is affected by
+    // embedded_server_allow_wan (for /trigger reachability from
+    // outside the display, see Interactive Control's own webhook
+    // feature) -- the per-widget shards below stay loopback-only
+    // regardless, since they exist purely to work around Chromium's
+    // 6-connections-per-origin limit for internal widget loading, not
+    // for external reachability.
+    // Respect the CMS's own embeddedServerPort setting (an admin can
+    // configure this from the Display Profile) if it sent a real,
+    // non-zero value -- our own fixed constant is only a fallback for
+    // a CMS that doesn't specify anything. Note for whoever deploys
+    // this: this is a *behavior change* from before, when the CMS's
+    // own value was silently ignored -- an existing fleet may switch
+    // from EMBEDDED_SERVER_PORT to whatever the CMS says on next
+    // restart after upgrading, which matters if anything external
+    // (firewall rules, port forwarding, monitoring) assumed the old
+    // fixed port specifically.
+    let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
+    let port = server::effective_port(settings.embedded_server_port);
+    let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
                                          duration_tx.clone(), local_data.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();

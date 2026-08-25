@@ -107,6 +107,14 @@ pub struct PlayerSettings {
     pub force_https: bool,
     #[serde(default = "default_embedded_server_port")]
     pub embedded_server_port: u16,
+    // Whether the embedded webserver's main listener should bind to
+    // 0.0.0.0 (reachable from the LAN/WAN) instead of 127.0.0.1
+    // (loopback-only) -- controls whether an external system can hit
+    // /trigger directly. Fails closed (loopback-only) if the CMS
+    // response is somehow missing this field, same reasoning as
+    // enable_shell_commands's own doc comment.
+    #[serde(default)]
+    pub embedded_server_allow_wan: bool,
     #[serde(default)]
     pub prevent_sleep: bool,
     #[serde(default = "default_display_name")]
@@ -184,6 +192,7 @@ impl Default for PlayerSettings {
             new_cms_key: String::new(),
             force_https: false,
             embedded_server_port: default_embedded_server_port(),
+            embedded_server_allow_wan: false,
             prevent_sleep: false,
             display_name: default_display_name(),
             size_x: 0,

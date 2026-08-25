@@ -270,12 +270,14 @@ impl Cms {
                 new_cms_address: tree.def_child::<String>("newCmsAddress", String::new())?,
                 new_cms_key: tree.def_child::<String>("newCmsKey", String::new())?,
                 force_https: tree.def_child::<i32>("forceHttps", 0)? != 0,
-                // embeddedServerPort from the CMS is effectively
-                // vestigial regardless -- main.rs immediately overwrites
-                // it with whatever port we actually bound locally
-                // (`settings.embedded_server_port = webserver.port();`),
-                // so any value here (or its absence) has no real effect.
+                // Respected by main.rs as the actual bind port when
+                // non-zero (an admin can configure this from the
+                // Display Profile) -- falls back to our own fixed
+                // EMBEDDED_SERVER_PORT constant only if the CMS sends
+                // 0/nothing.
                 embedded_server_port: tree.def_child("embeddedServerPort", 0u16)?,
+                embedded_server_allow_wan:
+                    tree.def_child::<i32>("embeddedServerAllowWan", 0)? != 0,
                 // 0 already means "use the full screen" for both
                 // dimensions (see gui/view.cpp: `if (size_x == 0) size_x
                 // = screen_w;`) -- safe, already-established sentinel.
@@ -1173,6 +1175,28 @@ mod send_current_layout_as_status_update_parsing_tests {
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
         assert!(settings.send_current_layout_as_status_update);
+    }
+
+    #[test]
+    fn embedded_server_allow_wan_defaults_to_false_when_absent() {
+        // Fails closed (loopback-only) if the CMS response omits this
+        // field entirely -- confirmed with a real RegisterDisplay XML
+        // sample that this response can legitimately omit fields we
+        // don't otherwise care about, so this needs its own explicit
+        // coverage rather than assuming.
+        let port = start_mock(r#"<ActivationMessage code="READY"></ActivationMessage>"#);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert!(!settings.embedded_server_allow_wan);
+    }
+
+    #[test]
+    fn embedded_server_allow_wan_true_is_respected() {
+        let port = start_mock(
+            r#"<ActivationMessage code="READY"><embeddedServerAllowWan type="checkbox">1</embeddedServerAllowWan></ActivationMessage>"#);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert!(settings.embedded_server_allow_wan);
     }
 
     #[test]
