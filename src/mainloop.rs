@@ -114,6 +114,16 @@ pub struct Handler {
     xmr: Receiver<xmr::Message>,
     schedule: Schedule,
     layouts: Vec<i64>,
+    /// scheduleids of scheduled commands (see schedule::ScheduledCommand)
+    /// already fired this session -- in-memory only, resets on restart
+    /// (same as the reference client's own per-item HasRun flag, itself
+    /// reset whenever a fresh Schedule.xml comes in and a new
+    /// ScheduleItem gets built for the same underlying scheduled
+    /// command). Deliberately *not* keyed against `self.schedule` being
+    /// replaced wholesale on every collection cycle -- see
+    /// Schedule::commands_due's own doc comment for why the "already
+    /// run" check has to live here instead.
+    commands_run: std::collections::HashSet<i64>,
     current_layout: i64,
     /// Set by an XMR `changeLayout` action: while `Some`, completely
     /// bypasses the normal CMS-driven schedule (see `schedule_check()`)
@@ -399,7 +409,8 @@ impl Handler {
             settings.to_file(&setting_file).context("writing player settings")?;
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
-                                 layouts, envdir: envdir.into(), current_layout: 0,
+                                 layouts, commands_run: std::collections::HashSet::new(),
+                                 envdir: envdir.into(), current_layout: 0,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -441,7 +452,8 @@ impl Handler {
             }
             let mut slf = Self { to_gui, from_gui, settings: PlayerSettings::default(),
                                  cache, xmds, xmr: never(), schedule: Schedule::default(),
-                                 layouts: vec![], envdir: envdir.into(), current_layout: 0,
+                                 layouts: vec![], commands_run: std::collections::HashSet::new(),
+                                 envdir: envdir.into(), current_layout: 0,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -494,6 +506,11 @@ impl Handler {
             never()
         };
         let schedule_check = tick(Duration::from_secs(60));
+        // 5s, comfortably under commands_due's own 10s window (see its
+        // own doc comment) -- guarantees at least one check happens
+        // within any given command's own due window, never silently
+        // skipping past it between checks.
+        let command_check = tick(Duration::from_secs(5));
         loop {
             select! {
                 // timer channel that fires when collect is needed
@@ -551,6 +568,9 @@ impl Handler {
                 recv(schedule_check) -> _ => {
                     self.schedule_check();
                 },
+                recv(command_check) -> _ => {
+                    self.check_scheduled_commands();
+                },
                 // timer channel that fires when the active overlay's
                 // requested duration has elapsed
                 recv(self.overlay_expiry) -> _ => {
@@ -600,7 +620,7 @@ impl Handler {
                     }
                     Ok(xmr::Message::Purge) => {
                         if let Err(e) = self.cache.purge() {
-                            log::error!("durign cache purge: {e:#}");
+                            log::error!("during cache purge: {e:#}");
                         }
                         collect = after(Duration::from_secs(0));  // force re-download
                     }
@@ -1327,6 +1347,18 @@ impl Handler {
         // check just above.
         self.cache.prune_data_widgets_not_in(&self.layouts);
         self.recheck_schedule_overlays();
+    }
+
+    /// Fires any scheduled command (schedule::ScheduledCommand) that's
+    /// due right now -- see Schedule::commands_due's own doc comment for
+    /// the exact due-check semantics this relies on.
+    fn check_scheduled_commands(&mut self) {
+        let now = OffsetDateTime::now_local().unwrap();
+        for (scheduleid, code) in self.schedule.commands_due(now, &self.commands_run) {
+            log::info!("running scheduled command {code:?} (scheduleid {scheduleid})");
+            self.run_command(&code);
+            self.commands_run.insert(scheduleid);
+        }
     }
 
     /// Re-evaluate schedule-driven Overlay Layouts (schedule.rs's

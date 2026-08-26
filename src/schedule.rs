@@ -23,6 +23,18 @@ pub struct ScheduleCriterion {
     pub value: String,
 }
 
+/// A single `<command date="" scheduleid="" code=""/>` node -- a
+/// scheduled, time-triggered invocation of a Command (the command's own
+/// *definition*, what it actually does, comes from RegisterDisplay's own
+/// `<commands>`/PlayerSettings::commands; this only says *when* to run
+/// one). `date` is a single instant to fire at, not a fromdt/todt window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduledCommand {
+    date: OffsetDateTime,
+    scheduleid: i64,
+    code: String,
+}
+
 /// A single `<overlay file="" fromdt="" todt="" scheduleid="" priority=""
 /// duration="" isGeoAware="" geoLocation="" maxPlaysPerHour=""/>` node
 /// inside the schedule's own `<overlays>` wrapper -- a separate element
@@ -87,6 +99,8 @@ pub struct Schedule {
     schedules: Vec<ScheduleEntry>,
     #[serde(default)]
     overlays: Vec<OverlayEntry>,
+    #[serde(default)]
+    commands: Vec<ScheduledCommand>,
 }
 
 impl Schedule {
@@ -181,10 +195,39 @@ impl Schedule {
             }
         }
 
+        // Scheduled command invocations -- `<command date="" scheduleid=""
+        // code=""/>`, confirmed real from a live CMS (a "TESTTOUCH" command
+        // repeated hourly over several days). `code` matches a key in
+        // PlayerSettings::commands (the *definition* of what the command
+        // actually does, from RegisterDisplay) -- this element only says
+        // *when* to run it. `date` is a single instant, not a fromdt/todt
+        // window like layouts/overlays -- see the reference client's own
+        // `command.Date >= now && command.Date < tenSecondsTime &&
+        // !command.HasRun` (xibo-dotnetclient/Logic/ScheduleManager.cs) for
+        // the due-check semantics this is meant to support: a narrow
+        // forward-looking window, checked once, not "any time in the past
+        // we've never seen this before" (confirmed via a real historical
+        // bug, xibo/xibo#1327, fixed by exactly this kind of once-only
+        // tracking -- a command re-firing repeatedly, or firing long after
+        // its own scheduled time following an outage, is exactly the
+        // failure mode being guarded against here).
+        let mut commands = Vec::new();
+        for command in tree.find_all("command") {
+            let scheduleid = command.get_attr("scheduleid")
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
+            let code = command.get_attr("code").context("command missing code")?.to_string();
+            let date = command.get_attr("date").context("command missing date")?;
+            let date = PrimitiveDateTime::parse(date, &TIME_FMT)
+                .context("command invalid date")?
+                .assume_offset(tz_offset);
+            commands.push(ScheduledCommand { date, scheduleid, code });
+        }
+
         Ok(Self {
             default,
             schedules,
             overlays,
+            commands,
         })
     }
 
@@ -314,6 +357,29 @@ impl Schedule {
             }
         }
         0
+    }
+
+    /// Scheduled commands (see ScheduledCommand's own doc comment) due
+    /// right now -- as (scheduleid, code) pairs, in schedule order.
+    /// `already_run` is this session's own in-memory set of scheduleids
+    /// already fired (see mainloop.rs's own commands_run field) --
+    /// checked here rather than mutating any state on `self`, since
+    /// `Schedule` itself gets replaced wholesale on every collection
+    /// cycle (see mainloop.rs's own `self.schedule = ...`) and wouldn't
+    /// remember having fired something from one cycle to the next
+    /// otherwise. Same due-check semantics as the reference client's own
+    /// `command.Date >= now && command.Date < tenSecondsTime &&
+    /// !command.HasRun` (see ScheduledCommand's own doc comment for the
+    /// full reasoning) -- a narrow forward-looking window, not "any time
+    /// in the past we've never seen this before".
+    pub fn commands_due(&self, now: OffsetDateTime,
+                         already_run: &std::collections::HashSet<i64>) -> Vec<(i64, String)> {
+        const WINDOW: time::Duration = time::Duration::seconds(10);
+        self.commands.iter()
+            .filter(|c| now >= c.date && now < c.date + WINDOW
+                        && !already_run.contains(&c.scheduleid))
+            .map(|c| (c.scheduleid, c.code.clone()))
+            .collect()
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -478,7 +544,7 @@ mod tests {
 
     #[test]
     fn layout_with_no_criteria_is_always_eligible() {
-        let sched = Schedule { default: None, schedules: vec![entry(1, 0, vec![])], overlays: vec![] };
+        let sched = Schedule { default: None, schedules: vec![entry(1, 0, vec![])], overlays: vec![], commands: vec![] };
         assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![1]);
     }
 
@@ -487,7 +553,7 @@ mod tests {
         let crit = ScheduleCriterion {
             metric: "temperature".into(), condition: "gt".into(), value: "30".into(),
         };
-        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![] };
+        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![] };
         // no criteria set at all -> fails closed, falls back to default
         assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![99]);
 
@@ -501,7 +567,7 @@ mod tests {
         let crit = ScheduleCriterion {
             metric: "temperature".into(), condition: "gt".into(), value: "30".into(),
         };
-        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![] };
+        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![] };
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "35".into(), 3600);
         assert_eq!(sched.layouts_now(&cs), vec![1]);
@@ -518,7 +584,7 @@ mod tests {
         let sched = Schedule {
             default: Some(99),
             schedules: vec![entry(1, 0, vec![crit_ok, crit_fail])],
-            overlays: vec![],
+            overlays: vec![], commands: vec![],
         };
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "35".into(), 3600);
@@ -532,7 +598,7 @@ mod tests {
         let sched = Schedule {
             default: None,
             schedules: vec![entry(1, 0, vec![]), entry(2, 0, vec![])],
-            overlays: vec![],
+            overlays: vec![], commands: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         assert_eq!(result, vec![1, 2]);
@@ -548,7 +614,7 @@ mod tests {
                 entry(1, 0, vec![]),
                 interrupt_entry(2, 100, 3600),
             ],
-            overlays: vec![],
+            overlays: vec![], commands: vec![],
         };
         assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![2]);
     }
@@ -571,7 +637,7 @@ mod tests {
                 },
                 interrupt_entry(2, 10, 60),
             ],
-            overlays: vec![],
+            overlays: vec![], commands: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         // Both layouts appear, interrupt spread through rather than
@@ -601,7 +667,7 @@ mod tests {
                 interrupt_entry(2, 5, 60),  // target 180s -> 3 plays
                 interrupt_entry(3, 5, 60),  // target 180s -> 3 plays
             ],
-            overlays: vec![],
+            overlays: vec![], commands: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         assert_eq!(result.iter().filter(|&&id| id == 2).count(), 3);
@@ -613,7 +679,7 @@ mod tests {
         let sched = Schedule {
             default: Some(99),
             schedules: vec![interrupt_entry(2, 10, 60)],
-            overlays: vec![],
+            overlays: vec![], commands: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         assert!(result.contains(&99));
@@ -638,7 +704,7 @@ mod overlay_tests {
 
     #[test]
     fn no_overlays_means_empty_active_list() {
-        let sched = Schedule { default: None, schedules: vec![], overlays: vec![] };
+        let sched = Schedule { default: None, schedules: vec![], overlays: vec![], commands: vec![] };
         assert!(sched.active_overlays().is_empty());
     }
 
@@ -646,7 +712,7 @@ mod overlay_tests {
     fn single_active_overlay_is_returned_with_its_duration() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true)],
+            overlays: vec![mk_overlay(727, 91, true)], commands: vec![],
         };
         assert_eq!(sched.active_overlays(), vec![(727, 91)]);
     }
@@ -655,7 +721,7 @@ mod overlay_tests {
     fn expired_overlay_is_not_active() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, false)],
+            overlays: vec![mk_overlay(727, 91, false)], commands: vec![],
         };
         assert!(sched.active_overlays().is_empty());
     }
@@ -664,7 +730,7 @@ mod overlay_tests {
     fn multiple_simultaneously_active_overlays_all_returned() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true), mk_overlay(728, 30, true)],
+            overlays: vec![mk_overlay(727, 91, true), mk_overlay(728, 30, true)], commands: vec![],
         };
         let active = sched.active_overlays();
         assert_eq!(active.len(), 2);
@@ -676,7 +742,7 @@ mod overlay_tests {
     fn mixed_active_and_expired_only_active_returned() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true), mk_overlay(999, 30, false)],
+            overlays: vec![mk_overlay(727, 91, true), mk_overlay(999, 30, false)], commands: vec![],
         };
         assert_eq!(sched.active_overlays(), vec![(727, 91)]);
     }
@@ -699,3 +765,97 @@ mod overlay_tests {
         assert_eq!(sched.overlay_scheduleid_for(727), 211);
     }
 }
+
+#[cfg(test)]
+mod scheduled_command_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn parses_real_scheduled_commands_xml_from_user() {
+        // Exact structure from a real schedule.xml the user shared (an
+        // hourly "TESTTOUCH" command over several days) -- confirms the
+        // parser handles the real wire format correctly, including
+        // alongside <layout>/<default>/<dependants> in the same document.
+        let xml = r#"<schedule generated="2026-08-26 11:27:46" filterFrom="2026-08-26 11:00:00" filterTo="2026-08-28 11:00:00">
+  <command date="2026-08-26 11:00:00" scheduleid="234" code="TESTTOUCH"/>
+  <command date="2026-08-26 12:00:00" scheduleid="235" code="TESTTOUCH"/>
+  <layout file="964" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="227" priority="0" syncEvent="0" shareOfVoice="0" duration="30" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="146" playCount="0" maxPlaysPerHour="0"/>
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = Element::from_reader(xml.as_bytes()).unwrap();
+        let sched = Schedule::parse(&tree).unwrap();
+        assert_eq!(sched.commands.len(), 2);
+        assert_eq!(sched.commands[0].scheduleid, 234);
+        assert_eq!(sched.commands[0].code, "TESTTOUCH");
+        assert_eq!(sched.commands[1].scheduleid, 235);
+    }
+
+    fn sched_with(date: OffsetDateTime, scheduleid: i64) -> Schedule {
+        Schedule { default: None, schedules: vec![], overlays: vec![],
+                   commands: vec![ScheduledCommand { date, scheduleid, code: "TESTTOUCH".into() }] }
+    }
+
+    #[test]
+    fn a_command_right_at_its_own_due_time_is_due() {
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = sched_with(now, 1);
+        assert_eq!(sched.commands_due(now, &HashSet::new()), vec![(1, "TESTTOUCH".to_string())]);
+    }
+
+    #[test]
+    fn a_command_within_the_10s_window_is_due() {
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = sched_with(now - time::Duration::seconds(9), 1);
+        assert_eq!(sched.commands_due(now, &HashSet::new()).len(), 1);
+    }
+
+    #[test]
+    fn a_command_past_the_10s_window_is_no_longer_due() {
+        // Confirms the fix matches the reference client's own semantics
+        // (see ScheduledCommand's own doc comment) -- a command missed
+        // due to an outage/restart must NOT fire late, unlike a real
+        // historical bug this exact check is modeled to avoid
+        // (xibo/xibo#1327: commands re-firing/firing long after their
+        // own scheduled time).
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = sched_with(now - time::Duration::seconds(11), 1);
+        assert!(sched.commands_due(now, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_command_not_yet_due_is_not_due() {
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = sched_with(now + time::Duration::seconds(5), 1);
+        assert!(sched.commands_due(now, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn an_already_run_command_is_not_due_again() {
+        // Confirms the other half of the same historical bug (xibo/
+        // xibo#1327) -- a command that already fired must not fire
+        // again just because it's still within the window on a
+        // subsequent check.
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = sched_with(now, 1);
+        let mut already_run = HashSet::new();
+        already_run.insert(1);
+        assert!(sched.commands_due(now, &already_run).is_empty());
+    }
+
+    #[test]
+    fn only_the_not_yet_run_command_is_returned_among_several() {
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = Schedule {
+            default: None, schedules: vec![], overlays: vec![],
+            commands: vec![
+                ScheduledCommand { date: now, scheduleid: 1, code: "A".into() },
+                ScheduledCommand { date: now, scheduleid: 2, code: "B".into() },
+            ],
+        };
+        let mut already_run = HashSet::new();
+        already_run.insert(1);
+        assert_eq!(sched.commands_due(now, &already_run), vec![(2, "B".to_string())]);
+    }
+}
+
