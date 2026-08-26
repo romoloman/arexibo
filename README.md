@@ -7,7 +7,10 @@
 Arexibo is an unofficial alternate Digital Signage Player for [Xibo](https://xibo.org.uk),
 implemented mostly in Rust but making use of Qt GUI components, for Linux platforms.
 
-It is currently almost complete but there are still some features that may present errors or that maybe are not perfectly working
+It is currently almost complete but there are still some features that may present errors or that maybe are not perfectly working, in particular:
+VideoWall/SyncGroup and Cycle Playback (also not working properly in the windows client)
+
+All the other settings from the cms should work including allow_wan_access and embedded_server_port.
 
 
 ## Installation
@@ -104,7 +107,7 @@ WantedBy=multi-user.target
     --debug: verbose logging (SOAP calls, internal state transitions).
     --web-debug: logs every JS console message and page error from the rendered content – useful when troubleshooting a specific widget that isn’t displaying correctly.
     --allow-offline: tolerates the CMS being unreachable at startup, falling back to cached settings/content if available, instead of failing outright.
-    --clear: wipes the local file cache (downloaded media/widget pages), forcing a full re-download on next start. Does not affect cached CMS connection settings.
+    --clear: wipes the local file cache (downloaded media/widget pages), forcing a full re-download on next start. Does not affect cached CMS connection settings, it's always recommended to run --clear once after a new git pull or git clone 
     --no-verify: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
 
 ## Some useful environment variables
