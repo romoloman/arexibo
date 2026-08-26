@@ -368,6 +368,32 @@ impl PlayerSettings {
     }
 }
 
+/// Small persisted marker file (`arexibo.json`, alongside settings.json
+/// and sched.json in envdir) recording which Arexibo version last ran
+/// in this environment directory -- used by mainloop.rs's own
+/// Handler::new to detect a version change across runs (e.g. after an
+/// upgrade) and force a full cache purge, the same way a change in the
+/// embedded webserver's port already does. A dedicated file rather than
+/// a new field on PlayerSettings/CmsSettings, since it must be readable
+/// (and meaningfully absent, on a first-ever run) independent of both
+/// the CMS-provided settings and the locally-configured CMS connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArexiboMeta {
+    pub version: String,
+}
+
+impl ArexiboMeta {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        serde_json::from_reader(File::open(path.as_ref())?)
+            .context("deserializing arexibo meta")
+    }
+
+    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        serde_json::to_writer_pretty(File::create(path.as_ref())?, self)
+            .context("serializing arexibo meta")
+    }
+}
+
 fn default_collect_interval() -> u64 { 900 }
 fn default_true() -> bool { true }
 fn default_log_level() -> String { "debug".into() }

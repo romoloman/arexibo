@@ -11,7 +11,7 @@ use rand::rngs::OsRng;
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey}};
 use subprocess::Popen;
 use time::OffsetDateTime;
-use crate::config::{CmsSettings, PlayerSettings};
+use crate::config::{ArexiboMeta, CmsSettings, PlayerSettings};
 use crate::{logger, server, util, xmds, xmr};
 use crate::resource::{Cache, ReqFile};
 use crate::faults;
@@ -287,6 +287,34 @@ impl Handler {
         let (privkey, pubkey) = load_or_create_keypair(envdir)?;
         let mut cache = Cache::new(cms, envdir.join("res"), clear_cache, no_verify)
             .context("creating cache")?;
+
+        // Detect an Arexibo version change since the last run and force a
+        // full cache purge -- same reasoning as the embedded-webserver
+        // port-change check further down: a newer build may generate
+        // slightly different layout HTML/bundled assets (e.g. pdf.js),
+        // and stale cached files could still reflect the old version's
+        // output. Tracked via ArexiboMeta (arexibo.json, alongside
+        // settings.json/sched.json) rather than a field on
+        // PlayerSettings, since this must run even before/without ever
+        // talking to the CMS (e.g. --allow-offline). Doesn't fire on a
+        // first-ever run (no arexibo.json yet) -- the cache is already
+        // empty in that case, so there's nothing to gain from purging
+        // it. Any version difference triggers the purge, including a
+        // patch-level bump -- deliberately not limited to major/minor,
+        // since even a small change in generated HTML/assets can leave
+        // stale cached files behind.
+        let meta_file = envdir.join("arexibo.json");
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        if let Ok(prev_meta) = ArexiboMeta::from_file(&meta_file) {
+            if prev_meta.version != current_version {
+                log::warn!("Arexibo version changed from {} to {current_version} since \
+                            last run -- purging the cache", prev_meta.version);
+                cache.purge().context("purging cache after a version change")?;
+            }
+        }
+        ArexiboMeta { version: current_version }.to_file(&meta_file)
+            .context("writing arexibo meta file")?;
+
         let setting_file = envdir.join("settings.json");
         let sched_file = envdir.join("sched.json");
         let mut schedule = Schedule::default();
