@@ -22,20 +22,19 @@ use crate::logger::LogEntry;
 
 /// XMDS endpoint version -- each version is a separate server-side
 /// handler (Soap5.php, Soap6.php...), so v6/v7-only methods
-/// (GetWeather/GetDependency/GetData) always fail against v5.
+/// (GetWeather/GetDependency/GetData) always fail against an older
+/// one.
 ///
 /// CMS v4+'s Data Widget JSON/HTML splitting is also gated by this
-/// version, not by clientType/clientCode -- v5 just doesn't generate
-/// those entries, which is why Data Widgets currently work via the
-/// embedded-HTML path. The player-side GetData integration this would
-/// require (discovery, independent polling, atomic writes, GUI
+/// version, not by clientType/clientCode. Player-side GetData
+/// integration (discovery, independent polling, atomic writes, GUI
 /// reload notification, downloading files[] entries, retry backoff,
 /// pruning against the active schedule, coordination with the
 /// XMR-pushed dataUpdate path) is done and verified against a real
-/// CMS -- staying on v5 here is a deliberate choice, not a missing
-/// prerequisite. See the project's own status document for the
-/// current reasoning on when to actually bump this.
-const XMDS_ENDPOINT_VERSION: u32 = 5;
+/// CMS -- staying on v5 was a deliberate choice while that work was
+/// completed, not a missing prerequisite. Bumped to v7 once that work
+/// was confirmed solid, per the user's own explicit request.
+const XMDS_ENDPOINT_VERSION: u32 = 7;
 
 /// Whether the endpoint has GetWeather/GetDependency/GetData -- lets
 /// callers skip a call known to always fail.
@@ -1097,9 +1096,9 @@ mod xmds_supports_v6_v7_methods_tests {
 
     #[test]
     fn correctly_reflects_the_current_hardcoded_endpoint_version() {
-        // Trip-wire: if XMDS_ENDPOINT_VERSION is bumped, re-read its
-        // doc comment before updating this expected value.
-        assert!(!xmds_supports_v6_v7_methods());
+        // Trip-wire: if XMDS_ENDPOINT_VERSION is bumped/lowered again,
+        // re-read its doc comment before updating this expected value.
+        assert!(xmds_supports_v6_v7_methods());
     }
 }
 
