@@ -1447,8 +1447,27 @@ impl Handler {
 
     /// Flush any accumulated player fault reports to the CMS. Same
     /// batching/requeue-on-failure approach as `flush_stats` above.
+    /// Skipped entirely if the endpoint version doesn't support it --
+    /// ReportFaults is v6/v7-only (see faults.rs's own doc comment),
+    /// and this call used to run completely unguarded: every attempt
+    /// against a v5 endpoint (arexibo's own default for a long time)
+    /// would fail with a "not present" SOAP fault every single cycle,
+    /// forever, without ever successfully reporting anything -- a
+    /// wasted network round-trip each cycle, and faults requeued
+    /// indefinitely until FaultCollector's own MAX_PENDING cap started
+    /// silently dropping the oldest ones.
+    ///
+    /// Unlike GetWeather (which also gates on this same version check,
+    /// but *additionally* learns "unsupported" at runtime, since a
+    /// v6/v7-capable endpoint can still fail for an entirely separate,
+    /// only-discoverable-by-trying reason: no weather provider
+    /// configured on the CMS side), there's no second, independent
+    /// failure mode here to learn about -- ReportFaults's own
+    /// availability is fully determined by the endpoint version alone,
+    /// which we already know statically. A runtime-learned flag would
+    /// add complexity without covering any real scenario.
     fn flush_faults(&mut self) {
-        if self.faults.is_empty() {
+        if self.faults.is_empty() || !xmds::xmds_supports_v6_v7_methods() {
             return;
         }
         let (json, recs) = self.faults.build_and_clear();
@@ -4541,5 +4560,112 @@ mod data_refresh_timer_tests {
         let msg = togui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(msg, ToGui::ReloadWidget(1)),
                 "expected ToGui::ReloadWidget(1) (the resource id)");
+    }
+}
+
+#[cfg(test)]
+mod flush_faults_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // Tracks ReportFaults calls specifically (not just any SOAP call --
+    // RegisterDisplay also happens during Handler::new, and must not be
+    // miscounted as a fault report).
+    struct FaultMock {
+        port: u16,
+        report_calls: std::sync::Arc<AtomicU32>,
+    }
+
+    impl FaultMock {
+        fn start() -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            let report_calls = std::sync::Arc::new(AtomicU32::new(0));
+            let calls = report_calls.clone();
+            std::thread::spawn(move || {
+                for mut request in server.incoming_requests() {
+                    let mut body = String::new();
+                    let _ = request.as_reader().read_to_string(&mut body);
+                    let response = if body.contains("ReportFaults") {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><ReportFaultsResponse><success>1</success></ReportFaultsResponse></soap:Body>
+</soap:Envelope>"#.to_string()
+                    } else {
+                        r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#.to_string()
+                    };
+                    let _ = request.respond(tiny_http::Response::from_string(response));
+                }
+            });
+            Self { port, report_calls }
+        }
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(), display_id: "test-display".into(),
+            display_name: None, proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_flush_faults_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Sanity check for the *current*, real configuration
+    // (XMDS_ENDPOINT_VERSION == 7, gate open): confirms the fix that
+    // added the version gate to flush_faults doesn't overcorrect into
+    // never sending faults at all. This can't, on its own, prove the
+    // gate itself works when *closed* -- XMDS_ENDPOINT_VERSION is a
+    // compile-time constant, not something a test can independently
+    // fake per-run. That side was instead verified manually: with the
+    // constant temporarily set back to 5, this same test (and the real
+    // bug's own reproduction) confirmed zero ReportFaults calls happen
+    // -- not something that can be encoded as a permanent, automated
+    // regression test given the constant's own nature, unlike every
+    // other "prove the fix" verification elsewhere in this file.
+    #[test]
+    fn flushes_pending_faults_now_that_the_version_gate_is_open() {
+        let mock = FaultMock::start();
+        let cms = test_cms_settings(mock.port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        handler.faults.record(faults::Fault::new(9001, "test fault"));
+        handler.flush_faults();
+
+        assert_eq!(mock.report_calls.load(Ordering::SeqCst), 1,
+                    "flush_faults must actually call ReportFaults when there are \
+                     pending faults and the endpoint version supports it");
+    }
+
+    #[test]
+    fn does_nothing_when_no_faults_are_pending() {
+        let mock = FaultMock::start();
+        let cms = test_cms_settings(mock.port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        handler.flush_faults();
+
+        assert_eq!(mock.report_calls.load(Ordering::SeqCst), 0,
+                    "flush_faults must not call ReportFaults at all when nothing is pending");
     }
 }
