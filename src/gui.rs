@@ -80,8 +80,21 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                     }
                 }
                 ToGui::WebHook(code) => {
+                    // Matches layout.rs's own `write_action` -- a
+                    // triggerType="webhook" action registers itself as
+                    // window.arexibo.triggers[code] (a lookup table,
+                    // not a single callable function) -- same call
+                    // shape as ToGui::Trigger just below (the /trigger
+                    // HTTP path), which already gets this right. Found
+                    // from a real report: this XMR-pushed path called
+                    // a nonexistent window.arexibo.trigger(code)
+                    // (singular, no such function ever defined) --
+                    // silently doing nothing, no error reported for a
+                    // failed run_js call.
+                    let escaped = serde_json::to_string(&code).unwrap();
                     let code = CString::new(format!(
-                        "window.arexibo.trigger(\"{code}\");")).unwrap();
+                        "if (window.arexibo.triggers[{escaped}]) window.arexibo.triggers[{escaped}]();"
+                    )).unwrap();
                     unsafe {
                         cpp::run_js(code.as_ptr());
                     }
@@ -203,6 +216,13 @@ extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _
             }
         }
         cpp::CB_LAYOUT_NEXT => {
+            // The currently-shown layout just completed one natural
+            // cycle of its own regions/widgets -- independent of
+            // whatever happens next below (advancing within a local
+            // rotation, or marking done). See FromGui::LayoutCompleted's
+            // own doc comment (handle_trigger_code's own duration==0
+            // revert case).
+            let _ = cb_data.sender.send(FromGui::LayoutCompleted);
             let mut schedule = cb_data.schedule.lock();
             if let Some(id) = schedule.next() {
                 log::info!("showing next layout: {id}");

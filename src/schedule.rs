@@ -23,6 +23,46 @@ pub struct ScheduleCriterion {
     pub value: String,
 }
 
+/// A single `<action>` node inside `<actions>` -- confirmed real from a
+/// live CMS: `<action fromdt="" todt="" scheduleid="" priority="" duration=""
+/// isGeoAware="" geoLocation="" triggerCode="" actionType="" layoutCode=""
+/// commandCode=""/>`. Distinct from both ScheduledCommand (time-triggered,
+/// no incoming code needed) and a widget-embedded `<action
+/// triggerType="webhook">` (only reachable while its own layout/widget is
+/// already on screen) -- this is the CMS's own official manual concept:
+/// "Scheduled Actions listen for a Trigger Code coming in on a webhook to
+/// Navigate to a Layout or to run a Command" -- reachable regardless of
+/// what's currently showing, confirmed to match a real user-reported
+/// symptom (a trigger doing nothing because the *current* layout had no
+/// matching widget-embedded action at all).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ActionTarget {
+    /// `actionType="navLayout"` -- `layoutCode` resolved via the same
+    /// code_map already used for a widget-embedded action's own
+    /// layoutCode-based navigation (see resource.rs's own
+    /// resolve_layout_code).
+    Layout(String),
+    /// `actionType="command"` -- `commandCode` matches a key in
+    /// PlayerSettings::commands, same as ScheduledCommand's own `code`.
+    Command(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ScheduledAction {
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    scheduleid: i64,
+    /// Seconds. 0 means "no fixed duration" -- confirmed real semantics,
+    /// user-specified: >0 reverts to the normal schedule after this many
+    /// seconds; 0 instead waits for the shown layout's own natural
+    /// completion (its own region/widget cycle finishing once) before
+    /// reverting -- see mainloop.rs's own handle_trigger_code and
+    /// FromGui::LayoutCompleted.
+    duration: i64,
+    trigger_code: String,
+    target: ActionTarget,
+}
+
 /// A single `<command date="" scheduleid="" code=""/>` node -- a
 /// scheduled, time-triggered invocation of a Command (the command's own
 /// *definition*, what it actually does, comes from RegisterDisplay's own
@@ -101,6 +141,8 @@ pub struct Schedule {
     overlays: Vec<OverlayEntry>,
     #[serde(default)]
     commands: Vec<ScheduledCommand>,
+    #[serde(default)]
+    actions: Vec<ScheduledAction>,
 }
 
 impl Schedule {
@@ -223,11 +265,52 @@ impl Schedule {
             commands.push(ScheduledCommand { date, scheduleid, code });
         }
 
+        // Scheduled Actions -- `<actions><action .../></actions>`,
+        // confirmed real from a live CMS (a "navLayout" action, trigger
+        // code "apri_home", targeting a layout by its own layoutCode).
+        // See ScheduledAction's own doc comment for the full reasoning.
+        let mut actions = Vec::new();
+        if let Some(actions_el) = tree.find("actions") {
+            for action in actions_el.find_all("action") {
+                let scheduleid = action.get_attr("scheduleid")
+                    .and_then(|s| s.parse().ok()).unwrap_or(0);
+                let duration = action.get_attr("duration")
+                    .and_then(|s| s.parse().ok()).unwrap_or(0);
+                let trigger_code = action.get_attr("triggerCode")
+                    .context("action missing triggerCode")?.to_string();
+                let action_type = action.get_attr("actionType")
+                    .context("action missing actionType")?;
+                let target = match action_type {
+                    "navLayout" => ActionTarget::Layout(
+                        action.get_attr("layoutCode")
+                            .context("navLayout action missing layoutCode")?.to_string()),
+                    "command" => ActionTarget::Command(
+                        action.get_attr("commandCode")
+                            .context("command action missing commandCode")?.to_string()),
+                    other => {
+                        // Forward-compatible: skip an actionType we don't
+                        // recognize rather than failing the whole
+                        // schedule parse over it.
+                        log::warn!("skipping scheduled action with unknown actionType {other:?}");
+                        continue;
+                    }
+                };
+                let from = action.get_attr("fromdt").context("action missing fromdt")?;
+                let from = PrimitiveDateTime::parse(from, &TIME_FMT)
+                    .context("action invalid fromdt")?.assume_offset(tz_offset);
+                let to = action.get_attr("todt").context("action missing todt")?;
+                let to = PrimitiveDateTime::parse(to, &TIME_FMT)
+                    .context("action invalid todt")?.assume_offset(tz_offset);
+                actions.push(ScheduledAction { from, to, scheduleid, duration, trigger_code, target });
+            }
+        }
+
         Ok(Self {
             default,
             schedules,
             overlays,
             commands,
+            actions,
         })
     }
 
@@ -380,6 +463,20 @@ impl Schedule {
                         && !already_run.contains(&c.scheduleid))
             .map(|c| (c.scheduleid, c.code.clone()))
             .collect()
+    }
+
+    /// The Scheduled Action (see ScheduledAction's own doc comment)
+    /// matching `code`, if any is currently valid (`from <= now <= to`).
+    /// Returns (duration, target) -- see mainloop.rs's own
+    /// handle_trigger_code for how these get used. If more than one
+    /// currently-valid action shares the same trigger code (not expected
+    /// in practice, but not something the CMS itself seems to prevent),
+    /// the first match wins -- no documented tie-breaking rule to follow
+    /// here.
+    pub fn action_for_trigger(&self, code: &str, now: OffsetDateTime) -> Option<(i64, &ActionTarget)> {
+        self.actions.iter()
+            .find(|a| a.trigger_code == code && a.from <= now && now <= a.to)
+            .map(|a| (a.duration, &a.target))
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -544,7 +641,7 @@ mod tests {
 
     #[test]
     fn layout_with_no_criteria_is_always_eligible() {
-        let sched = Schedule { default: None, schedules: vec![entry(1, 0, vec![])], overlays: vec![], commands: vec![] };
+        let sched = Schedule { default: None, schedules: vec![entry(1, 0, vec![])], overlays: vec![], commands: vec![], actions: vec![] };
         assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![1]);
     }
 
@@ -553,7 +650,7 @@ mod tests {
         let crit = ScheduleCriterion {
             metric: "temperature".into(), condition: "gt".into(), value: "30".into(),
         };
-        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![] };
+        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![] };
         // no criteria set at all -> fails closed, falls back to default
         assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![99]);
 
@@ -567,7 +664,7 @@ mod tests {
         let crit = ScheduleCriterion {
             metric: "temperature".into(), condition: "gt".into(), value: "30".into(),
         };
-        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![] };
+        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![] };
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "35".into(), 3600);
         assert_eq!(sched.layouts_now(&cs), vec![1]);
@@ -584,7 +681,7 @@ mod tests {
         let sched = Schedule {
             default: Some(99),
             schedules: vec![entry(1, 0, vec![crit_ok, crit_fail])],
-            overlays: vec![], commands: vec![],
+            overlays: vec![], commands: vec![], actions: vec![],
         };
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "35".into(), 3600);
@@ -598,7 +695,7 @@ mod tests {
         let sched = Schedule {
             default: None,
             schedules: vec![entry(1, 0, vec![]), entry(2, 0, vec![])],
-            overlays: vec![], commands: vec![],
+            overlays: vec![], commands: vec![], actions: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         assert_eq!(result, vec![1, 2]);
@@ -614,7 +711,7 @@ mod tests {
                 entry(1, 0, vec![]),
                 interrupt_entry(2, 100, 3600),
             ],
-            overlays: vec![], commands: vec![],
+            overlays: vec![], commands: vec![], actions: vec![],
         };
         assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![2]);
     }
@@ -637,7 +734,7 @@ mod tests {
                 },
                 interrupt_entry(2, 10, 60),
             ],
-            overlays: vec![], commands: vec![],
+            overlays: vec![], commands: vec![], actions: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         // Both layouts appear, interrupt spread through rather than
@@ -667,7 +764,7 @@ mod tests {
                 interrupt_entry(2, 5, 60),  // target 180s -> 3 plays
                 interrupt_entry(3, 5, 60),  // target 180s -> 3 plays
             ],
-            overlays: vec![], commands: vec![],
+            overlays: vec![], commands: vec![], actions: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         assert_eq!(result.iter().filter(|&&id| id == 2).count(), 3);
@@ -679,7 +776,7 @@ mod tests {
         let sched = Schedule {
             default: Some(99),
             schedules: vec![interrupt_entry(2, 10, 60)],
-            overlays: vec![], commands: vec![],
+            overlays: vec![], commands: vec![], actions: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default());
         assert!(result.contains(&99));
@@ -704,7 +801,7 @@ mod overlay_tests {
 
     #[test]
     fn no_overlays_means_empty_active_list() {
-        let sched = Schedule { default: None, schedules: vec![], overlays: vec![], commands: vec![] };
+        let sched = Schedule { default: None, schedules: vec![], overlays: vec![], commands: vec![], actions: vec![] };
         assert!(sched.active_overlays().is_empty());
     }
 
@@ -712,7 +809,7 @@ mod overlay_tests {
     fn single_active_overlay_is_returned_with_its_duration() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true)], commands: vec![],
+            overlays: vec![mk_overlay(727, 91, true)], commands: vec![], actions: vec![],
         };
         assert_eq!(sched.active_overlays(), vec![(727, 91)]);
     }
@@ -721,7 +818,7 @@ mod overlay_tests {
     fn expired_overlay_is_not_active() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, false)], commands: vec![],
+            overlays: vec![mk_overlay(727, 91, false)], commands: vec![], actions: vec![],
         };
         assert!(sched.active_overlays().is_empty());
     }
@@ -730,7 +827,7 @@ mod overlay_tests {
     fn multiple_simultaneously_active_overlays_all_returned() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true), mk_overlay(728, 30, true)], commands: vec![],
+            overlays: vec![mk_overlay(727, 91, true), mk_overlay(728, 30, true)], commands: vec![], actions: vec![],
         };
         let active = sched.active_overlays();
         assert_eq!(active.len(), 2);
@@ -742,7 +839,7 @@ mod overlay_tests {
     fn mixed_active_and_expired_only_active_returned() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true), mk_overlay(999, 30, false)], commands: vec![],
+            overlays: vec![mk_overlay(727, 91, true), mk_overlay(999, 30, false)], commands: vec![], actions: vec![],
         };
         assert_eq!(sched.active_overlays(), vec![(727, 91)]);
     }
@@ -793,7 +890,7 @@ mod scheduled_command_tests {
 
     fn sched_with(date: OffsetDateTime, scheduleid: i64) -> Schedule {
         Schedule { default: None, schedules: vec![], overlays: vec![],
-                   commands: vec![ScheduledCommand { date, scheduleid, code: "TESTTOUCH".into() }] }
+                   commands: vec![ScheduledCommand { date, scheduleid, code: "TESTTOUCH".into() }], actions: vec![] }
     }
 
     #[test]
@@ -852,10 +949,102 @@ mod scheduled_command_tests {
                 ScheduledCommand { date: now, scheduleid: 1, code: "A".into() },
                 ScheduledCommand { date: now, scheduleid: 2, code: "B".into() },
             ],
+            actions: vec![],
         };
         let mut already_run = HashSet::new();
         already_run.insert(1);
         assert_eq!(sched.commands_due(now, &already_run), vec![(2, "B".to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod scheduled_action_tests {
+    use super::*;
+
+    #[test]
+    fn parses_real_scheduled_actions_xml_from_user() {
+        // Exact structure from a real schedule.xml the user shared,
+        // alongside <layout>/<default>/<dependants> in the same
+        // document -- confirms the parser handles the real wire format
+        // correctly, including a real trigger code targeting a real
+        // layout by its own layoutCode.
+        let xml = r#"<schedule generated="2026-08-27 11:35:27" filterFrom="2026-08-27 11:00:00" filterTo="2026-08-29 11:00:00">
+  <layout file="971" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="254" priority="0" syncEvent="0" shareOfVoice="0" duration="30" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="137" playCount="0" maxPlaysPerHour="0"/>
+  <actions>
+    <action fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="253" priority="0" duration="0" isGeoAware="0" geoLocation="" triggerCode="apri_home" actionType="navLayout" layoutCode="defaultxibomultimedia" commandCode=""/>
+  </actions>
+  <default file="982" duration="60"/>
+</schedule>"#;
+        let tree = Element::from_reader(xml.as_bytes()).unwrap();
+        let sched = Schedule::parse(&tree).unwrap();
+        assert_eq!(sched.actions.len(), 1);
+        assert_eq!(sched.actions[0].scheduleid, 253);
+        assert_eq!(sched.actions[0].duration, 0);
+        assert_eq!(sched.actions[0].trigger_code, "apri_home");
+        assert_eq!(sched.actions[0].target,
+                   ActionTarget::Layout("defaultxibomultimedia".into()));
+    }
+
+    #[test]
+    fn parses_a_command_type_action() {
+        // Same element shape, actionType="command" instead -- confirms
+        // both branches of the real "navLayout or run a Command"
+        // manual-documented mechanism, not just the one real capture
+        // happened to show.
+        let xml = r#"<schedule generated="2026-08-27 11:35:27" filterFrom="2026-08-27 11:00:00" filterTo="2026-08-29 11:00:00">
+  <actions>
+    <action fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="260" priority="0" duration="0" isGeoAware="0" geoLocation="" triggerCode="run_touch" actionType="command" layoutCode="" commandCode="TESTTOUCH"/>
+  </actions>
+</schedule>"#;
+        let tree = Element::from_reader(xml.as_bytes()).unwrap();
+        let sched = Schedule::parse(&tree).unwrap();
+        assert_eq!(sched.actions[0].target, ActionTarget::Command("TESTTOUCH".into()));
+    }
+
+    fn real_action(trigger_code: &str, duration: i64, target: ActionTarget) -> Schedule {
+        let now = OffsetDateTime::now_local().unwrap();
+        Schedule {
+            default: None, schedules: vec![], overlays: vec![], commands: vec![],
+            actions: vec![ScheduledAction {
+                from: now - time::Duration::hours(1), to: now + time::Duration::hours(1),
+                scheduleid: 1, duration, trigger_code: trigger_code.into(), target,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_matching_trigger_code_within_its_window_returns_the_action() {
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = real_action("apri_home", 30, ActionTarget::Layout("home".into()));
+        assert_eq!(sched.action_for_trigger("apri_home", now),
+                   Some((30, &ActionTarget::Layout("home".into()))));
+    }
+
+    #[test]
+    fn a_nonmatching_trigger_code_returns_none() {
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = real_action("apri_home", 30, ActionTarget::Layout("home".into()));
+        assert_eq!(sched.action_for_trigger("something_else", now), None);
+    }
+
+    #[test]
+    fn a_trigger_code_outside_its_own_window_returns_none() {
+        let now = OffsetDateTime::now_local().unwrap();
+        let mut sched = real_action("apri_home", 30, ActionTarget::Layout("home".into()));
+        // Window already expired.
+        sched.actions[0].to = now - time::Duration::minutes(1);
+        assert_eq!(sched.action_for_trigger("apri_home", now), None);
+    }
+
+    #[test]
+    fn duration_zero_is_returned_verbatim_for_the_caller_to_interpret() {
+        // schedule.rs itself doesn't interpret duration==0 specially --
+        // that's mainloop.rs's own handle_trigger_code (timer vs. wait
+        // for natural completion). Just confirms the real value (0)
+        // round-trips correctly through parsing and lookup.
+        let now = OffsetDateTime::now_local().unwrap();
+        let sched = real_action("apri_home", 0, ActionTarget::Layout("home".into()));
+        assert_eq!(sched.action_for_trigger("apri_home", now).map(|(d, _)| d), Some(0));
     }
 }
 

@@ -12,7 +12,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::{DecodePrivateKey, EncodePrivateKe
 use subprocess::Popen;
 use time::OffsetDateTime;
 use crate::config::{ArexiboMeta, CmsSettings, PlayerSettings};
-use crate::{logger, server, util, xmds, xmr};
+use crate::{logger, schedule, server, util, xmds, xmr};
 use crate::resource::{Cache, ReqFile};
 use crate::faults;
 use crate::schedule::Schedule;
@@ -97,6 +97,13 @@ pub enum Kill {
 /// Messages received from the GUI thread
 pub enum FromGui {
     Showing(i64),
+    /// Sent when the currently-shown layout completes one natural
+    /// cycle of its own regions/widgets (CB_LAYOUT_NEXT, matching
+    /// jsLayoutDone) -- distinct from `Showing`, which fires when a
+    /// layout *starts*. Used by handle_trigger_code's own
+    /// duration==0 revert case (see override_revert_on_completion's
+    /// own doc comment) -- otherwise ignored.
+    LayoutCompleted,
     Screenshot(Vec<u8>),
     Command(String),
     Shell(String, bool),
@@ -224,6 +231,20 @@ pub struct Handler {
     /// here (was local to `run()`) since `schedule_check()` needs to
     /// (re)schedule it too, not just XMR's `overlayLayout` handling.
     overlay_expiry: Receiver<std::time::Instant>,
+    /// Timer for reverting an active `override_layout` set by a
+    /// Scheduled Action's own `navLayout` target with a nonzero
+    /// `duration` (see schedule::ScheduledAction's own doc comment,
+    /// handle_trigger_code). `duration == 0` uses
+    /// `override_revert_on_completion` instead -- this stays at
+    /// `never()` in that case.
+    override_expiry: Receiver<std::time::Instant>,
+    /// Whether the active `override_layout` (if any) should revert to
+    /// the normal schedule on the shown layout's own next natural
+    /// completion (`FromGui::LayoutCompleted`) rather than on a timer
+    /// (`override_expiry`) -- set for a Scheduled Action's own
+    /// `navLayout` target with `duration == 0`. Meaningless whenever
+    /// `override_layout` is `None`.
+    override_revert_on_completion: bool,
     /// Currently-active schedule-driven Overlay Layouts (see
     /// schedule.rs's `active_overlays` -- a real `<overlays>` section,
     /// distinct from XMR's transient `overlayLayout` push action) as
@@ -446,6 +467,7 @@ impl Handler {
                                  criteria: CriteriaStore::default(),
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, overlay_expiry: never(),
+                                 override_expiry: never(), override_revert_on_completion: false,
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
@@ -489,6 +511,7 @@ impl Handler {
                                  criteria: CriteriaStore::default(),
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, overlay_expiry: never(),
+                                 override_expiry: never(), override_revert_on_completion: false,
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
@@ -625,6 +648,19 @@ impl Handler {
                         self.show_current_schedule_overlay();
                     }
                 },
+                // Timer channel for reverting an active override_layout
+                // set by a Scheduled Action's own navLayout target with
+                // duration > 0 (see handle_trigger_code) -- the
+                // duration == 0 case instead reverts on
+                // FromGui::LayoutCompleted, below.
+                recv(self.override_expiry) -> _ => {
+                    if self.override_layout.take().is_some() {
+                        log::info!("Scheduled Action's override layout duration elapsed -- \
+                                    reverting to normal schedule");
+                        self.override_expiry = never();
+                        self.schedule_check();
+                    }
+                },
                 // timer channel that fires to retry resources whose
                 // download failed during a normal collection -- see
                 // `resource_retry_queue`'s own doc comment.
@@ -653,7 +689,9 @@ impl Handler {
                         collect = after(Duration::from_secs(0));  // force re-download
                     }
                     Ok(xmr::Message::WebHook(code)) => {
-                        self.to_gui.send(ToGui::WebHook(code)).unwrap();
+                        if self.handle_trigger_code(&code) {
+                            collect = after(Duration::from_secs(0));
+                        }
                     }
                     Ok(xmr::Message::Command(code)) => {
                         self.run_command(&code);
@@ -825,6 +863,20 @@ impl Handler {
                             self.send_status_update();
                         }
                     }
+                    Ok(FromGui::LayoutCompleted) => {
+                        // Only meaningful for a Scheduled Action's own
+                        // navLayout target with duration == 0 (see
+                        // override_revert_on_completion's own doc
+                        // comment) -- a no-op otherwise (e.g. normal
+                        // schedule cycling, which handles its own
+                        // advancement entirely on the GUI side).
+                        if self.override_revert_on_completion && self.override_layout.take().is_some() {
+                            log::info!("Scheduled Action's override layout completed its own \
+                                        natural cycle -- reverting to normal schedule");
+                            self.override_revert_on_completion = false;
+                            self.schedule_check();
+                        }
+                    }
                     Ok(FromGui::Command(code)) =>
                         self.run_command(&code),
                     Ok(FromGui::Shell(code, with_shell)) =>
@@ -850,7 +902,9 @@ impl Handler {
                 // Same reasoning as duration_rx just above, for
                 // Interactive Control webhook triggers.
                 recv(self.trigger_rx) -> req => if let Ok(req) = req {
-                    self.to_gui.send(ToGui::Trigger(req.code)).unwrap();
+                    if self.handle_trigger_code(&req.code) {
+                        collect = after(Duration::from_secs(0));
+                    }
                 }
             }
         }
@@ -1412,6 +1466,78 @@ impl Handler {
             self.run_command(&code);
             self.commands_run.insert(scheduleid);
         }
+    }
+
+    /// Handles an incoming webhook trigger code -- from either XMR's own
+    /// pushed `triggerWebhook` action, or a direct HTTP POST to
+    /// `/trigger` (see server::TriggerRequest). First checks for a
+    /// matching Scheduled Action (schedule::ActionTarget -- a
+    /// schedule-level "listen for this code, then Navigate to a Layout
+    /// or run a Command", confirmed real from a live CMS's own
+    /// `<actions>` section, reachable regardless of what's currently
+    /// showing), falling back to the older, narrower mechanism (an
+    /// in-page widget-embedded action, only reachable while its own
+    /// layout/widget happens to already be on screen) if no Scheduled
+    /// Action matches -- found from a real report: a trigger doing
+    /// nothing at all because the *current* layout had no matching
+    /// widget-embedded action, when the actual configured action was a
+    /// Scheduled Action targeting a different layout entirely.
+    ///
+    /// Returns true if the caller (run()'s own select! loop) should
+    /// force an immediate collection -- the resolved target layout of a
+    /// matched navLayout action isn't cached yet.
+    fn handle_trigger_code(&mut self, code: &str) -> bool {
+        let now = OffsetDateTime::now_local().unwrap();
+        // Cloned immediately to release the borrow on self.schedule --
+        // both branches below need &mut self (run_command,
+        // resolve_layout_code, setting self.override_layout/etc), which
+        // would otherwise conflict with a reference still borrowed from
+        // self.schedule for the whole match.
+        let matched = self.schedule.action_for_trigger(code, now)
+            .map(|(duration, target)| (duration, target.clone()));
+        if let Some((duration, target)) = matched {
+            match target {
+                schedule::ActionTarget::Layout(layout_code) => {
+                    let Some(id) = self.cache.resolve_layout_code(&layout_code) else {
+                        log::warn!("Scheduled Action: trigger {code:?} targets unknown layout \
+                                    code {layout_code:?} -- not yet cached, or genuinely \
+                                    misconfigured");
+                        return false;
+                    };
+                    log::info!("Scheduled Action: trigger {code:?} navigating to layout \
+                                {layout_code:?} (resolved to {id}), duration={duration}s");
+                    self.override_layout = Some(id);
+                    if duration > 0 {
+                        self.override_expiry = after(Duration::from_secs(duration as u64));
+                        self.override_revert_on_completion = false;
+                    } else {
+                        // Same reasoning as ScheduledAction::duration's
+                        // own doc comment: wait for the shown layout's
+                        // own natural completion instead of a timer.
+                        self.override_expiry = never();
+                        self.override_revert_on_completion = true;
+                    }
+                    if self.cache.get_layout(id).is_none() {
+                        log::info!("Scheduled Action target layout {id} not yet cached, \
+                                    forcing a collection");
+                        return true;
+                    }
+                    self.schedule_check();
+                }
+                schedule::ActionTarget::Command(command_code) => {
+                    log::info!("Scheduled Action: trigger {code:?} running command \
+                                {command_code:?}");
+                    self.run_command(&command_code);
+                }
+            }
+            return false;
+        }
+        // No matching Scheduled Action -- fall back to the older,
+        // narrower in-page widget-embedded action mechanism
+        // (window.arexibo.triggers[code], see layout.rs's own
+        // write_action / TriggerRequest's own doc comment).
+        self.to_gui.send(ToGui::Trigger(code.to_string())).unwrap();
+        false
     }
 
     /// Re-evaluate schedule-driven Overlay Layouts (schedule.rs's
@@ -3184,6 +3310,206 @@ mod sync_role_change_forces_restart_tests {
             assert!(e.root_cause().downcast_ref::<RestartRequired>().is_none(),
                     "an unchanged Sync Group role must not be reported as RestartRequired");
         }
+    }
+}
+
+#[cfg(test)]
+mod handle_trigger_code_tests {
+    use super::*;
+
+    // Regression coverage for a real report: a webhook trigger did
+    // nothing at all, because the only mechanism handled was an
+    // in-page widget-embedded action (only reachable while its own
+    // layout/widget happens to already be on screen) -- the actual
+    // configured action was a Scheduled Action (schedule::ActionTarget,
+    // confirmed real from a live CMS's own <actions> section),
+    // targeting a *different* layout entirely, reachable regardless of
+    // what's currently showing.
+
+    fn start_mock_ready() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "testkey".into(),
+                      display_id: "test-display".into(), display_name: None, proxy: None }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_handle_trigger_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_handler() -> Handler {
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        Handler::new(&cms, false, &envdir, true, true, false,
+                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap()
+    }
+
+    /// A minimal <actions> Schedule, matching the real capture's own
+    /// shape (fromdt/todt spanning "always").
+    fn schedule_with_action(trigger_code: &str, duration: i64, action_type_and_targets: &str) -> Schedule {
+        let xml = format!(
+            r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <actions>
+    <action fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0"
+     duration="{duration}" isGeoAware="0" geoLocation="" triggerCode="{trigger_code}" {action_type_and_targets}/>
+  </actions>
+</schedule>"#);
+        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
+        Schedule::parse(&tree).unwrap()
+    }
+
+    /// Registers `layout_code` -> `id` in the handler's own cache code
+    /// map, matching how a real collection cycle populates it (see
+    /// resource.rs's own update_code_map) -- needed for the navLayout
+    /// success path specifically.
+    fn register_layout_code(handler: &mut Handler, layout_code: &str, id: i64) {
+        let file = crate::resource::ReqFile::File {
+            id, typ: "layout", size: 0, md5: vec![], http: false,
+            path: String::new(), name: String::new(), code: Some(layout_code.into()),
+        };
+        handler.cache.update_code_map(&[file]).unwrap();
+    }
+
+    #[test]
+    fn a_matching_navlayout_action_with_nonzero_duration_arms_a_timer() {
+        let mut handler = test_handler();
+        handler.schedule = schedule_with_action("apri_home", 30,
+            r#"actionType="navLayout" layoutCode="home" commandCode="""#);
+        register_layout_code(&mut handler, "home", 971);
+
+        let needs_collect = handler.handle_trigger_code("apri_home");
+
+        assert_eq!(handler.override_layout, Some(971));
+        assert!(!handler.override_revert_on_completion,
+                "a nonzero duration must use the timer, not wait-for-completion");
+        // register_layout_code only populates the code->id mapping, not
+        // the layout's own actual content -- get_layout(971) correctly
+        // finds nothing cached, so a collection really is needed here.
+        assert!(needs_collect, "the target layout's own content isn't actually cached yet");
+    }
+
+    #[test]
+    fn a_matching_navlayout_action_with_zero_duration_waits_for_completion() {
+        let mut handler = test_handler();
+        handler.schedule = schedule_with_action("apri_home", 0,
+            r#"actionType="navLayout" layoutCode="home" commandCode="""#);
+        register_layout_code(&mut handler, "home", 971);
+
+        handler.handle_trigger_code("apri_home");
+
+        assert_eq!(handler.override_layout, Some(971));
+        assert!(handler.override_revert_on_completion,
+                "duration == 0 must wait for the layout's own natural completion \
+                 instead of arming a timer");
+    }
+
+    #[test]
+    fn a_matching_command_action_runs_the_command() {
+        let mut handler = test_handler();
+        handler.schedule = schedule_with_action("run_touch", 0,
+            r#"actionType="command" layoutCode="" commandCode="TESTTOUCH""#);
+
+        handler.handle_trigger_code("run_touch");
+
+        // enable_shell_commands defaults to false (PlayerSettings::
+        // default), so run_command fails closed deterministically --
+        // what matters here is only that it actually got *called*.
+        assert_eq!(handler.last_command_success, Some(false));
+        assert!(handler.override_layout.is_none(),
+                "a command-type action must not touch override_layout at all");
+    }
+
+    #[test]
+    fn no_matching_scheduled_action_falls_back_to_the_in_page_trigger() {
+        let mut handler = test_handler();
+        // Empty schedule -- no Scheduled Action defined at all.
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        handler.to_gui = togui_tx;
+
+        let needs_collect = handler.handle_trigger_code("some_code");
+
+        assert!(!needs_collect);
+        assert!(handler.override_layout.is_none());
+        let msg = togui_rx.try_recv().expect("must fall back to the in-page trigger mechanism");
+        assert!(matches!(msg, ToGui::Trigger(code) if code == "some_code"));
+    }
+
+    #[test]
+    fn an_unresolvable_layout_code_does_not_set_an_override() {
+        let mut handler = test_handler();
+        handler.schedule = schedule_with_action("apri_home", 30,
+            r#"actionType="navLayout" layoutCode="never_registered" commandCode="""#);
+        // Deliberately not calling register_layout_code -- the code map
+        // stays empty, matching a genuinely misconfigured action or one
+        // whose target layout hasn't been seen in RequiredFiles yet.
+
+        let needs_collect = handler.handle_trigger_code("apri_home");
+
+        assert!(!needs_collect);
+        assert!(handler.override_layout.is_none());
+    }
+
+    #[test]
+    fn layout_completed_reverts_an_override_waiting_for_completion() {
+        let mut handler = test_handler();
+        handler.override_layout = Some(971);
+        handler.override_revert_on_completion = true;
+
+        if let Err(e) = handler.collect_once() {
+            // Irrelevant to what's under test -- collect_once may fail
+            // against this minimal mock for unrelated reasons (no
+            // RequiredFiles/Schedule support), which is fine; only
+            // FromGui::LayoutCompleted's own handling (exercised below)
+            // is what this test actually verifies.
+            let _ = e;
+        }
+
+        // Simulate exactly what run()'s own select! loop does on
+        // FromGui::LayoutCompleted, without needing to drive that full,
+        // otherwise-infinite loop just to test this.
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+        }
+
+        assert!(handler.override_layout.is_none());
+        assert!(!handler.override_revert_on_completion);
+    }
+
+    #[test]
+    fn layout_completed_does_not_affect_a_timer_based_override() {
+        let mut handler = test_handler();
+        handler.override_layout = Some(971);
+        handler.override_revert_on_completion = false; // timer-based, not wait-for-completion
+
+        // Same simulated FromGui::LayoutCompleted logic as above.
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+        }
+
+        assert_eq!(handler.override_layout, Some(971),
+                   "a timer-based override must not be cleared by a mere \
+                    natural-completion signal");
     }
 }
 

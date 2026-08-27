@@ -452,6 +452,19 @@ impl Cache {
         Ok(())
     }
 
+    /// Resolves a Layout's own `code` (an admin-assigned alphanumeric
+    /// identifier, distinct from its numeric id) to that id, using the
+    /// same code_map already kept up to date by update_code_map for a
+    /// widget-embedded action's own layoutCode-based navigation. Exposed
+    /// for a Scheduled Action's own `navLayout` target (see
+    /// schedule::ActionTarget::Layout, mainloop.rs's own
+    /// handle_trigger_code) -- confirmed real from a live CMS,
+    /// `layoutCode="defaultxibomultimedia"` needing this exact same
+    /// resolution.
+    pub fn resolve_layout_code(&self, code: &str) -> Option<LayoutId> {
+        self.code_map.get(code).copied()
+    }
+
     pub fn get_layout(&self, id: LayoutId) -> Option<Arc<LayoutInfo>> {
         self.content.get(&format!("{id}.xlf")).and_then(|entry| match entry {
             Resource::Layout(layout) => Some(layout.clone()),
