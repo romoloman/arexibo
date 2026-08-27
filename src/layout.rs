@@ -237,6 +237,96 @@ window.arexibo = {
   navWidget: function(rid, index) {
     this.region_switch(rid, index, false);
   },
+
+  // navWidgetFromDrawer: temporarily swaps a drawer widget (see
+  // Rust-side drawer_widgets's own doc comment -- a widget that's
+  // never part of any region's own normal item cycling) into a
+  // *target* region in place of whatever it's currently showing,
+  // for the drawer widget's own configured duration, then reverts.
+  // Confirmed real behavior (Xibo's own developer docs): "it should
+  // run for its whole duration and on expiry the player should
+  // reload its previous state... If a Widget has been loaded its
+  // previous state would be the prior widget in that region" -- the
+  // real C# client's own equivalent is RegionChangeToWidget.
+  // Deliberately doesn't try to track/restore the interrupted
+  // widget's own *remaining* time on revert -- it just restarts that
+  // widget's own full duration fresh, a reasonable simplification
+  // (the official client's own docs only promise resuming the same
+  // widget, not preserving exact elapsed time).
+  //
+  // Resizes to the *target* region rather than the drawer's own
+  // native size, confirmed real (Xibo issue #2429: "we need to see
+  // if the intended region has been configured and if so go and get
+  // the width/height of that region instead of the drawer") --
+  // implemented here by actually reparenting the widget's own DOM
+  // element into the target region's own wrapper (moved back to the
+  // drawer's own wrapper on revert) and overriding its own
+  // left/top/width/height to fill whichever wrapper currently
+  // contains it, rather than computing/duplicating each region's own
+  // geometry again here -- the wrapper's own real size (already
+  // correct, written once at translation time) does that for free.
+  navWidgetFromDrawer: function(rid, drawerWidgetId) {
+    const region = this.regions[rid];
+    if (!region) {
+      console.warn('navWidgetFromDrawer: unknown target region ' + rid);
+      return;
+    }
+    const drawerItem = this.drawerWidgets && this.drawerWidgets[drawerWidgetId];
+    if (!drawerItem) {
+      console.warn('navWidgetFromDrawer: unknown drawer widget ' + drawerWidgetId);
+      return;
+    }
+    window.clearTimeout(region.timeoutid);
+    const prevCur = region.cur;
+    if (prevCur !== null) region.media[prevCur][1](); // hide whatever's currently shown
+
+    const el = document.getElementById('m' + drawerWidgetId);
+    const targetWrapper = document.querySelector('.r' + rid);
+    if (el && targetWrapper) {
+      targetWrapper.appendChild(el);
+      el.style.left = '0px';
+      el.style.top = '0px';
+      el.style.width = '100%';
+      el.style.height = '100%';
+    } else {
+      console.warn('navWidgetFromDrawer: could not find element m' + drawerWidgetId +
+                    ' or target wrapper .r' + rid + ' to resize into');
+    }
+
+    const [show, hide, duration] = drawerItem;
+    show();
+    // `duration` is a `() => N` function, same shape as a normal
+    // region item's own media[cur][2] (see region_switch's own
+    // `media[next][2]()` call) -- not a raw number. Found from a real
+    // report: treating it as a plain value here made durationMs come
+    // out NaN (a function times 1000), which setTimeout then likely
+    // clamped to ~0 -- the widget swapped in and immediately back out
+    // again, faster than visibly perceptible, looking exactly like
+    // "nothing happened".
+    const durationMs = (duration() || 1) * 1000;
+    region.timeoutDuration = durationMs;
+    region.timeoutStart = Date.now();
+    region.timeoutid = window.setTimeout(() => {
+      hide();
+      // Move the widget's own DOM element back to the drawer -- its
+      // own left/top/width/height stay overridden to the *previous*
+      // target region's own size until this same widget is swapped
+      // in again (harmless: it's hidden, and the next
+      // navWidgetFromDrawer call for it always re-applies the sizing
+      // above regardless of whatever it was set to before).
+      const drawerWrapper = document.querySelector('.drawer');
+      if (el && drawerWrapper) {
+        drawerWrapper.appendChild(el);
+      }
+      // Resume the region's own normal cycling by re-showing
+      // whichever item was active before this temporary swap-in --
+      // `first: true` so this specific re-entry into index 0 (if
+      // that's what it was) isn't mistaken for a genuine full cycle
+      // completing again (see region_switch's own "region_done"
+      // check).
+      this.region_switch(rid, prevCur === null ? 0 : prevCur, true);
+    }, durationMs);
+  },
 };
 "##;
 
@@ -313,6 +403,20 @@ pub struct Translator<'a> {
     /// actions, which reference a target widget id directly rather
     /// than a region + relative-index like `next`/`previous` do.
     widget_regions: HashMap<i32, (i32, usize)>,
+    /// Widget ids that live in the layout's own `<drawer>` (a "hidden
+    /// reservoir" -- confirmed, Xibo's own developer docs: "a
+    /// collection of Widgets with a similar structure to a normal
+    /// Region... not shown directly... referenced by Actions elsewhere
+    /// in the Layout") rather than any real, directly-shown region --
+    /// checked by `write_action`'s own navWidget resolution as a
+    /// fallback when a target widget id isn't found in
+    /// `widget_regions` at all (a normal region widget). Populated by
+    /// `write_drawer`. A plain set, not carrying each widget's own
+    /// duration/etc: the generated `navWidgetFromDrawer` JS call looks
+    /// that up at runtime instead, from `window.arexibo.drawerWidgets`
+    /// (itself populated by `write_drawer` too) -- this field only
+    /// needs to answer "is this id a known drawer widget at all".
+    drawer_widgets: std::collections::HashSet<i32>,
     /// Maps a region's `id` to its (x, y, w, h) geometry -- needed for
     /// touch actions, which get an invisible click-catching overlay
     /// `<div>` positioned over the *region* (not attached to the
@@ -356,7 +460,8 @@ impl<'a> Translator<'a> {
         let out = BufWriter::new(out);
 
         Ok(Self { id, tree, out, regions: Vec::new(), size: (0, 0), code_map, has_pdf: false,
-                  widget_regions: HashMap::new(), region_geom: HashMap::new(),
+                  widget_regions: HashMap::new(), drawer_widgets: std::collections::HashSet::new(),
+                  region_geom: HashMap::new(),
                   enable_stat: true, adspace, html_port })
     }
 
@@ -390,6 +495,19 @@ impl<'a> Translator<'a> {
             actions.extend(region.find_all("action"));
             for media in region.find_all("media") {
                 actions.extend(media.find_all("action"));
+            }
+        }
+        // The drawer's own widgets can carry actions too (confirmed,
+        // Xibo's own developer docs: "Parse the XLF for Action Nodes
+        // on Layouts, Regions, the Drawer and Widgets") -- collected
+        // the same way as a normal region's own nested actions, above.
+        if let Some(drawer) = tree.find("drawer") {
+            actions.extend(drawer.find_all("action"));
+            for media in drawer.find_all("media") {
+                actions.extend(media.find_all("action"));
+            }
+            if let Err(e) = self.write_drawer(drawer) {
+                log::error!("layout: could not translate drawer: {:#}", e);
             }
         }
 
@@ -429,9 +547,28 @@ impl<'a> Translator<'a> {
         // fire, check these names first.
         let call = if action == "navWidget" {
             let widget_id: i32 = el.parse_attr("widgetId")?;
-            let (rid, index) = self.widget_regions.get(&widget_id).copied()
-                .with_context(|| format!("navWidget: unknown target widget id {widget_id}"))?;
-            format!("window.arexibo.navWidget({rid}, {index})")
+            if let Some((rid, index)) = self.widget_regions.get(&widget_id).copied() {
+                format!("window.arexibo.navWidget({rid}, {index})")
+            } else if self.drawer_widgets.contains(&widget_id) {
+                // A drawer widget (see drawer_widgets's own doc
+                // comment) -- not part of any region's own item
+                // cycling, so the normal (region id, index)
+                // resolution above doesn't apply. Confirmed real from
+                // a live layout: this kind of action also carries its
+                // own targetId, naming the region to temporarily
+                // swap this widget into (see navWidgetFromDrawer's
+                // own doc comment in the runtime JS) -- unlike the
+                // generic target/targetId handling in the `else`
+                // branch just below, which doesn't apply here either
+                // (this whole branch is navWidget-specific).
+                let targetid: i32 = el.parse_attr("targetId")
+                    .context("navWidget targeting a drawer widget needs a targetId \
+                              (the region to temporarily show it in)")?;
+                format!("window.arexibo.navWidgetFromDrawer({targetid}, {widget_id})")
+            } else {
+                anyhow::bail!("navWidget: unknown target widget id {widget_id} (neither \
+                               a region widget nor a drawer widget)");
+            }
         } else {
             let target = el.def_attr("target", "screen");
             let targetid = el.def_attr("targetId", "0").parse::<i64>()
@@ -668,115 +805,274 @@ impl<'a> Translator<'a> {
 
         // for each media, write functions to start/stop displaying it
         for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in sequence {
-            writeln!(self.out, "    [function() {{")?;
-            // Diagnostic log (found genuinely useful investigating a
-            // real "content renders correctly inside its own iframe but
-            // is never visible" report): confirms whether region_switch
-            // actually calls this widget's own show function at all.
-            // Gated behind --web-debug (see `window.arexiboDebug`,
-            // injected profile-wide in gui/lib.cpp's `setup()`) -- on
-            // request, so this doesn't add permanent noise to every
-            // normal run; combined with LoggingPage (which already
-            // captures every frame's own console output including this
-            // one when that flag is on), gives a simple way to check
-            // "is this specific widget's own show() ever running"
-            // without needing network-reachable remote debugging.
-            writeln!(self.out, "      if (window.arexiboDebug) console.log(\
-                                'arexibo-show: region {rid} widget {mid}');")?;
-            let el = format!("document.getElementById('m{mid}')");
-            match trans_in {
-                Trans::Fade => {
-                    // Per the documented semantics ("the media duration
-                    // should include the in transition"), this animates
-                    // *within* the widget's own already-scheduled duration
-                    // countdown in region_switch -- no timing changes are
-                    // needed there, only here in how "becoming visible" is
-                    // actually performed.
-                    writeln!(self.out, "      {{ let el = {el}; \
-                                        el.style.transition = 'opacity {ms_in}ms'; \
-                                        el.style.opacity = '0'; \
-                                        el.style.visibility = 'visible'; \
-                                        void el.offsetWidth; \
-                                        el.style.opacity = '1'; }}")?;
-                }
-                Trans::Fly(dir) => {
-                    // Arrives *from* this compass direction (see
-                    // FlyDir::offset's own doc comment for the
-                    // semantics/uncertainty note): starts translated
-                    // fully off-screen in that direction, then animates
-                    // to its natural position. Same "animate within the
-                    // widget's own duration countdown" timing as fadeIn.
-                    let (dx, dy) = dir.offset();
-                    writeln!(self.out, "      {{ let el = {el}; \
-                                        el.style.transition = 'none'; \
-                                        el.style.transform = 'translate({dx}%, {dy}%)'; \
-                                        el.style.visibility = 'visible'; \
-                                        void el.offsetWidth; \
-                                        el.style.transition = 'transform {ms_in}ms'; \
-                                        el.style.transform = 'translate(0%, 0%)'; }}")?;
-                }
-                Trans::None => {
-                    writeln!(self.out, "      {el}.style.visibility = 'visible';")?;
-                }
-            }
-            writeln!(self.out, "      {add_start}")?;
-            writeln!(self.out, "    }}, function() {{")?;
-            // if only one item is present, don't need to hide the others
-            if nitems > 1 {
-                match trans_out {
-                    Trans::Fade => {
-                        // Fire-and-forget: region_switch already moves
-                        // to the next widget immediately, so its own
-                        // in-transition overlaps with this fade-out --
-                        // a real crossfade, not sequential fade-out-
-                        // then-fade-in. Duration countdown isn't
-                        // delayed by this timer.
-                        //
-                        // z-index bump is essential, not cosmetic:
-                        // .media elements are position:absolute with
-                        // no explicit z-index, stacking in DOM order --
-                        // the incoming widget would otherwise paint on
-                        // top from frame one, hiding this fade-out
-                        // entirely. Bumping keeps the fading-out widget
-                        // on top so its decreasing opacity visibly
-                        // reveals what's underneath. Not reset
-                        // afterwards -- once visibility:hidden, the
-                        // element doesn't participate in stacking
-                        // regardless of z-index.
-                        writeln!(self.out, "      {{ let el = {el}; \
-                                            el.style.zIndex = '9999'; \
-                                            el.style.transition = 'opacity {ms_out}ms'; \
-                                            el.style.opacity = '0'; \
-                                            setTimeout(() => {{ el.style.visibility = 'hidden'; }}, \
-                                                       {ms_out}); }}")?;
-                    }
-                    Trans::Fly(dir) => {
-                        // Exits *toward* this compass direction -- same
-                        // z-index reasoning as the fade-out case above
-                        // (keeps the leaving widget visibly on top while
-                        // it flies away, rather than being instantly
-                        // hidden behind the incoming one).
-                        let (dx, dy) = dir.offset();
-                        writeln!(self.out, "      {{ let el = {el}; \
-                                            el.style.zIndex = '9999'; \
-                                            el.style.transition = 'transform {ms_out}ms'; \
-                                            el.style.transform = 'translate({dx}%, {dy}%)'; \
-                                            setTimeout(() => {{ el.style.visibility = 'hidden'; \
-                                                                 el.style.transform = ''; }}, \
-                                                       {ms_out}); }}")?;
-                    }
-                    Trans::None => {
-                        writeln!(self.out, "      {el}.style.visibility = 'hidden'; ")?;
-                    }
-                }
-            }
-            writeln!(self.out, "      {add_stop}")?;
-            writeln!(self.out, "    }}, {duration}, {mid}],")?;
+            writeln!(self.out, "    [")?;
+            self.write_show_stop_functions(mid, &add_start, &add_stop,
+                                            trans_in, ms_in, trans_out, ms_out, nitems > 1)?;
+            writeln!(self.out, "    , {duration}, {mid}],")?;
         }
         writeln!(self.out, "  ],")?;
         writeln!(self.out, "}};\n</script>")?;
         writeln!(self.out, "</div> <!-- end region {rid} wrapper -->")?;
         self.regions.push(rid);
+        Ok(())
+    }
+
+    /// Writes the `function() {{ ...show... }}, function() {{ ...hide...
+    /// }}` pair (comma-separated, no trailing comma/bracket -- the
+    /// caller wraps this appropriately for its own context: a region's
+    /// own `media` array entry gets `, {duration}, {mid}]` appended
+    /// after this, while a drawer widget's own standalone entry (see
+    /// write_drawer) does not) shared between a region's own normal
+    /// item cycling (write_region) and a drawer widget's own temporary
+    /// swap-in (write_drawer) -- factored out so the two can never
+    /// silently drift apart on the actual show/hide behavior (fades,
+    /// flies, z-index handling) for what is, from the widget's own
+    /// point of view, an identical "become visible" / "become hidden"
+    /// pair either way.
+    ///
+    /// `always_hide` mirrors the region-cycling case's own `nitems > 1`
+    /// check (a single-item, non-looping region skips its own hide
+    /// logic since nothing else will ever show in its place) -- a
+    /// drawer widget always needs real hide logic, since it always
+    /// gets swapped back out again later (see navWidgetFromDrawer's
+    /// own doc comment), so callers writing a drawer widget's own
+    /// functions should always pass `true` here regardless of the
+    /// target region's own item count.
+    fn write_show_stop_functions(&mut self, mid: i32, add_start: &str, add_stop: &str,
+                                  trans_in: Trans, ms_in: u32, trans_out: Trans, ms_out: u32,
+                                  always_hide: bool) -> Result<()> {
+        writeln!(self.out, "      function() {{")?;
+        // Diagnostic log (found genuinely useful investigating a
+        // real "content renders correctly inside its own iframe but
+        // is never visible" report): confirms whether region_switch
+        // actually calls this widget's own show function at all.
+        // Gated behind --web-debug (see `window.arexiboDebug`,
+        // injected profile-wide in gui/lib.cpp's `setup()`) -- on
+        // request, so this doesn't add permanent noise to every
+        // normal run; combined with LoggingPage (which already
+        // captures every frame's own console output including this
+        // one when that flag is on), gives a simple way to check
+        // "is this specific widget's own show() ever running"
+        // without needing network-reachable remote debugging.
+        writeln!(self.out, "        if (window.arexiboDebug) console.log(\
+                                    'arexibo-show: widget {mid}');")?;
+        let el = format!("document.getElementById('m{mid}')");
+        match trans_in {
+            Trans::Fade => {
+                // Per the documented semantics ("the media duration
+                // should include the in transition"), this animates
+                // *within* the widget's own already-scheduled duration
+                // countdown in region_switch -- no timing changes are
+                // needed there, only here in how "becoming visible" is
+                // actually performed.
+                writeln!(self.out, "        {{ let el = {el}; \
+                                    el.style.transition = 'opacity {ms_in}ms'; \
+                                    el.style.opacity = '0'; \
+                                    el.style.visibility = 'visible'; \
+                                    void el.offsetWidth; \
+                                    el.style.opacity = '1'; }}")?;
+            }
+            Trans::Fly(dir) => {
+                // Arrives *from* this compass direction (see
+                // FlyDir::offset's own doc comment for the
+                // semantics/uncertainty note): starts translated
+                // fully off-screen in that direction, then animates
+                // to its natural position. Same "animate within the
+                // widget's own duration countdown" timing as fadeIn.
+                let (dx, dy) = dir.offset();
+                writeln!(self.out, "        {{ let el = {el}; \
+                                    el.style.transition = 'none'; \
+                                    el.style.transform = 'translate({dx}%, {dy}%)'; \
+                                    el.style.visibility = 'visible'; \
+                                    void el.offsetWidth; \
+                                    el.style.transition = 'transform {ms_in}ms'; \
+                                    el.style.transform = 'translate(0%, 0%)'; }}")?;
+            }
+            Trans::None => {
+                writeln!(self.out, "        {el}.style.visibility = 'visible';")?;
+            }
+        }
+        writeln!(self.out, "        {add_start}")?;
+        writeln!(self.out, "      }}, function() {{")?;
+        // if only one item is present, don't need to hide the others
+        if always_hide {
+            match trans_out {
+                Trans::Fade => {
+                    // Fire-and-forget: region_switch already moves
+                    // to the next widget immediately, so its own
+                    // in-transition overlaps with this fade-out --
+                    // a real crossfade, not sequential fade-out-
+                    // then-fade-in. Duration countdown isn't
+                    // delayed by this timer.
+                    //
+                    // z-index bump is essential, not cosmetic:
+                    // .media elements are position:absolute with
+                    // no explicit z-index, stacking in DOM order --
+                    // the incoming widget would otherwise paint on
+                    // top from frame one, hiding this fade-out
+                    // entirely. Bumping keeps the fading-out widget
+                    // on top so its decreasing opacity visibly
+                    // reveals what's underneath. Not reset
+                    // afterwards -- once visibility:hidden, the
+                    // element doesn't participate in stacking
+                    // regardless of z-index.
+                    writeln!(self.out, "        {{ let el = {el}; \
+                                        el.style.zIndex = '9999'; \
+                                        el.style.transition = 'opacity {ms_out}ms'; \
+                                        el.style.opacity = '0'; \
+                                        setTimeout(() => {{ el.style.visibility = 'hidden'; }}, \
+                                                   {ms_out}); }}")?;
+                }
+                Trans::Fly(dir) => {
+                    // Exits *toward* this compass direction -- same
+                    // z-index reasoning as the fade-out case above
+                    // (keeps the leaving widget visibly on top while
+                    // it flies away, rather than being instantly
+                    // hidden behind the incoming one).
+                    let (dx, dy) = dir.offset();
+                    writeln!(self.out, "        {{ let el = {el}; \
+                                        el.style.zIndex = '9999'; \
+                                        el.style.transition = 'transform {ms_out}ms'; \
+                                        el.style.transform = 'translate({dx}%, {dy}%)'; \
+                                        setTimeout(() => {{ el.style.visibility = 'hidden'; \
+                                                             el.style.transform = ''; }}, \
+                                                   {ms_out}); }}")?;
+                }
+                Trans::None => {
+                    writeln!(self.out, "        {el}.style.visibility = 'hidden'; ")?;
+                }
+            }
+        }
+        writeln!(self.out, "        {add_stop}")?;
+        writeln!(self.out, "      }}")?;
+        Ok(())
+    }
+
+    /// Writes the layout's own `<drawer>` -- "a hidden reservoir" of
+    /// widgets (see `drawer_widgets`'s own doc comment), each one
+    /// meant to be temporarily swapped into a *target region* by a
+    /// `navWidget` action rather than ever shown in place. Modeled
+    /// closely on write_region's own geometry/wrapper handling (a
+    /// `<drawer>` element carries the same width/height/top/left
+    /// attributes a `<region>` does, confirmed from a real XLF), but:
+    /// - the wrapper stays `display: none` unconditionally (the
+    ///   drawer itself is never shown, only individual widgets pulled
+    ///   out of it into some *other* region -- see
+    ///   navWidgetFromDrawer's own doc comment in the runtime JS);
+    /// - widgets are NOT attached to any `window.arexibo.regions[rid]`
+    ///   cycling structure (they don't belong to a real, directly-
+    ///   shown region at all) -- instead each one's own show/hide
+    ///   functions and duration go into `window.arexibo.
+    ///   drawerWidgets[mid]`, a flat, standalone entry.
+    ///
+    /// Dynamic resizing to the target region (confirmed real, Xibo
+    /// issue #2429 -- see navWidgetFromDrawer's own doc comment) is
+    /// handled entirely at runtime, in JS -- this function only ever
+    /// writes each widget once, at the drawer's own native geometry;
+    /// navWidgetFromDrawer overrides that at the moment of swapping a
+    /// widget in, rather than this function needing to know in
+    /// advance which region(s) might eventually reference it.
+    fn write_drawer(&mut self, drawer: &Element) -> Result<()> {
+        let x = drawer.parse_attr("left")?;
+        let y = drawer.parse_attr("top")?;
+        let w = drawer.parse_attr("width")?;
+        let h = drawer.parse_attr("height")?;
+        // A synthetic region id, only ever used for write_media's own
+        // `class='media r{rid}'` CSS class and similarly cosmetic
+        // bookkeeping -- drawer widgets are deliberately never
+        // inserted into `widget_regions` (that's what lets
+        // write_action's own navWidget resolution tell a normal
+        // region widget and a drawer widget apart), so this can never
+        // collide with or be confused for a genuine region id from
+        // the XLF.
+        const DRAWER_RID: i32 = -1;
+
+        writeln!(self.out, "<!-- drawer -->")?;
+        // Deliberately no `display: none` here (a real bug found this
+        // way: an ancestor's display:none hides everything inside it
+        // regardless of each child's own visibility -- so toggling a
+        // drawer widget's own visibility, as navWidgetFromDrawer
+        // already correctly did, could never actually make anything
+        // appear on screen at all). Every `.media` element already
+        // starts `visibility: hidden` by default (see the shared CSS
+        // in write_footer) -- the same mechanism that already governs
+        // every normal region widget's own show/hide -- so this
+        // wrapper needs no visibility handling of its own at all.
+        //
+        // z-index: 9999 is essential, not cosmetic -- a second real
+        // bug found this way: every real region gets its own explicit
+        // z-index (see write_region), but this wrapper previously had
+        // none at all, meaning it stacked at the implicit/auto level
+        // -- *below* any region with an explicit z-index (which is
+        // all of them). A drawer widget could become genuinely
+        // visible (the display:none fix above) and still never
+        // actually be seen, sitting behind every normal region
+        // (including a full-screen "global" one) the whole time.
+        // Matches the same "temporarily bump above everything" z-index
+        // already used for a fade-out transition elsewhere in this
+        // file.
+        //
+        // pointer-events: none is essential too -- a third real bug
+        // found this way: `visibility: hidden` on each *child* widget
+        // (the default, see the .media CSS rule) only stops that
+        // child from being clickable/visible -- it does nothing to
+        // stop the *wrapper* itself from being a solid, event-
+        // catching layer. Combined with z-index: 9999 covering the
+        // full layout, every touch/click across the entire screen was
+        // being silently swallowed by this otherwise-invisible
+        // wrapper, disabling every interactive control on the layout.
+        // A widget reparented into a target region by
+        // navWidgetFromDrawer automatically escapes this (CSS
+        // inheritance follows the DOM tree -- once moved to a
+        // different parent, it's no longer a descendant of this
+        // wrapper at all), so no extra per-widget override is needed
+        // for it to remain interactive once actually shown.
+        writeln!(self.out, "<div class='drawer' style='position: absolute; \
+                            left: {x}px; top: {y}px; width: {w}px; height: {h}px; \
+                            overflow: hidden; z-index: 9999; pointer-events: none;'>")?;
+
+        // Write every widget's own DOM element (via write_media) FIRST,
+        // collecting the show/hide/duration info to register in a
+        // *separate*, later <script> block -- a real bug found this
+        // way: an earlier version interleaved each widget's own
+        // <img>/<iframe> markup with the drawerWidgets[...] = [...]
+        // registration *inside a single already-open <script> tag*.
+        // Once a browser's HTML parser enters a <script> tag, it treats
+        // everything up to the next </script> as raw JS source text,
+        // not HTML to keep parsing -- an <img ...> tag appearing there
+        // is invalid JS syntax (a real live report confirmed the exact
+        // resulting error: "SyntaxError: Unexpected token '<'"), and a
+        // syntax error anywhere in a <script> block means *none* of it
+        // runs -- not just that one line. Every drawerWidgets[mid]
+        // registration silently never executed at all, on every single
+        // layout, regardless of the display/z-index/duration fixes
+        // that came before this one -- explaining why none of them
+        // ever visibly helped. write_region already avoids this
+        // exact trap (all of a region's own DOM elements are written
+        // by its own write_media loop *before* that region's own
+        // <script>/media array ever opens) -- mirrored here.
+        let media_geom = [0, 0, w, h];
+        let mut widgets = Vec::new();
+        for media in drawer.find_all("media") {
+            match self.write_media(DRAWER_RID, media_geom, (x, y), media,
+                                    ((Trans::None, 0), (Trans::None, 0))) {
+                Err(e) => log::error!("layout: could not translate drawer widget: {:#}", e),
+                Ok(None) => continue,
+                Ok(Some(res)) => widgets.push(res),
+            }
+        }
+
+        writeln!(self.out, "<script type='text/javascript'>")?;
+        writeln!(self.out, "window.arexibo.drawerWidgets = window.arexibo.drawerWidgets || {{}};")?;
+        for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in widgets {
+            self.drawer_widgets.insert(mid);
+            writeln!(self.out, "window.arexibo.drawerWidgets[{mid}] = [")?;
+            self.write_show_stop_functions(mid, &add_start, &add_stop,
+                                            trans_in, ms_in, trans_out, ms_out, true)?;
+            writeln!(self.out, ", {duration}];")?;
+        }
+        writeln!(self.out, "</script>")?;
+        writeln!(self.out, "</div> <!-- end drawer -->")?;
         Ok(())
     }
 
@@ -2040,6 +2336,270 @@ mod html_sharding_tests {
         assert!(html.contains("src='http://127.0.0.2:9999/4001.html")); // 4001%4=1 -> shard2
         assert!(html.contains("src='http://127.0.0.3:9999/4002.html")); // 4002%4=2 -> shard3
         assert!(html.contains("src='http://127.0.0.4:9999/4003.html")); // 4003%4=3 -> shard4
+    }
+}
+
+#[cfg(test)]
+mod drawer_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn translate_xlf(xlf: &str, code_map: &HashMap<String, LayoutId>, test_name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("arexibo_{test_name}_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let t = Translator::new(1, &xlf_path, &html_path, code_map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
+        html
+    }
+
+    // Real XLF shared directly by the user (layout 983) -- the exact
+    // report this whole feature addresses: a webhook trigger
+    // ("apri_home") on an interactive-button widget did nothing at
+    // all, because its own navWidget action targets widgetId="4670",
+    // a widget that lives in the <drawer>, not any real region --
+    // previously never processed at all (confirmed: zero occurrences
+    // of "drawer" anywhere in this file before this feature), so
+    // write_action's own widget_regions-only lookup always failed,
+    // silently dropping the whole action (write_action's own errors
+    // are caught and logged, not propagated -- see translate()) and
+    // therefore never actually registering
+    // window.arexibo.triggers["apri_home"] at all.
+    const REAL_LAYOUT_983_XLF: &str = r##"<?xml version="1.0"?>
+<layout width="1080" height="1920" bgcolor="#ffffff" schemaVersion="4" enableStat="1"><region id="4654" width="1080" height="1920" top="0" left="0" syncKey="" zindex="2"><options/><media id="4666" schemaVersion="1" type="global" render="html" duration="10" useDuration="1" fromDt="1970-01-01 01:00:00" toDt="2038-01-19 04:14:07" enableStat="1"><options><updateInterval>43200</updateInterval></options><raw/></media></region><region id="4657" width="240" height="255" top="1616" left="40" syncKey="" zindex="5"><options><loop>0</loop><transitionDirection/><transitionDuration/><transitionType/></options><media id="4669" schemaVersion="2" type="interactive-button" render="html" duration="60" useDuration="0" fromDt="1970-01-01 01:00:00" toDt="2038-01-19 04:14:07" enableStat="1"><action layoutCode="" target="region" source="widget" actionType="navWidget" triggerType="webhook" triggerCode="apri_home" id="809" widgetId="4670" targetId="4657" sourceId="4669"/><options><updateInterval>43200</updateInterval></options><raw/></media></region><drawer id="4658" width="1080" height="1920" top="0" left="0" syncKey=""><options/><media id="4670" schemaVersion="1" type="image" render="native" duration="10" useDuration="0" fromDt="1970-01-01 01:00:00" toDt="2038-01-19 04:14:07" enableStat="0" fileId="154"><options><uri>154.jpg</uri><scaleType>center</scaleType><alignId>center</alignId><valignId>middle</valignId></options><raw/></media></drawer><tags/></layout>"##;
+
+    #[test]
+    fn real_layout_983_registers_the_trigger_that_previously_did_nothing() {
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_983_trigger");
+        assert!(html.contains(r#"window.arexibo.triggers["apri_home"]"#),
+                "the webhook trigger must actually get registered now -- this is the \
+                 exact real report this feature addresses");
+        assert!(html.contains("window.arexibo.navWidgetFromDrawer(4657, 4670)"),
+                "must resolve to the target region (4657) and the drawer widget (4670), \
+                 not silently fail");
+    }
+
+    #[test]
+    fn real_layout_983_drawer_widget_gets_written_hidden() {
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_983_hidden");
+        // Regression test for a real bug: the drawer wrapper must NOT
+        // have `display: none` -- an ancestor's display:none hides
+        // everything inside it regardless of each child's own
+        // visibility, so toggling a drawer widget's own visibility
+        // (navWidgetFromDrawer) could never make anything actually
+        // appear on screen at all. Every `.media` element already
+        // starts hidden via the shared `.media { visibility: hidden }`
+        // CSS rule (see write_footer) -- the same mechanism every
+        // normal region widget's own show/hide already relies on --
+        // so the wrapper itself needs no visibility handling at all.
+        assert!(html.contains("class='drawer'"), "the drawer wrapper must exist");
+        assert!(!html.contains("class='drawer' style='position: absolute; \
+                                left: 0px; top: 0px; width: 1080px; height: 1920px; \
+                                overflow: hidden; display: none;'"),
+                "the drawer wrapper must NOT have display:none -- that would hide \
+                 every widget inside it regardless of its own visibility toggling");
+        assert!(html.contains(".media { position: absolute; visibility: hidden; }"),
+                "the shared CSS rule that keeps every widget (drawer or not) hidden \
+                 by default must still be present");
+        // Regression test for a second real bug, found only after the
+        // first fix (display:none) let the widget become visible but
+        // still invisible in practice: every real region gets its own
+        // explicit z-index (see write_region), but the drawer wrapper
+        // previously had none at all -- stacking at the implicit/auto
+        // level, *below* any region with an explicit z-index (every
+        // one of them, including a full-screen "global" widget region
+        // that would completely obscure it). A drawer widget must
+        // stack above every normal region once swapped in.
+        assert!(html.contains("class='drawer'") && html.contains("z-index: 9999;"),
+                "the drawer wrapper must have a high explicit z-index -- otherwise a \
+                 swapped-in drawer widget can be genuinely visible (visibility: \
+                 visible) yet still never actually seen, stacked behind every normal \
+                 region");
+        // Regression test for a third real bug, found only after the
+        // display:none and z-index fixes above finally let a swapped-in
+        // drawer widget actually become visible: `visibility: hidden`
+        // on each *child* widget (the default) only stops that child
+        // from being clickable/visible -- it does nothing to stop the
+        // *wrapper* itself from being a solid, event-catching layer.
+        // Combined with the same z-index: 9999 covering the full
+        // layout, every touch/click across the entire screen was being
+        // silently swallowed by this otherwise-invisible wrapper,
+        // disabling every interactive control on the layout.
+        assert!(html.contains("pointer-events: none;'"),
+                "the drawer wrapper must have pointer-events: none -- otherwise, even \
+                 though its own contents are invisible, the wrapper itself (full-screen, \
+                 stacked above everything via the z-index fix) silently intercepts every \
+                 touch/click on the entire layout, disabling all interactive controls");
+        // The widget's own content must actually exist in the DOM
+        // (id='m4670') -- otherwise there'd be nothing to reveal.
+        assert!(html.contains("id='m4670'"),
+                "the drawer widget's own DOM element must actually be written");
+        assert!(html.contains("window.arexibo.drawerWidgets[4670]"),
+                "the drawer widget's own show/hide/duration entry must be registered");
+    }
+
+    #[test]
+    fn drawer_script_block_contains_no_html_markup() {
+        // Regression test for the real, root-cause bug behind every
+        // previous "trigger does nothing" report on this feature: an
+        // earlier version wrote each widget's own <img>/<iframe>
+        // markup *inside* the same already-open <script> block as its
+        // own drawerWidgets[...] = [...] registration. Once a
+        // browser's HTML parser enters <script>, everything up to the
+        // next </script> is raw JS source text, not HTML to keep
+        // parsing -- an embedded <img ...> tag is invalid JS syntax
+        // (confirmed via a real browser console: "SyntaxError:
+        // Unexpected token '<'"), and a syntax error anywhere in a
+        // <script> block means *none* of it runs, not just that one
+        // line -- so drawerWidgets was silently never populated at
+        // all, on every layout, regardless of the display/z-index/
+        // duration fixes that came before this one. None of those
+        // earlier fixes could ever have been *observed* working,
+        // because this bug prevented the registration script from
+        // running in the first place. Only actually parsing the
+        // generated HTML's own structure (not just checking for
+        // substrings, which every earlier test in this file did, and
+        // which is exactly why this one slipped through repeatedly)
+        // can catch this class of bug.
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_no_html_in_script");
+        let script_start = html.find("<script type='text/javascript'>\nwindow.arexibo.drawerWidgets")
+            .expect("the drawer's own registration script must exist");
+        let script_end = html[script_start..].find("</script>")
+            .expect("the drawer's own registration script must be closed") + script_start;
+        let script_body = &html[script_start..script_end];
+        assert!(!script_body.contains('<') || script_body.matches("() =>").count() > 0,
+                "sanity check: the script body should contain at least the arrow \
+                 functions it's expected to, confirming the slice itself is correct");
+        for tag in ["<img", "<iframe", "<canvas", "<video", "<audio", "<div"] {
+            assert!(!script_body.contains(tag),
+                    "the drawer's own <script> block must not contain any HTML \
+                     markup ({tag:?} found) -- this breaks JS parsing and silently \
+                     prevents the *entire* script block from ever running");
+        }
+    }
+
+    #[test]
+    fn every_script_block_in_the_generated_html_is_syntactically_valid_js() {
+        // A much stronger, general version of the substring-based
+        // check above -- rather than looking for specific HTML tags
+        // that happen to break JS parsing (the exact class of real
+        // bug found on this feature), this actually extracts *every*
+        // <script> block from a real, full layout's own generated
+        // HTML and validates each with `node --check`, a real JS
+        // parser -- catching this whole class of bug regardless of
+        // what causes it, not just the one specific tag that
+        // triggered the real report. Skips gracefully (rather than
+        // failing) if `node` isn't available in this environment,
+        // since this is a genuinely stronger *additional* check, not
+        // the only test covering this -- CI/dev environments without
+        // node shouldn't lose an otherwise-unrelated test run over it.
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("skipping: node not available in this environment");
+            return;
+        }
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_node_check");
+        let mut pos = 0;
+        let mut checked = 0;
+        while let Some(start_rel) = html[pos..].find("<script") {
+            let start = pos + start_rel;
+            let tag_end = html[start..].find('>').expect("script tag must close") + start + 1;
+            let end = html[tag_end..].find("</script>").expect("script must be closed") + tag_end;
+            let body = &html[tag_end..end];
+            let path = std::env::temp_dir().join(format!(
+                "arexibo_node_check_{}_{}_{checked}.js",
+                std::process::id(), std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            fs::write(&path, body).unwrap();
+            let output = std::process::Command::new("node").arg("--check").arg(&path)
+                .output().expect("running node --check");
+            assert!(output.status.success(),
+                    "script block #{checked} is not valid JS: {}\n--- body ---\n{body}",
+                    String::from_utf8_lossy(&output.stderr));
+            let _ = fs::remove_file(&path);
+            pos = end + "</script>".len();
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected to find and check several script blocks \
+                                (regions, drawer, actions, footer) -- only found {checked}, \
+                                the extraction logic itself may be broken");
+    }
+
+    #[test]
+    fn navwidgetfromdrawer_calls_duration_as_a_function_not_a_raw_value() {
+        // Regression test for a real report: the trigger fired
+        // correctly (window.arexibo.triggers[...] was registered and
+        // called navWidgetFromDrawer with the right arguments -- the
+        // earlier bug this whole feature already fixed), yet still
+        // visibly did nothing. Root cause: drawerWidgets[mid]'s own
+        // third element is a `() => N` function (same shape as a
+        // normal region item's own media[cur][2], see region_switch's
+        // own `media[next][2]()` call) -- the shared runtime JS's own
+        // navWidgetFromDrawer treated it as a raw number instead,
+        // making its own computed setTimeout delay come out NaN
+        // (a function times 1000) -- clamped by the browser to ~0, so
+        // the widget swapped in and back out again within
+        // milliseconds, imperceptibly fast.
+        //
+        // This can only be checked at the level of the *shared*
+        // runtime JS text itself (not per-layout translated output,
+        // which never repeats this function's own body) -- confirms
+        // duration is actually *invoked* (parenthesized call), not
+        // just referenced as a bare identifier.
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_duration_call");
+        assert!(html.contains("duration() || 1"),
+                "navWidgetFromDrawer must call duration() as a function -- it's a \
+                 `() => N` expression, not a raw number, same as every normal region \
+                 item's own third array element");
+    }
+
+    #[test]
+    fn a_normal_navwidget_action_targeting_a_real_region_widget_is_unaffected() {
+        // Regression safety: the original, already-working case (a
+        // navWidget action targeting a widget that's genuinely part
+        // of a normal region, resolved via widget_regions) must keep
+        // working exactly as before -- this feature only *adds* a
+        // fallback for the drawer case, never changes the existing
+        // resolution path.
+        let xlf = r#"<layout width="1080" height="1920">
+            <action target="screen" source="layout" actionType="navWidget"
+                    triggerType="webhook" triggerCode="show2" id="1" widgetId="101"/>
+            <region id="1" left="0" top="0" width="1080" height="1920">
+                <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
+                <media id="101" type="image" duration="5"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf, &HashMap::new(), "drawer_normal_navwidget");
+        assert!(html.contains(r#"window.arexibo.triggers["show2"]"#));
+        assert!(html.contains("window.arexibo.navWidget(1, 1)"),
+                "widget 101 is the second (index 1) item in region 1 -- must still \
+                 resolve via widget_regions, not be mistaken for a drawer widget");
+        assert!(!html.contains("window.arexibo.navWidgetFromDrawer("),
+                "must not go anywhere near the drawer fallback for a genuinely \
+                 normal region widget (navWidgetFromDrawer is always *defined* in the \
+                 shared runtime JS regardless -- this checks for an actual *call*)");
+    }
+
+    #[test]
+    fn an_action_targeting_a_genuinely_unknown_widget_id_is_dropped_and_logged() {
+        // Neither a region widget nor a drawer widget -- must still
+        // fail closed (the action is silently dropped, logged, see
+        // translate()'s own error handling) rather than somehow
+        // succeeding or panicking.
+        let xlf = r#"<layout width="1080" height="1920">
+            <action target="screen" source="layout" actionType="navWidget"
+                    triggerType="webhook" triggerCode="ghost" id="1" widgetId="99999"/>
+            <region id="1" left="0" top="0" width="1080" height="1920">
+                <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf, &HashMap::new(), "drawer_unknown_widget");
+        assert!(!html.contains(r#"window.arexibo.triggers["ghost"]"#),
+                "an action targeting a genuinely nonexistent widget id must not \
+                 register any trigger at all");
     }
 }
 

@@ -314,7 +314,7 @@ impl ZmqConnector {
     }
 
     fn connect(channel: &str, uri: &str) -> Result<ZmqSubSocket> {
-        let mut socket = ZmqSubSocket::connect(uri).context("connecting XMR socket")?;
+        let mut socket = ZmqSubSocket::connect(uri, READ_TMO).context("connecting XMR socket")?;
         socket.subscribe(channel.as_bytes())?;
         socket.subscribe(HEARTBEAT.as_bytes())?;
         Ok(socket)
@@ -506,7 +506,7 @@ fn decrypt_private_key(enc_key: &[u8], private_key: &RsaPrivateKey) -> Result<Ve
 /// than propagating that as a genuine failure. See
 /// `connect_retrying_eintr`'s own doc comment for the full context of
 /// why this is needed.
-fn retry_on_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+pub(crate) fn retry_on_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     loop {
         match f() {
             Ok(v) => return Ok(v),
@@ -523,7 +523,7 @@ fn retry_on_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Resu
 /// syscall is interrupted by a signal (EINTR) -- std does not
 /// auto-retry EINTR for "trivial" single-syscall wrappers like
 /// TcpStream::connect (confirmed via Rust's own internals discussion).
-fn connect_retrying_eintr<A: std::net::ToSocketAddrs>(addr: A) -> std::io::Result<TcpStream> {
+pub(crate) fn connect_retrying_eintr<A: std::net::ToSocketAddrs>(addr: A) -> std::io::Result<TcpStream> {
     retry_on_eintr(|| TcpStream::connect(&addr))
 }
 
@@ -583,12 +583,12 @@ fn describe_close(frame: &Option<tungstenite::protocol::CloseFrame>) -> String {
     }
 }
 
-struct ZmqSubSocket(TcpStream);
+pub(crate) struct ZmqSubSocket(TcpStream);
 
 /// Implementation of ZMTP as far as we need it for XMR. We don't want to pull in the
 /// `zmq` crate since it is almost unmaintained.
 impl ZmqSubSocket {
-    fn connect(uri: &str) -> Result<Self> {
+    pub(crate) fn connect(uri: &str, read_timeout: std::time::Duration) -> Result<Self> {
         let rx = regex::Regex::new("tcp://([^:]*):([0-9]+)").context("invalid validation Regex")?;
         let caps = rx.captures(uri).context("invalid XMR connect URI")?;
         let host = caps.get(1).expect("present").as_str();
@@ -631,13 +631,19 @@ impl ZmqSubSocket {
             bail!("ZMTP READY command not understood");
         }
 
-        // now we're ready to receive frames, heartbeats come in 30s interval so use 40
-        // to detect dead connection
-        stream.set_read_timeout(Some(READ_TMO))?;
+        // now we're ready to receive frames -- the caller picks a
+        // timeout matching its own heartbeat cadence (XMR: 30s
+        // heartbeats, uses 40; Sync Group: 5s Sync messages, uses a
+        // much shorter one -- see syncgroup.rs's own call site) so a
+        // dead peer gets detected promptly, and so any `stop`-flag
+        // check tied to this read (like Sync Group's own Follower
+        // loop) doesn't block for far longer than that cadence
+        // actually requires.
+        stream.set_read_timeout(Some(read_timeout))?;
         Ok(Self(stream))
     }
 
-    fn subscribe(&mut self, topic: &[u8]) -> Result<()> {
+    pub(crate) fn subscribe(&mut self, topic: &[u8]) -> Result<()> {
         let mut msg = Vec::with_capacity(3 + topic.len());
         msg.push(0);  // single-frame message, short length
         msg.push(1 + topic.len() as u8);  // length of msg
@@ -647,7 +653,7 @@ impl ZmqSubSocket {
         Ok(())
     }
 
-    fn recv_frame(&mut self) -> Result<(Vec<u8>, bool)> {
+    pub(crate) fn recv_frame(&mut self) -> Result<(Vec<u8>, bool)> {
         // BUG fix: same EINTR gap as connect_retrying_eintr/process_msg's
         // WebSocket read above, just for this hand-rolled ZMTP frame
         // reader's own direct read_u8/read_u64/read_exact calls on the

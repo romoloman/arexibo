@@ -19,6 +19,7 @@ pub mod stats;
 pub mod criteria;
 pub mod faults;
 pub mod adspace;
+pub mod syncgroup;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

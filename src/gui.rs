@@ -173,6 +173,12 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                     let code = CString::new(format!(
                         "if (window.arexibo.triggers[{escaped}]) window.arexibo.triggers[{escaped}]();"
                     )).unwrap();
+                    // Same reasoning as the matching log in
+                    // mainloop.rs's own handle_trigger_code -- rare
+                    // event, negligible noise, genuinely useful for
+                    // confirming the GUI thread actually received and
+                    // attempted this.
+                    log::info!("GUI thread: running trigger JS for {trigger_code:?}: {code:?}");
                     unsafe {
                         cpp::run_js(code.as_ptr());
                     }

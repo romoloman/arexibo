@@ -11,8 +11,8 @@ use rand::rngs::OsRng;
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey}};
 use subprocess::Popen;
 use time::OffsetDateTime;
-use crate::config::{ArexiboMeta, CmsSettings, PlayerSettings};
-use crate::{logger, schedule, server, util, xmds, xmr};
+use crate::config::{ArexiboMeta, CmsSettings, PlayerSettings, SyncRole};
+use crate::{logger, schedule, server, syncgroup, util, xmds, xmr};
 use crate::resource::{Cache, ReqFile};
 use crate::faults;
 use crate::schedule::Schedule;
@@ -144,6 +144,43 @@ pub struct Handler {
     /// replace the normal schedule, it's shown on top of it. Cleared by
     /// its own expiry timer (see `run()`) or by `revertToSchedule`.
     overlay_layout: Option<i64>,
+    /// Sync Group (video wall) LAN command channel -- see syncgroup.rs's
+    /// own module doc comment. `None` whenever `settings.sync_role` is
+    /// `SyncRole::None` (the overwhelmingly common case: not part of
+    /// any Sync Group). Kept up to date by `update_sync_group`.
+    sync_group: Option<syncgroup::SyncGroup>,
+    /// The `sync_role` that `sync_group` (if any) was actually built
+    /// from -- compared against `settings.sync_role` in
+    /// `update_sync_group` to avoid tearing down and rebuilding a
+    /// perfectly good connection (losing a Follower's own tracked
+    /// clock offset, and briefly missing any Command published during
+    /// the gap) on every unrelated settings change. A role *kind*
+    /// change (None/Lead/Follower switching) is already caught earlier
+    /// in `collect_once`, forcing a full process restart before this
+    /// is ever reached with a different kind -- so in practice, this
+    /// only actually differs (and triggers a real rebuild) when a
+    /// Follower's own `lead_addr` changes while staying a Follower.
+    sync_group_role: SyncRole,
+    /// A Follower's own incoming, already offset-corrected SyncCommands
+    /// -- `never()` whenever this display isn't currently a Sync Group
+    /// Follower (matching every other "currently inactive"
+    /// timer/channel in this struct, e.g. `overlay_expiry`), so this
+    /// select! arm simply stays permanently idle in that case.
+    sync_commands: Receiver<syncgroup::SyncCommand>,
+    /// The layout id from the most recently received Sync Group
+    /// Command, waiting to actually be applied once `sync_apply_timer`
+    /// fires -- see that field's own doc comment for why this isn't
+    /// applied immediately on receipt.
+    pending_sync_layout: Option<i64>,
+    /// Fires at the *local* instant (already offset-corrected --
+    /// `SyncCommand::target_local`) of the most recently received Sync
+    /// Group Command -- deliberately not applied to `override_layout`
+    /// until this fires, so every display in the group switches at
+    /// approximately the same real-world moment rather than as soon as
+    /// each one individually happens to receive the message (network
+    /// latency/jitter between the Lead and each Follower would
+    /// otherwise directly show up as a visible desync).
+    sync_apply_timer: Receiver<std::time::Instant>,
     /// Proof of Play accumulator (layout-level records only, see
     /// stats.rs). Flushed to the CMS at the end of every collection.
     stats: StatCollector,
@@ -468,6 +505,9 @@ impl Handler {
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
+                                 sync_group: None, sync_group_role: SyncRole::None,
+                                 sync_commands: never(), pending_sync_layout: None,
+                                 sync_apply_timer: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
@@ -512,6 +552,9 @@ impl Handler {
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
+                                 sync_group: None, sync_group_role: SyncRole::None,
+                                 sync_commands: never(), pending_sync_layout: None,
+                                 sync_apply_timer: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
                                  dataupdate_retry_queue: Vec::new(),
@@ -658,6 +701,32 @@ impl Handler {
                         log::info!("Scheduled Action's override layout duration elapsed -- \
                                     reverting to normal schedule");
                         self.override_expiry = never();
+                        self.schedule_check();
+                    }
+                },
+                // A Sync Group Follower's own incoming, already
+                // offset-corrected Command -- see sync_apply_timer's
+                // own doc comment for why this is staged rather than
+                // applied immediately.
+                recv(self.sync_commands) -> cmd => if let Ok(cmd) = cmd {
+                    let now = OffsetDateTime::now_local().unwrap();
+                    let delay = (cmd.target_local - now).max(time::Duration::ZERO).unsigned_abs();
+                    log::info!("Sync Group: received Command for layout {} -- applying \
+                                in {delay:?}", cmd.layout_id);
+                    self.pending_sync_layout = Some(cmd.layout_id);
+                    self.sync_apply_timer = after(delay);
+                },
+                // The staged Sync Group Command's own target instant
+                // has arrived -- actually switch now, at (as close as
+                // this process's own timer/scheduling precision
+                // allows) the same real-world moment every other
+                // display in the group does too.
+                recv(self.sync_apply_timer) -> _ => {
+                    if let Some(layout_id) = self.pending_sync_layout.take() {
+                        log::info!("Sync Group: applying synchronized layout switch to \
+                                    {layout_id}");
+                        self.override_layout = Some(layout_id);
+                        self.sync_apply_timer = never();
                         self.schedule_check();
                     }
                 },
@@ -1443,6 +1512,15 @@ impl Handler {
         if new_layouts != self.layouts {
             let all_layouts = new_layouts.iter().format(", ").to_string();
             log::info!("new layouts in schedule: {}", all_layouts);
+            // A no-op for a Follower's own SyncGroup (publish_layout's
+            // own doc comment), or when self.sync_group is None --
+            // safe to call unconditionally here. Publishes the first
+            // (primary) of possibly several equally-eligible layouts,
+            // matching what the GUI is about to actually navigate to
+            // first.
+            if let (Some(sync_group), Some(&first)) = (&self.sync_group, new_layouts.first()) {
+                sync_group.publish_layout(first);
+            }
             self.to_gui.send(ToGui::Layouts(new_layouts.clone())).unwrap();
             self.layouts = new_layouts;
         }
@@ -1535,9 +1613,63 @@ impl Handler {
         // No matching Scheduled Action -- fall back to the older,
         // narrower in-page widget-embedded action mechanism
         // (window.arexibo.triggers[code], see layout.rs's own
-        // write_action / TriggerRequest's own doc comment).
+        // write_action / TriggerRequest's own doc comment). Logged at
+        // info level -- trigger events are inherently rare (webhook-
+        // driven), so this adds negligible noise, and proved genuinely
+        // useful diagnosing a real report where nothing downstream
+        // (not even a console.warn) ever fired, letting this line
+        // alone confirm the Rust side was dispatching correctly.
+        log::info!("Trigger {code:?}: no Scheduled Action matched -- forwarding to \
+                    the GUI thread for the in-page widget-embedded mechanism");
         self.to_gui.send(ToGui::Trigger(code.to_string())).unwrap();
         false
+    }
+
+    /// (Re)builds the Sync Group (video wall) LAN command channel to
+    /// match the CMS's current `sync_role`/`sync_publisher_port` --
+    /// see `sync_group_role`'s own doc comment for why a no-op most of
+    /// the time is the correct, expected behavior. Called from
+    /// `update_settings`, so this runs both on initial registration
+    /// and on any later collection cycle where the CMS's settings
+    /// changed.
+    fn update_sync_group(&mut self) {
+        if self.settings.sync_role == self.sync_group_role {
+            return;
+        }
+        self.sync_group_role = self.settings.sync_role.clone();
+        match &self.settings.sync_role {
+            SyncRole::None => {
+                if self.sync_group.take().is_some() {
+                    log::info!("Sync Group: no longer a member -- stopping the LAN \
+                                command channel");
+                }
+                self.sync_commands = never();
+            }
+            SyncRole::Lead => {
+                log::info!("Sync Group: starting as Lead, listening on port {}",
+                            self.settings.sync_publisher_port);
+                match syncgroup::SyncGroup::start_lead(self.settings.sync_publisher_port) {
+                    Ok(g) => self.sync_group = Some(g),
+                    Err(e) => log::error!("Sync Group: starting as Lead: {e:#}"),
+                }
+                self.sync_commands = never();
+            }
+            SyncRole::Follower { lead_addr } => {
+                let addr = format!("{lead_addr}:{}", self.settings.sync_publisher_port);
+                log::info!("Sync Group: starting/reconnecting as Follower, Lead at {addr}");
+                match syncgroup::SyncGroup::start_follower(addr) {
+                    Ok(g) => {
+                        self.sync_commands = g.commands()
+                            .expect("a Follower's own commands() is always Some").clone();
+                        self.sync_group = Some(g);
+                    }
+                    Err(e) => {
+                        log::error!("Sync Group: starting as Follower: {e:#}");
+                        self.sync_commands = never();
+                    }
+                }
+            }
+        }
     }
 
     /// Re-evaluate schedule-driven Overlay Layouts (schedule.rs's
@@ -1780,6 +1912,12 @@ impl Handler {
         // migration below, and reuses the same validate_new_cms
         // helper. If this succeeds it exits the process too.
         self.attempt_https_upgrade()?;
+
+        // (Re)builds the Sync Group LAN command channel to match the
+        // CMS's current sync_role -- see update_sync_group's own doc
+        // comment for why this is safe to call unconditionally here
+        // (a no-op when nothing actually changed).
+        self.update_sync_group();
 
         // CMS-driven migration to a different server (see
         // new_cms_address/new_cms_key's own doc comment in config.rs)
