@@ -1613,13 +1613,12 @@ impl Handler {
         // No matching Scheduled Action -- fall back to the older,
         // narrower in-page widget-embedded action mechanism
         // (window.arexibo.triggers[code], see layout.rs's own
-        // write_action / TriggerRequest's own doc comment). Logged at
-        // info level -- trigger events are inherently rare (webhook-
-        // driven), so this adds negligible noise, and proved genuinely
-        // useful diagnosing a real report where nothing downstream
-        // (not even a console.warn) ever fired, letting this line
-        // alone confirm the Rust side was dispatching correctly.
-        log::info!("Trigger {code:?}: no Scheduled Action matched -- forwarding to \
+        // write_action / TriggerRequest's own doc comment). Kept as a
+        // permanent debug-level log -- proved genuinely useful
+        // diagnosing a real report where nothing downstream (not even
+        // a console.warn) ever fired, letting this line alone confirm
+        // the Rust side was dispatching correctly.
+        log::debug!("Trigger {code:?}: no Scheduled Action matched -- forwarding to \
                     the GUI thread for the in-page widget-embedded mechanism");
         self.to_gui.send(ToGui::Trigger(code.to_string())).unwrap();
         false
@@ -4445,14 +4444,13 @@ mod data_refresh_timer_tests {
         dir
     }
 
-    // Only what's actually reachable via the public Handler/Cache API
-    // today (XMDS_ENDPOINT_VERSION hardcoded to 5, see xmds.rs) is
-    // testable from here -- no data widget can ever get tracked via
-    // the real download() path in this build, so these two tests
-    // confirm the v5 safety property at the mainloop integration
-    // level, complementing resource.rs's own more detailed tests of
-    // Cache's refresh/expiry logic directly (which bypass the gate to
-    // test that logic on its own merits).
+    // These two tests use a minimal "READY" mock with no actual data
+    // widget content flowing through it at all -- nothing is ever
+    // tracked here regardless of XMDS_ENDPOINT_VERSION/the gate's own
+    // state (see xmds.rs), so they stay valid whether the gate is
+    // open or closed. Complements resource.rs's own more detailed
+    // tests of Cache's refresh/expiry logic directly (which construct
+    // real tracked widgets to test that logic on its own merits).
 
     #[test]
     fn rearm_leaves_the_timer_disarmed_when_nothing_is_tracked() {

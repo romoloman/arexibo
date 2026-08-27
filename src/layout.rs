@@ -16,7 +16,7 @@ use crate::util::{ElementExt, percent_decode};
 // - overriding duration from resources
 // - fromDt/toDt
 
-pub const TRANSLATOR_VERSION: u32 = 29;
+pub const TRANSLATOR_VERSION: u32 = 30;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -216,7 +216,17 @@ window.arexibo = {
     if (action == 'navLayout') {
       window.arexiboGui.jsLayoutJump(window.arexibo.id, layoutid);
     } else if (action == 'previous' || action == 'next') {
-      if (target == 'layout') {
+      // "screen" is a synonym for "layout" here (whole-layout level
+      // next/previous, as opposed to a specific region) -- confirmed
+      // real from two independent XLF actions: both used
+      // target="screen", and in both cases targetId matched the
+      // *layout's own* id (not any real region id in that layout at
+      // all) -- calling region_switch(layoutId, ...) on that (the
+      // previous, "screen" falls into the else/region branch below)
+      // would look up a nonexistent this.regions[layoutId], throwing
+      // when region_switch tries to destructure it -- matching a real
+      // report of these actions "not working" at all.
+      if (target == 'layout' || target == 'screen') {
         if (action == 'next')
           window.arexiboGui.jsLayoutDone(window.arexibo.id);
         else
@@ -2255,6 +2265,82 @@ mod action_tests {
         let mut html = String::new();
         fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         assert!(html.contains("performAction(\"navLayout\", \"screen\", 0, 999)"));
+    }
+
+    #[test]
+    fn real_next_action_from_user_report_routes_to_layout_level_advance() {
+        // Regression test for a real report: "next"/"previous" touch
+        // actions "don't seem to work" -- confirmed real from two
+        // independent XLF actions the user shared (1006.xlf, 1008.xlf):
+        // both used target="screen", with targetId matching the
+        // *layout's own* id (1006/1008), not any real region id in
+        // that layout at all.
+        //
+        // The generated call itself (checked here) was never the
+        // problem -- write_action already correctly passed "screen"
+        // and the targetId through unconditionally, regardless of
+        // their meaning. The actual bug was entirely inside the
+        // *shared runtime* performAction function's own handling of
+        // target=="screen" (see
+        // performAction_treats_screen_as_a_synonym_for_layout below)
+        // -- this test only confirms the call-generation side stayed
+        // correct throughout.
+        let xlf = r#"<layout width="1080" height="1920">
+            <action layoutCode="numeriutilitest" target="screen" source="widget"
+                    actionType="next" triggerType="touch" triggerCode="apri_home"
+                    id="823" targetId="1006" sourceId="4802"/>
+            <region id="4782" left="651" top="1621" width="240" height="255">
+                <media id="4802" type="text" duration="5"><options></options></media>
+            </region>
+        </layout>"#;
+        let dir = std::env::temp_dir().join(format!("arexibo_action_next_screen_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let empty_map = HashMap::new();
+        let t = Translator::new(1, &xlf_path, &html_path, &empty_map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
+        assert!(html.contains("performAction(\"next\", \"screen\", 1006, 0)"));
+    }
+
+    #[test]
+    fn performaction_treats_screen_as_a_synonym_for_layout() {
+        // The actual bug and its fix, verified directly against the
+        // *shared runtime* JS source (not per-layout generated output,
+        // which never repeats this function's own body) -- any
+        // minimal layout produces the same shared runtime JS, so this
+        // doesn't need the real 1006/1008.xlf specifically. Before the
+        // fix, only target=='layout' routed to jsLayoutDone/
+        // jsLayoutPrev (whole-layout advance) -- any other value,
+        // including the real "screen" confirmed above, fell into the
+        // region_switch(targetid, ...) branch instead, looking up
+        // this.regions[targetid] where targetid is actually the
+        // *layout's own* id -- a lookup that finds nothing, and
+        // region_switch destructuring `undefined` throws.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="1080" height="1920">
+                <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let dir = std::env::temp_dir().join(format!("arexibo_performaction_screen_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let empty_map = HashMap::new();
+        let t = Translator::new(1, &xlf_path, &html_path, &empty_map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
+        assert!(html.contains("target == 'layout' || target == 'screen'"),
+                "performAction must treat 'screen' as a synonym for 'layout' for \
+                 next/previous actions -- otherwise a real action using \
+                 target=\"screen\" (confirmed real, not a hypothetical) with a \
+                 targetId that's actually the layout's own id (not a region id) \
+                 ends up calling region_switch on a nonexistent region, throwing");
     }
 }
 

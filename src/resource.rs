@@ -1579,23 +1579,29 @@ mod data_widget_polling_tests {
         assert!(cache.data_widgets_due(Instant::now()).is_empty());
     }
 
-    // This is the test that actually matters for today's real-world
-    // safety: confirms the production code path (download, not
-    // discover_data_widgets directly) does NOT start tracking anything
-    // right now, because XMDS_ENDPOINT_VERSION is hardcoded to 5. If
-    // this test ever starts failing on its own (without the version
-    // constant having been deliberately bumped), that's a sign the
-    // gate in `download` got removed or broken.
+    // This is the test that actually matters for real-world safety:
+    // confirms the production code path (download, not
+    // discover_data_widgets directly) correctly starts tracking a v7-
+    // shaped widget now that XMDS_ENDPOINT_VERSION is 7 (bumped from
+    // 5, per the user's own explicit request, once the GetData
+    // integration below was confirmed solid against a real CMS). This
+    // used to assert the opposite (gate closed, nothing tracked) while
+    // still on v5 -- inverted here rather than left in its old form,
+    // since testing "the gate stays closed" is no longer a meaningful
+    // invariant for our actual, current configuration. If this test
+    // ever starts failing on its own (without the version constant
+    // having been deliberately lowered again), that's a sign the gate
+    // in `download` got removed or broken.
     #[test]
-    fn download_does_not_discover_data_widgets_while_the_version_gate_is_closed() {
+    fn download_discovers_data_widgets_now_that_the_version_gate_is_open() {
         let (mut cache, _dir) = make_cache();
         let mut cms = make_cms_with_mock_getresource(V7_WIDGET_HTML);
         let req = ReqFile::Resource { id: 1, layoutid: 940, regionid: 4542, mediaid: 4543,
                                        updated: 0 };
         cache.download(req, &mut cms).unwrap();
-        assert!(cache.data_widgets_due(Instant::now()).is_empty(),
-                "nothing should be tracked via the real download() path while \
-                 xmds_supports_v6_v7_methods() is false");
+        assert!(!cache.data_widgets_due(Instant::now()).is_empty(),
+                "the real download() path must start tracking a v7-shaped widget \
+                 now that xmds_supports_v6_v7_methods() is true");
     }
 
     // The following tests cover files[] (see GetData's own real shape,
