@@ -13,6 +13,65 @@ use rustls_pki_types::CertificateDer;
 use crate::command::Command;
 use crate::util::fingerprint;
 
+/// A display's own Sync Group (video wall) role -- confirmed from two
+/// real register.xml captures (a lead and a follower in the same
+/// group), not guessed: the CMS's own `<syncGroup>` element is a
+/// single string with three possible shapes, not a separate group-id
+/// + leader-boolean pair as might be assumed from the CMS admin UI's
+/// own "Sync Groups" terminology:
+/// - absent/empty: not part of any Sync Group (the overwhelmingly
+///   common case)
+/// - the literal string "lead": this display IS the Lead
+/// - any other value: this display is a Follower, and the value IS
+///   the Lead's own LAN IP address to connect to directly (confirmed:
+///   `<syncGroup>192.168.1.235</syncGroup>` on a real Follower, that
+///   real IP address, not a group identifier of any kind) -- see
+///   syncgroup.rs's own module doc comment for what a Follower does
+///   with this.
+///
+/// Notably, this means the player itself never learns or needs its
+/// own "group id" at all -- group membership bookkeeping stays
+/// entirely CMS-side; the player only ever sees "am I the Lead, or
+/// here's my Lead's address" for whichever single group (a display
+/// can only belong to one at a time, confirmed by the CMS's own
+/// manual) it's currently in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SyncRole {
+    #[default]
+    None,
+    Lead,
+    Follower { lead_addr: String },
+}
+
+impl SyncRole {
+    pub fn parse(raw: &str) -> Self {
+        if raw.is_empty() {
+            SyncRole::None
+        } else if raw.eq_ignore_ascii_case("lead") {
+            SyncRole::Lead
+        } else {
+            SyncRole::Follower { lead_addr: raw.to_string() }
+        }
+    }
+
+    /// Whether `self` and `other` are the same *kind* of role (both
+    /// None, both Lead, or both Follower), ignoring a Follower's own
+    /// `lead_addr`. Used to decide what a role change requires: None/
+    /// Lead/Follower switching kind needs a completely different
+    /// network setup (nothing / listening / connecting), which isn't
+    /// safe to do live (same reasoning as the embedded webserver's own
+    /// port/WAN-access change, see RestartRequired's own doc comment
+    /// in mainloop.rs) -- a full process restart. A Follower whose
+    /// `lead_addr` simply changes (e.g. the CMS reassigns which
+    /// display is the Lead) stays a Follower the whole time, and
+    /// doesn't need a restart at all -- just reconnecting to the new
+    /// address (left as a TODO for the actual sync channel
+    /// implementation, not yet built).
+    pub fn is_same_role_kind(&self, other: &SyncRole) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlayerSettings {
     #[serde(default = "default_collect_interval")]
@@ -149,6 +208,30 @@ pub struct PlayerSettings {
     // configured, so only gated by enable_shell_commands itself).
     #[serde(default)]
     pub shell_command_allow_list: String,
+    // Sync Group / video wall membership -- see SyncRole's own doc
+    // comment for the confirmed real shape of the underlying
+    // `<syncGroup>` element. `#[serde(default)]` here means "not part
+    // of any Sync Group" if the CMS omits the element, matching
+    // today's behavior for every display until this was added.
+    #[serde(default)]
+    pub sync_role: SyncRole,
+    // Confirmed real default from two independent register.xml
+    // captures (a real Lead and a real Follower, same CMS) -- also
+    // matches the CMS's own documented default ("This is defaulted to
+    // 9590"). The port a Follower connects to the Lead on.
+    #[serde(default = "default_sync_publisher_port")]
+    pub sync_publisher_port: u16,
+    // Milliseconds. Confirmed real value from both captures (750 on
+    // both) -- not independently confirmed as a deliberately-tuned
+    // per-group setting vs. simply this CMS's own global default, but
+    // a sensible fallback regardless since it's only ever meaningful
+    // when sync_role isn't None.
+    #[serde(default = "default_sync_switch_delay")]
+    pub sync_switch_delay: u64,
+    // Milliseconds. Same provenance/caveat as sync_switch_delay (100
+    // on both real captures).
+    #[serde(default = "default_sync_video_pause_delay")]
+    pub sync_video_pause_delay: u64,
 }
 
 /// Manual `Default` impl -- deliberately *not* derived. A derived
@@ -202,6 +285,10 @@ impl Default for PlayerSettings {
             commands: HashMap::new(),
             enable_shell_commands: false,
             shell_command_allow_list: String::new(),
+            sync_role: SyncRole::None,
+            sync_publisher_port: default_sync_publisher_port(),
+            sync_switch_delay: default_sync_switch_delay(),
+            sync_video_pause_delay: default_sync_video_pause_delay(),
         }
     }
 }
@@ -252,6 +339,10 @@ impl fmt::Debug for PlayerSettings {
             .field("commands", &self.commands)
             .field("enable_shell_commands", &self.enable_shell_commands)
             .field("shell_command_allow_list", &self.shell_command_allow_list)
+            .field("sync_role", &self.sync_role)
+            .field("sync_publisher_port", &self.sync_publisher_port)
+            .field("sync_switch_delay", &self.sync_switch_delay)
+            .field("sync_video_pause_delay", &self.sync_video_pause_delay)
             .finish()
     }
 }
@@ -399,6 +490,9 @@ fn default_true() -> bool { true }
 fn default_log_level() -> String { "debug".into() }
 fn default_embedded_server_port() -> u16 { 9696 }
 fn default_display_name() -> String { "Xibo".into() }
+fn default_sync_publisher_port() -> u16 { 9590 }
+fn default_sync_switch_delay() -> u64 { 750 }
+fn default_sync_video_pause_delay() -> u64 { 100 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CmsSettings {
@@ -581,12 +675,34 @@ mod tests {
             "embedded_server_allow_wan",
             "prevent_sleep", "display_name", "size_x", "size_y", "pos_x", "pos_y",
             "commands", "enable_shell_commands", "shell_command_allow_list",
+            "sync_role", "sync_publisher_port", "sync_switch_delay",
+            "sync_video_pause_delay",
         ] {
             assert!(debug_output.contains(field),
                     "field {field:?} missing from PlayerSettings's own hand-written \
                      Debug impl -- it exists on the struct but won't show up in the \
                      real debug logs arexibo prints on every collection cycle");
         }
+    }
+
+    #[test]
+    fn sync_role_parses_the_three_confirmed_real_shapes() {
+        // Confirmed from two real register.xml captures (a real Lead
+        // and a real Follower in the same Sync Group, same CMS) --
+        // see SyncRole's own doc comment.
+        assert_eq!(SyncRole::parse(""), SyncRole::None);
+        assert_eq!(SyncRole::parse("lead"), SyncRole::Lead);
+        assert_eq!(SyncRole::parse("192.168.1.235"),
+                   SyncRole::Follower { lead_addr: "192.168.1.235".into() });
+    }
+
+    #[test]
+    fn sync_role_lead_match_is_case_insensitive() {
+        // Not independently confirmed either way against a real CMS
+        // response using different casing -- deliberately tolerant
+        // rather than depending on exact casing matching forever.
+        assert_eq!(SyncRole::parse("Lead"), SyncRole::Lead);
+        assert_eq!(SyncRole::parse("LEAD"), SyncRole::Lead);
     }
 
     fn test_cms(address: &str) -> CmsSettings {

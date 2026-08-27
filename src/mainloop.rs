@@ -973,6 +973,17 @@ impl Handler {
             // RestartRequired's own doc comment), unlike every other
             // setting here, which collect_once can just apply directly
             // in place.
+            //
+            // Same reasoning for a Sync Group *role* change (see
+            // SyncRole::is_same_role_kind's own doc comment) -- None,
+            // Lead, and Follower each need a fundamentally different
+            // network setup once the actual sync channel exists
+            // (nothing / listening / connecting), not something safe
+            // to reconfigure live. A Follower's own lead_addr simply
+            // changing (same role, different address to connect to)
+            // deliberately does NOT trigger this -- that's a
+            // reconnect, not a restart, left for the sync channel's
+            // own implementation to handle once it exists.
             if settings.embedded_server_port != self.settings.embedded_server_port
                 || settings.embedded_server_allow_wan != self.settings.embedded_server_allow_wan {
                 log::warn!("embedded server port ({} -> {}) or WAN-access setting ({} -> {}) \
@@ -980,6 +991,12 @@ impl Handler {
                             fresh and picks it up",
                             self.settings.embedded_server_port, settings.embedded_server_port,
                             self.settings.embedded_server_allow_wan, settings.embedded_server_allow_wan);
+                return Err(RestartRequired.into());
+            }
+            if !settings.sync_role.is_same_role_kind(&self.settings.sync_role) {
+                log::warn!("Sync Group role changed ({:?} -> {:?}) mid-session -- exiting so \
+                            the supervisor restarts us fresh and picks it up",
+                            self.settings.sync_role, settings.sync_role);
                 return Err(RestartRequired.into());
             }
             if settings != self.settings {
@@ -1268,6 +1285,13 @@ impl Handler {
         // (Xibo issue #983).
         let system_tz = util::timezone();
         let reported_tz = timezone_to_report(&self.settings.display_time_zone, &system_tz);
+        // First local IP only (matching `hostname -I`'s own ordering,
+        // typically the primary/default-route interface) -- see
+        // Status::lanIpAddress's own doc comment for why this matters.
+        // `hostname -I` is best-effort (see get_local_ips's own doc
+        // comment); an empty result here just means the field gets
+        // omitted below, not sent as an empty string.
+        let local_ips = util::get_local_ips();
         let status = xmds::Status {
             currentLayoutId: self.current_layout,
             availableSpace: avail,
@@ -1275,6 +1299,7 @@ impl Handler {
             lastCommandSuccess: self.last_command_success.unwrap_or(true),
             deviceName: &self.settings.display_name,
             timeZone: &reported_tz,
+            lanIpAddress: local_ips.first().map(String::as_str),
         };
         if let Err(e) = self.xmds.notify_status(&status) {
             log::error!("sending status update: {e:#}");
@@ -2763,6 +2788,129 @@ mod port_change_forces_cache_purge_tests {
 }
 
 #[cfg(test)]
+mod version_change_forces_cache_purge_tests {
+    use super::*;
+    use crate::config::ArexiboMeta;
+
+    // A newer build may generate slightly different layout HTML/bundled
+    // assets (e.g. pdf.js) -- stale cached files from a previous version
+    // could still reflect the old version's own output. Same reasoning,
+    // same fix shape, as port_change_forces_cache_purge_tests above, but
+    // this check runs *before* any CMS interaction at all (right after
+    // Cache::new, inside Handler::new), so no mock needs to vary its own
+    // response across calls here -- a plain "always READY" mock is
+    // enough.
+
+    fn start_mock_ready() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "testkey".into(),
+                      display_id: "test-display".into(), display_name: None, proxy: None }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_version_change_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_changed_version_purges_the_cache() {
+        let envdir = test_envdir();
+
+        // Simulate a previous run on a different (older) version.
+        ArexiboMeta { version: "0.0.1-previous".into() }
+            .to_file(envdir.join("arexibo.json")).unwrap();
+        // A file that a previous run's own cache would have -- must be
+        // gone afterward, proving purge() actually ran.
+        std::fs::create_dir_all(envdir.join("res")).unwrap();
+        std::fs::write(envdir.join("res").join("leftover.html"), b"stale").unwrap();
+
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let _handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        assert!(!envdir.join("res").join("leftover.html").exists(),
+                "a changed Arexibo version must force a full cache purge -- cached \
+                 layout HTML/assets could still reflect the old version's own output");
+
+        // The meta file must now reflect the *current* version, so a
+        // subsequent same-version run doesn't purge again.
+        let written = ArexiboMeta::from_file(envdir.join("arexibo.json")).unwrap();
+        assert_eq!(written.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn an_unchanged_version_does_not_purge_the_cache() {
+        let envdir = test_envdir();
+
+        ArexiboMeta { version: env!("CARGO_PKG_VERSION").into() }
+            .to_file(envdir.join("arexibo.json")).unwrap();
+        std::fs::create_dir_all(envdir.join("res")).unwrap();
+        std::fs::write(envdir.join("res").join("leftover.html"), b"stale").unwrap();
+
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let _handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        assert!(envdir.join("res").join("leftover.html").exists(),
+                "an unchanged version must not purge the cache");
+    }
+
+    #[test]
+    fn a_first_ever_run_does_not_purge_and_writes_the_meta_file() {
+        let envdir = test_envdir();
+        // No arexibo.json at all -- genuinely first-ever run.
+        std::fs::create_dir_all(envdir.join("res")).unwrap();
+        std::fs::write(envdir.join("res").join("preexisting.html"), b"content").unwrap();
+
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let _handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        assert!(envdir.join("res").join("preexisting.html").exists(),
+                "a first-ever run (no prior arexibo.json) must not purge -- nothing \
+                 to compare against yet");
+        let written = ArexiboMeta::from_file(envdir.join("arexibo.json")).unwrap();
+        assert_eq!(written.version, env!("CARGO_PKG_VERSION"),
+                   "must still write the meta file, so the *next* run has something \
+                    to compare against");
+    }
+}
+
+#[cfg(test)]
 mod send_status_update_tests {
     use super::*;
 
@@ -2881,6 +3029,161 @@ mod send_status_update_tests {
         assert!(!requests.iter().any(|body| body.contains("4242")),
                 "must NOT send an immediate status update when the CMS setting \
                  disables it -- captured requests: {requests:?}");
+    }
+
+    #[test]
+    fn status_update_includes_the_own_lan_ip_address() {
+        // Xibo xibosignage/xibo#2863 ("Displays: add LAN IP address
+        // when available") -- confirmed real and meaningful from a
+        // real register.xml capture: a Sync Group Follower's own
+        // <syncGroup> element contains literally the Lead's own
+        // lanIpAddress value, relayed by the CMS. Never previously
+        // sent by arexibo at all.
+        let (port, captured) = start_mock_capturing_requests();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        handler.send_status_update();
+
+        let requests = captured.lock().unwrap();
+        assert!(requests.iter().any(|body| body.contains("lanIpAddress")),
+                "a status update must include lanIpAddress when a local IP is \
+                 determinable -- captured requests: {requests:?}");
+    }
+}
+
+#[cfg(test)]
+mod sync_role_change_forces_restart_tests {
+    use super::*;
+    use crate::config::SyncRole;
+
+    /// Returns `responses[N]` for the Nth call (0-indexed), clamped to
+    /// the last entry once past the end -- for simulating a
+    /// syncGroup value that changes *mid-session*, not just at the
+    /// very first registration.
+    fn start_mock_with_sync_group_sequence(responses: Vec<&'static str>) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for (n, request) in server.incoming_requests().enumerate() {
+                let idx = n.min(responses.len() - 1);
+                let sync_group = responses[idx];
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"&gt;&lt;syncGroup&gt;{sync_group}&lt;/syncGroup&gt;&lt;/ActivationMessage&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings { address: format!("http://127.0.0.1:{port}"), key: "testkey".into(),
+                      display_id: "test-display".into(), display_name: None, proxy: None }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_sync_role_change_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn none_to_lead_forces_a_restart() {
+        let port = start_mock_with_sync_group_sequence(vec!["", "lead"]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        assert_eq!(handler.settings.sync_role, SyncRole::None);
+
+        let err = handler.collect_once().expect_err(
+            "a Sync Group role change must return an error, not silently apply it");
+        assert!(err.root_cause().downcast_ref::<RestartRequired>().is_some());
+    }
+
+    #[test]
+    fn lead_to_follower_forces_a_restart() {
+        let port = start_mock_with_sync_group_sequence(vec!["lead", "192.168.1.235"]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        assert_eq!(handler.settings.sync_role, SyncRole::Lead);
+
+        let err = handler.collect_once().expect_err(
+            "a Sync Group role change must return an error, not silently apply it");
+        assert!(err.root_cause().downcast_ref::<RestartRequired>().is_some());
+    }
+
+    #[test]
+    fn lead_address_change_while_staying_a_follower_does_not_force_a_restart() {
+        // The key distinction from the tests above: same role kind
+        // (Follower both times), only the lead's own address changes
+        // (e.g. the CMS reassigns which display is the Lead) -- must
+        // NOT trigger a restart. Left for the actual sync channel
+        // implementation to handle as a reconnect once it exists (see
+        // SyncRole::is_same_role_kind's own doc comment).
+        let port = start_mock_with_sync_group_sequence(
+            vec!["192.168.1.235", "192.168.1.236"]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        assert_eq!(handler.settings.sync_role,
+                   SyncRole::Follower { lead_addr: "192.168.1.235".into() });
+
+        if let Err(e) = handler.collect_once() {
+            assert!(e.root_cause().downcast_ref::<RestartRequired>().is_none(),
+                    "a lead_addr change while staying a Follower must not be reported \
+                     as RestartRequired");
+        }
+        assert_eq!(handler.settings.sync_role,
+                   SyncRole::Follower { lead_addr: "192.168.1.236".into() },
+                   "the new address must still be applied");
+    }
+
+    #[test]
+    fn no_sync_role_change_does_not_force_a_restart() {
+        let port = start_mock_with_sync_group_sequence(vec!["lead", "lead"]);
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        if let Err(e) = handler.collect_once() {
+            assert!(e.root_cause().downcast_ref::<RestartRequired>().is_none(),
+                    "an unchanged Sync Group role must not be reported as RestartRequired");
+        }
     }
 }
 

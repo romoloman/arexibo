@@ -13,7 +13,7 @@ use std::{collections::HashMap, fs, path::PathBuf};
 use anyhow::{ensure, Context, Result};
 use elementtree::Element;
 use serde::Serialize;
-use crate::config::{CmsSettings, PlayerSettings};
+use crate::config::{CmsSettings, PlayerSettings, SyncRole};
 use crate::command::Command;
 use crate::util::{TIME_FMT, Base64Field, ElementExt, retrieve_mac, get_display_name};
 use crate::resource::ReqFile;
@@ -297,6 +297,14 @@ impl Cms {
                 // enabling arbitrary command execution.
                 enable_shell_commands: tree.def_child::<i32>("enableShellCommands", 0)? != 0,
                 shell_command_allow_list: tree.def_child("shellCommandAllowList", "")?,
+                // Confirmed real element names and shape from two
+                // independent register.xml captures (a real Lead and a
+                // real Follower in the same Sync Group, same CMS) --
+                // see SyncRole's own doc comment for the full reasoning.
+                sync_role: SyncRole::parse(&tree.def_child::<String>("syncGroup", String::new())?),
+                sync_publisher_port: tree.def_child("syncPublisherPort", 9590u16)?,
+                sync_switch_delay: tree.def_child("syncSwitchDelay", 750u64)?,
+                sync_video_pause_delay: tree.def_child("syncVideoPauseDelay", 100u64)?,
             }))
         }
     }
@@ -632,6 +640,26 @@ pub struct Status<'s> {
     pub lastCommandSuccess: bool,
     pub deviceName: &'s str,
     pub timeZone: &'s str,
+    // Own real LAN IP address, as opposed to whatever `clientAddress`
+    // the CMS itself observes from the XMDS connection -- the latter
+    // is only useful when the display reaches the CMS directly, and is
+    // otherwise NAT'd/proxied (e.g. a cloud-hosted CMS), unlike this
+    // field (Xibo xibosignage/xibo#2863: "Displays: add LAN IP address
+    // when available"). This matters specifically for a display that's
+    // the Lead of a Sync Group (video wall) -- the CMS relays this
+    // exact value to every Follower in the same group as the address
+    // to connect to directly on the LAN (see syncgroup.rs's own module
+    // doc comment, confirmed from a real register.xml capture: a
+    // Follower's own `<syncGroup>` element contains literally this
+    // string). `None` (omitted entirely, not sent as an empty string)
+    // when no local IP could be determined at all -- the CMS's own
+    // parsing (`getString('lanIpAddress', ['default' => $this->
+    // display->lanIpAddress])`) falls back to whatever value it
+    // already has stored when the field is missing, so omitting it
+    // here is a safe no-op rather than clobbering a previously-good
+    // value with nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lanIpAddress: Option<&'s str>,
     // pub latitude: f64,
     // pub longitude: f64,
 }
@@ -1120,6 +1148,93 @@ mod get_weather_tests {
         let mut cms = test_cms(port);
         let data = cms.get_weather().unwrap();
         assert_eq!(data, r#"{"temperature":25,"weather_condition":"clear"}"#);
+    }
+}
+
+#[cfg(test)]
+mod sync_group_parsing_tests {
+    use super::*;
+    use crate::config::SyncRole;
+
+    // Two real register.xml captures shared directly by the user: a
+    // Lead and a Follower in the same Sync Group, same CMS -- used
+    // verbatim (not reconstructed/simplified), including their real
+    // root element (`<display ...>`, matching the real Soap4.php
+    // source: `$displayElement = $return->createElement('display')`)
+    // rather than the `<ActivationMessage>` root the *other* tests in
+    // this file happen to use -- confirms our parser doesn't care what
+    // the root element is actually named, only its own attributes/
+    // children, matching the real wire format precisely for this case.
+
+    const REAL_LEAD_XML: &str = r#"<display date="2026-08-27 09:02:49" timezone="Europe/Rome" status="0" code="READY" message="Display is active and ready to start." version_instructions="" localTimezone="Europe/Rome" localDate="2026-08-27 09:02:49" checkSchedule="1734717998" checkRf="987824267"><collectInterval>305</collectInterval><downloadStartWindow>:</downloadStartWindow><downloadEndWindow>:</downloadEndWindow><xmrNetworkAddress>tcp://168.119.16.68:9505</xmrNetworkAddress><xmrWebSocketAddress>ws://168.119.16.68:8080</xmrWebSocketAddress><statsEnabled type="checkbox">1</statsEnabled><aggregationLevel type="string">Individual</aggregationLevel><sizeX>0</sizeX><sizeY>0</sizeY><offsetX>0</offsetX><offsetY>0</offsetY><logLevel>error</logLevel><elevateLogsUntil type="int">0</elevateLogsUntil><enableShellCommands type="checkbox">1</enableShellCommands><expireModifiedLayouts type="checkbox">1</expireModifiedLayouts><maxConcurrentDownloads>2</maxConcurrentDownloads><shellCommandAllowList/><sendCurrentLayoutAsStatusUpdate type="checkbox">1</sendCurrentLayoutAsStatusUpdate><screenShotRequestInterval>0</screenShotRequestInterval><screenShotSize>0</screenShotSize><maxLogFileUploads>3</maxLogFileUploads><embeddedServerPort>9696</embeddedServerPort><preventSleep type="checkbox">1</preventSleep><forceHttps type="checkbox">1</forceHttps><embeddedServerAllowWan type="checkbox">0</embeddedServerAllowWan><isRecordGeoLocationOnProofOfPlay type="checkbox">0</isRecordGeoLocationOnProofOfPlay><newCmsAddress/><newCmsKey/><displayName>totemlinux01</displayName><screenShotRequested type="checkbox">0</screenShotRequested><displayTimeZone>Europe/Rome</displayTimeZone><isAdspaceEnabled type="checkbox">0</isAdspaceEnabled><xmrType type="string">ws</xmrType><xmrCmsKey type="string">xmr_032379f704129794b965</xmrCmsKey><commands><TESTTOUCH><commandString><![CDATA[touch /tmp/xibo-command-test]]></commandString><validationString><![CDATA[]]></validationString><createAlertOn><![CDATA[never]]></createAlertOn></TESTTOUCH></commands><syncGroup>lead</syncGroup><syncPublisherPort>9590</syncPublisherPort><syncSwitchDelay>750</syncSwitchDelay><syncVideoPauseDelay>100</syncVideoPauseDelay></display>"#;
+
+    const REAL_FOLLOWER_XML: &str = r#"<display date="2026-08-27 09:06:57" timezone="Europe/Rome" status="0" code="READY" message="Display is active and ready to start." version_instructions="" localTimezone="Europe/Rome" localDate="2026-08-27 09:06:57" checkSchedule="2496328210" checkRf="1573506232"><collectInterval>296</collectInterval><downloadStartWindow>:</downloadStartWindow><downloadEndWindow>:</downloadEndWindow><xmrNetworkAddress>tcp://168.119.16.68:9505</xmrNetworkAddress><xmrWebSocketAddress>ws://168.119.16.68:8080</xmrWebSocketAddress><statsEnabled type="checkbox">0</statsEnabled><aggregationLevel type="string">Individual</aggregationLevel><sizeX>0</sizeX><sizeY>0</sizeY><offsetX>0</offsetX><offsetY>0</offsetY><logLevel>error</logLevel><elevateLogsUntil type="int">0</elevateLogsUntil><enableShellCommands type="checkbox">0</enableShellCommands><expireModifiedLayouts type="checkbox">0</expireModifiedLayouts><maxConcurrentDownloads>2</maxConcurrentDownloads><shellCommandAllowList/><sendCurrentLayoutAsStatusUpdate type="checkbox">1</sendCurrentLayoutAsStatusUpdate><screenShotRequestInterval>0</screenShotRequestInterval><screenShotSize>0</screenShotSize><maxLogFileUploads>3</maxLogFileUploads><embeddedServerPort>9696</embeddedServerPort><preventSleep type="checkbox">1</preventSleep><forceHttps type="checkbox">1</forceHttps><embeddedServerAllowWan type="checkbox">0</embeddedServerAllowWan><isRecordGeoLocationOnProofOfPlay type="checkbox">0</isRecordGeoLocationOnProofOfPlay><newCmsAddress/><newCmsKey/><displayName>totem-kss1al</displayName><screenShotRequested type="checkbox">0</screenShotRequested><displayTimeZone>Europe/Rome</displayTimeZone><isAdspaceEnabled type="checkbox">0</isAdspaceEnabled><xmrType type="string">ws</xmrType><xmrCmsKey type="string">xmr_032379f704129794b965</xmrCmsKey><commands><TESTTOUCH><commandString><![CDATA[touch /tmp/xibo-command-test]]></commandString><validationString><![CDATA[]]></validationString><createAlertOn><![CDATA[never]]></createAlertOn></TESTTOUCH></commands><syncGroup>192.168.1.235</syncGroup><syncPublisherPort>9590</syncPublisherPort><syncSwitchDelay>750</syncSwitchDelay><syncVideoPauseDelay>100</syncVideoPauseDelay></display>"#;
+
+    fn start_mock(activation_body: &'static str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let escaped = activation_body.replace('&', "&amp;").replace('<', "&lt;")
+                                              .replace('>', "&gt;").replace('"', "&quot;");
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>{escaped}</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_syncgroup_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn parses_the_real_lead_capture() {
+        let port = start_mock(REAL_LEAD_XML);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert_eq!(settings.sync_role, SyncRole::Lead);
+        assert_eq!(settings.sync_publisher_port, 9590);
+        assert_eq!(settings.sync_switch_delay, 750);
+        assert_eq!(settings.sync_video_pause_delay, 100);
+    }
+
+    #[test]
+    fn parses_the_real_follower_capture() {
+        let port = start_mock(REAL_FOLLOWER_XML);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert_eq!(settings.sync_role,
+                   SyncRole::Follower { lead_addr: "192.168.1.235".into() });
+        assert_eq!(settings.sync_publisher_port, 9590);
+    }
+
+    #[test]
+    fn absent_sync_group_element_means_not_a_member() {
+        // Every display not in any Sync Group -- the overwhelmingly
+        // common case, and everything before this feature existed.
+        let port = start_mock(r#"<ActivationMessage code="READY"/>"#);
+        let mut cms = test_cms(port);
+        let settings = cms.register_display().unwrap().unwrap();
+        assert_eq!(settings.sync_role, SyncRole::None);
+        // Falls back to the real, confirmed defaults even when absent.
+        assert_eq!(settings.sync_publisher_port, 9590);
+        assert_eq!(settings.sync_switch_delay, 750);
+        assert_eq!(settings.sync_video_pause_delay, 100);
     }
 }
 
