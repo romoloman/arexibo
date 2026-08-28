@@ -16,7 +16,7 @@ use crate::util::{ElementExt, percent_decode};
 // - overriding duration from resources
 // - fromDt/toDt
 
-pub const TRANSLATOR_VERSION: u32 = 30;
+pub const TRANSLATOR_VERSION: u32 = 31;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -456,6 +456,19 @@ pub struct Translator<'a> {
     /// `render="html"` widget's own absolute, sharded iframe `src` in
     /// `write_media`.
     html_port: u16,
+    /// Every distinct, non-empty `syncKey` found on any real region (or
+    /// the drawer, which carries the same attribute in real XLF) while
+    /// translating -- confirmed real from a live capture:
+    /// `<region ... syncKey="sync1">` on a region containing a
+    /// synchronized image playlist, `syncKey=""` (omitted here) on
+    /// ordinary/global ones. Tracks *all* of them (not just the
+    /// first), by explicit choice: Sync Group only reloads whole
+    /// layouts today, but every syncKey this layout carries is
+    /// recorded now specifically so a future move to reloading
+    /// individual *widgets* (Sync Group's own eventual per-item drift
+    /// correction, not yet implemented) doesn't need this same
+    /// scanning work redone from scratch.
+    sync_keys: std::collections::HashSet<String>,
 }
 
 impl<'a> Translator<'a> {
@@ -472,10 +485,11 @@ impl<'a> Translator<'a> {
         Ok(Self { id, tree, out, regions: Vec::new(), size: (0, 0), code_map, has_pdf: false,
                   widget_regions: HashMap::new(), drawer_widgets: std::collections::HashSet::new(),
                   region_geom: HashMap::new(),
-                  enable_stat: true, adspace, html_port })
+                  enable_stat: true, adspace, html_port,
+                  sync_keys: std::collections::HashSet::new() })
     }
 
-    pub fn translate(mut self) -> Result<(i32, i32, bool)> {
+    pub fn translate(mut self) -> Result<(i32, i32, bool, Vec<String>)> {
         let tree = self.tree.take().unwrap();
         // Pre-scan for PDF widgets to know if we need pdf.js
         for region in tree.find_all("region") {
@@ -534,7 +548,9 @@ impl<'a> Translator<'a> {
         }
         writeln!(self.out, "</script>")?;
         self.write_footer()?;
-        Ok((self.size.0, self.size.1, self.enable_stat))
+        let mut sync_keys: Vec<String> = self.sync_keys.into_iter().collect();
+        sync_keys.sort(); // deterministic order -- doesn't otherwise matter
+        Ok((self.size.0, self.size.1, self.enable_stat, sync_keys))
     }
 
     fn write_action(&mut self, el: &Element) -> Result<()> {
@@ -709,6 +725,12 @@ impl<'a> Translator<'a> {
         let h = region.parse_attr("height")?;
         let geom = [x, y, w, h];
         self.region_geom.insert(rid, geom);
+        // See sync_keys's own doc comment.
+        if let Some(key) = region.get_attr("syncKey") {
+            if !key.is_empty() {
+                self.sync_keys.insert(key.to_string());
+            }
+        }
         writeln!(self.out, "<!-- region {rid} -->")?;
 
         if let Some(zindex) = region.get_attr("zindex") {
@@ -987,6 +1009,13 @@ impl<'a> Translator<'a> {
         let y = drawer.parse_attr("top")?;
         let w = drawer.parse_attr("width")?;
         let h = drawer.parse_attr("height")?;
+        // See sync_keys's own doc comment -- the drawer carries the
+        // same syncKey attribute as a real region in real XLF.
+        if let Some(key) = drawer.get_attr("syncKey") {
+            if !key.is_empty() {
+                self.sync_keys.insert(key.to_string());
+            }
+        }
         // A synthetic region id, only ever used for write_media's own
         // `class='media r{rid}'` CSS class and similarly cosmetic
         // bookkeeping -- drawer widgets are deliberately never
@@ -2686,6 +2715,108 @@ mod drawer_tests {
         assert!(!html.contains(r#"window.arexibo.triggers["ghost"]"#),
                 "an action targeting a genuinely nonexistent widget id must not \
                  register any trigger at all");
+    }
+}
+
+#[cfg(test)]
+mod sync_keys_tests {
+    use super::*;
+    use std::fs;
+
+    fn translate_and_get_sync_keys(xlf: &str, test_name: &str) -> Vec<String> {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_sync_keys_test_{test_name}_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let empty_map = HashMap::new();
+        let t = Translator::new(1, &xlf_path, &html_path, &empty_map, None, 0).unwrap();
+        let (_, _, _, sync_keys) = t.translate().unwrap();
+        sync_keys
+    }
+
+    #[test]
+    fn collects_a_non_empty_sync_key_from_a_real_region() {
+        // Real attribute shape confirmed from a live XLF the user
+        // shared: a region carrying a synchronized image playlist had
+        // `syncKey="sync1"`; the layout's own global/background region
+        // had `syncKey=""` (must NOT be collected -- only non-empty
+        // keys count, see Translator::sync_keys's own doc comment).
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="1080" height="1920" syncKey="">
+                <media id="100" type="global" duration="10"><options></options></media>
+            </region>
+            <region id="2" left="162" top="689" width="250" height="250" syncKey="sync1">
+                <media id="101" type="image" duration="10"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let sync_keys = translate_and_get_sync_keys(xlf, "single_key");
+        assert_eq!(sync_keys, vec!["sync1".to_string()],
+                   "must collect the region's own non-empty syncKey, and never an \
+                    empty one from another region");
+    }
+
+    #[test]
+    fn collects_every_distinct_sync_key_not_just_the_first() {
+        // Deliberate choice (per the user's own explicit direction):
+        // track *all* sync_keys a layout carries, not just the first
+        // -- specifically to prepare for a future move from reloading
+        // whole layouts to reloading individual widgets.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="500" height="500" syncKey="sync-a">
+                <media id="100" type="image" duration="10"><options><uri>a.png</uri></options></media>
+            </region>
+            <region id="2" left="500" top="0" width="500" height="500" syncKey="sync-b">
+                <media id="101" type="image" duration="10"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let sync_keys = translate_and_get_sync_keys(xlf, "multiple_keys");
+        assert_eq!(sync_keys, vec!["sync-a".to_string(), "sync-b".to_string()],
+                   "must collect every distinct syncKey found, not just the first");
+    }
+
+    #[test]
+    fn deduplicates_a_sync_key_repeated_across_regions() {
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="500" height="500" syncKey="shared">
+                <media id="100" type="image" duration="10"><options><uri>a.png</uri></options></media>
+            </region>
+            <region id="2" left="500" top="0" width="500" height="500" syncKey="shared">
+                <media id="101" type="image" duration="10"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let sync_keys = translate_and_get_sync_keys(xlf, "dedup_keys");
+        assert_eq!(sync_keys, vec!["shared".to_string()],
+                   "the same syncKey appearing on more than one region must only be \
+                    recorded once");
+    }
+
+    #[test]
+    fn collects_a_sync_key_from_the_drawer_too() {
+        // Confirmed real: the <drawer> element carries the same
+        // syncKey attribute as a real region in real XLF.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="1080" height="1920" syncKey="">
+                <media id="100" type="global" duration="10"><options></options></media>
+            </region>
+            <drawer id="2" left="0" top="0" width="1080" height="1920" syncKey="drawer-key">
+                <media id="101" type="image" duration="10" fileId="1"><options><uri>a.png</uri></options></media>
+            </drawer>
+        </layout>"#;
+        let sync_keys = translate_and_get_sync_keys(xlf, "drawer_key");
+        assert_eq!(sync_keys, vec!["drawer-key".to_string()]);
+    }
+
+    #[test]
+    fn a_layout_with_no_sync_keys_at_all_returns_an_empty_vec() {
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="1080" height="1920" syncKey="">
+                <media id="100" type="image" duration="10"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let sync_keys = translate_and_get_sync_keys(xlf, "no_keys");
+        assert!(sync_keys.is_empty());
     }
 }
 

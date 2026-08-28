@@ -90,6 +90,13 @@ pub struct LayoutInfo {
     // Xibo's own documented default when the XLF attribute is absent.
     #[serde(default = "default_true")]
     pub enable_stat: bool,
+    // Every distinct syncKey this layout's own regions (or drawer)
+    // carry -- see layout::Translator's own `sync_keys` doc comment
+    // for the full story. #[serde(default)] so existing cached
+    // content.json entries (written before this field existed)
+    // deserialize as "no sync keys", not a parse error.
+    #[serde(default)]
+    pub sync_keys: Vec<String>,
 }
 
 fn default_true() -> bool { true }
@@ -360,10 +367,10 @@ impl Cache {
                         adspace_cfg,
                         self.html_port,
                     )?;
-                    let (w, h, enable_stat) = xl.translate()?;
+                    let (w, h, enable_stat, sync_keys) = xl.translate()?;
                     self.content.insert(name, Resource::Layout(Arc::new(
                         LayoutInfo { id, md5, size: (w, h), code, enable_stat,
-                                     translated_version: TRANSLATOR_VERSION }
+                                     translated_version: TRANSLATOR_VERSION, sync_keys }
                     )));
                 } else {
                     self.content.insert(name, Resource::Media(Arc::new(
@@ -470,6 +477,29 @@ impl Cache {
             Resource::Layout(layout) => Some(layout.clone()),
             _ => None
         })
+    }
+
+    /// Test-only: marks `id` as an already-cached, already-translated
+    /// layout, without performing any real network download/
+    /// translation -- for tests (in this module or others, e.g.
+    /// mainloop.rs's own Sync Group tests) whose actual subject is
+    /// some *other* piece of logic that merely needs
+    /// `get_layout(id).is_some()` to hold true, where a real download
+    /// would be unrelated setup noise.
+    #[cfg(test)]
+    pub(crate) fn insert_fake_layout_for_test(&mut self, id: LayoutId) {
+        self.insert_fake_layout_with_sync_keys_for_test(id, vec![]);
+    }
+
+    /// Same as `insert_fake_layout_for_test`, but also sets sync_keys
+    /// -- for tests of Sync Group's own sync_keys matching logic.
+    #[cfg(test)]
+    pub(crate) fn insert_fake_layout_with_sync_keys_for_test(&mut self, id: LayoutId,
+                                                              sync_keys: Vec<String>) {
+        self.content.insert(format!("{id}.xlf"), Resource::Layout(Arc::new(LayoutInfo {
+            id, md5: vec![], size: (1080, 1920), code: None,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys,
+        })));
     }
 
     /// Whether Proof of Play should record a "layout" stat for this
@@ -1187,7 +1217,7 @@ mod dataset_fallback_tests {
         fs::write(dir.join(&fname), xlf_content).unwrap();
         cache.content.insert(fname, Resource::Layout(Arc::new(LayoutInfo {
             id: layout_id, md5: vec![], size: (1080, 1920), code: None,
-            enable_stat: true, translated_version: TRANSLATOR_VERSION,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
         })));
         cache
     }
@@ -1244,7 +1274,7 @@ mod dataset_fallback_tests {
         // on disk (never written), which must not block the search.
         cache.content.insert("777.xlf".to_string(), Resource::Layout(Arc::new(LayoutInfo {
             id: 777, md5: vec![], size: (1080, 1920), code: None,
-            enable_stat: true, translated_version: TRANSLATOR_VERSION,
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
         })));
         assert_eq!(cache.find_widget_layout_region(100), Some((555, 1, 100, 0)));
     }

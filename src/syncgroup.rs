@@ -83,9 +83,28 @@ enum Message {
     Sync {
         #[serde(with = "time::serde::rfc3339")]
         lead_time: OffsetDateTime,
+        // Absent (deserializes to an empty Vec, via #[serde(default)])
+        // when talking to a peer running an older build that never
+        // sent this field at all -- treated the same as "Lead has
+        // nothing currently sync-gated", never a parse error.
+        #[serde(default)]
+        current_sync_keys: Vec<String>,
     },
     Command {
-        layout_id: i64,
+        // Deliberately not a layout id at all -- a real safety gap
+        // found this way: for anything other than Mirror Sync (Wall
+        // Sync: each display shows a *different* layout of its own),
+        // a Follower blindly applying the Lead's own layout id would
+        // show the wrong content entirely. `syncKey` (confirmed real,
+        // on a <region>/<drawer> in the real XLF -- see
+        // layout::Translator's own `sync_keys` doc comment) is
+        // per-region, not per-layout, matched independently by every
+        // display against its *own* currently-scheduled layout (see
+        // mainloop.rs's own resolve_layout_for_sync_keys) -- carrying
+        // every sync_key this Lead's own currently-active layout has,
+        // not just one, so a Follower whose own layout shares *any*
+        // of them knows to reload.
+        sync_keys: Vec<String>,
         #[serde(with = "time::serde::rfc3339")]
         target_time: OffsetDateTime,
     },
@@ -101,7 +120,7 @@ enum Message {
 /// unaware of mainloop.rs's own event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCommand {
-    pub layout_id: i64,
+    pub sync_keys: Vec<String>,
     pub target_local: OffsetDateTime,
 }
 
@@ -120,8 +139,34 @@ pub struct SyncGroup {
     stop: Arc<AtomicBool>,
     /// Some for a Follower only -- see `commands()`.
     commands: Option<Receiver<SyncCommand>>,
-    /// Some for a Lead only -- see `publish_layout()`.
-    publish: Option<Sender<i64>>,
+    /// Some for a Lead only -- see `publish_sync_keys()`.
+    publish: Option<Sender<Vec<String>>>,
+    /// (Lead only, None for a Follower's own SyncGroup.) The
+    /// currently-*committed* sync_keys -- i.e. what this Lead's own
+    /// currently-showing layout actually has (empty = nothing
+    /// sync-gated right now), not a switch merely pending during
+    /// `switch_delay` -- broadcast on every periodic `Sync` heartbeat
+    /// alongside `lead_time`, so a Follower that (re)connects mid-way
+    /// through an already-ongoing Synchronised Event (a real gap found
+    /// this way: a Follower restarted while the Lead was already
+    /// showing a synced layout had no way to ever catch up, since the
+    /// Lead only publishes a fresh `Command` when it *notices a
+    /// change* -- nothing changes from the Lead's own perspective for
+    /// an already-settled event) can immediately catch up instead of
+    /// waiting indefinitely for a `Command` that will never come.
+    /// Deliberately updated by the *caller* (mainloop.rs, via
+    /// `set_current_sync_keys`) only once it has itself actually
+    /// committed the switch (see mainloop.rs's own sync_apply_timer
+    /// handler) -- never while merely staged/pending -- so a Follower
+    /// checking this can never be told about a switch before the
+    /// coordinated moment it was meant to happen at.
+    current_sync_keys: Option<Arc<Mutex<Vec<String>>>>,
+    /// (Lead only, None for a Follower's own SyncGroup.) Fires once
+    /// for every Follower connection accept_loop successfully accepts
+    /// -- see its own doc comment for why mainloop.rs needs to react
+    /// to this by re-staging/re-publishing the currently-active
+    /// synchronized layout, not just noting the connection.
+    peer_connected: Option<Receiver<()>>,
 }
 
 impl Drop for SyncGroup {
@@ -138,8 +183,8 @@ impl SyncGroup {
     /// purpose is being reachable from other machines on the LAN),
     /// accepts any number of Follower connections, and sends each one
     /// a `Sync` message every `SYNC_INTERVAL` alongside any `Command`
-    /// requested via `publish_layout`.
-    pub fn start_lead(port: u16) -> Result<Self> {
+    /// requested via `publish_sync_keys`.
+    pub fn start_lead(port: u16, switch_delay: StdDuration) -> Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))
             .with_context(|| format!("binding Sync Group Lead listener on port {port}"))?;
         listener.set_nonblocking(true)
@@ -147,20 +192,26 @@ impl SyncGroup {
 
         let stop = Arc::new(AtomicBool::new(false));
         let peers: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
-        let (publish_tx, publish_rx) = unbounded::<i64>();
+        let (publish_tx, publish_rx) = unbounded::<Vec<String>>();
+        let current_sync_keys: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (peer_connected_tx, peer_connected_rx) = unbounded::<()>();
 
         {
             let stop = stop.clone();
             let peers = peers.clone();
-            thread::spawn(move || accept_loop(listener, peers, stop));
+            thread::spawn(move || accept_loop(listener, peers, stop, peer_connected_tx));
         }
         {
             let stop = stop.clone();
-            thread::spawn(move || lead_publish_loop(peers, publish_rx, stop));
+            let current_sync_keys = current_sync_keys.clone();
+            thread::spawn(move || lead_publish_loop(peers, publish_rx, stop, switch_delay,
+                                                     current_sync_keys));
         }
 
         log::info!("Sync Group: started as Lead, listening on 0.0.0.0:{port}");
-        Ok(Self { stop, commands: None, publish: Some(publish_tx) })
+        Ok(Self { stop, commands: None, publish: Some(publish_tx),
+                  current_sync_keys: Some(current_sync_keys),
+                  peer_connected: Some(peer_connected_rx) })
     }
 
     /// Starts a Follower: connects (and, on failure or disconnection,
@@ -181,16 +232,34 @@ impl SyncGroup {
             thread::spawn(move || follower_reconnect_loop(lead_addr, commands_tx, stop));
         }
 
-        Ok(Self { stop, commands: Some(commands_rx), publish: None })
+        Ok(Self { stop, commands: Some(commands_rx), publish: None, current_sync_keys: None,
+                  peer_connected: None })
     }
 
-    /// (Lead only.) Broadcasts a layout switch to every currently
-    /// connected Follower -- a no-op (silently) for a Follower's own
-    /// SyncGroup, or if the Lead's own publish thread has somehow
-    /// already gone away.
-    pub fn publish_layout(&self, layout_id: i64) {
+    /// (Lead only.) Broadcasts the sync_keys of whichever layout is
+    /// now sync-gated to every currently connected Follower -- a no-op
+    /// (silently) for a Follower's own SyncGroup, or if the Lead's own
+    /// publish thread has somehow already gone away.
+    pub fn publish_sync_keys(&self, sync_keys: Vec<String>) {
         if let Some(tx) = &self.publish {
-            let _ = tx.send(layout_id);
+            let _ = tx.send(sync_keys);
+        }
+    }
+
+    /// (Lead only, no-op for a Follower's own SyncGroup.) Records
+    /// which sync_keys this Lead has *actually committed to showing*
+    /// right now (empty Vec once it reverts to normal schedule
+    /// resolution) -- included in every subsequent periodic `Sync`
+    /// heartbeat, letting a (re)connecting Follower catch up on an
+    /// already-ongoing Synchronised Event it missed the original
+    /// `Command` for (see `current_sync_keys`'s own doc comment for
+    /// the full story). The caller (mainloop.rs) is responsible for
+    /// only calling this once it has itself actually applied the
+    /// switch, never while merely staged/pending -- this method
+    /// itself has no way to enforce that.
+    pub fn set_current_sync_keys(&self, sync_keys: Vec<String>) {
+        if let Some(current) = &self.current_sync_keys {
+            *current.lock().expect("poisoned lock") = sync_keys;
         }
     }
 
@@ -200,17 +269,38 @@ impl SyncGroup {
     pub fn commands(&self) -> Option<&Receiver<SyncCommand>> {
         self.commands.as_ref()
     }
+
+    /// (Lead only.) The channel that fires once per Follower
+    /// connection accepted -- `None` for a Follower's own SyncGroup.
+    /// See `peer_connected`'s own field doc comment.
+    pub fn peer_connected(&self) -> Option<&Receiver<()>> {
+        self.peer_connected.as_ref()
+    }
 }
 
 // ---- Lead side ----
 
-fn accept_loop(listener: TcpListener, peers: Arc<Mutex<Vec<TcpStream>>>, stop: Arc<AtomicBool>) {
+fn accept_loop(listener: TcpListener, peers: Arc<Mutex<Vec<TcpStream>>>, stop: Arc<AtomicBool>,
+                peer_connected: Sender<()>) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, addr)) => match zmtp_pub_handshake(stream) {
                 Ok(stream) => {
                     log::info!("Sync Group: Follower connected from {addr}");
                     peers.lock().expect("poisoned lock").push(stream);
+                    // Notify mainloop.rs -- a (re)connecting Follower
+                    // (no way to tell a genuinely first-time connection
+                    // apart from a reconnection after a restart, on
+                    // either side, so this fires unconditionally every
+                    // time) needs the currently-active synchronized
+                    // layout re-staged and re-published, not just
+                    // learned about passively: even once it knows
+                    // *which* layout id to show, its own already-
+                    // running region/playlist timers would stay
+                    // wherever they happened to be if the layout
+                    // itself never actually reloads. See mainloop.rs's
+                    // own handling of this channel.
+                    let _ = peer_connected.send(());
                 }
                 Err(e) => log::warn!("Sync Group: handshake with Follower at {addr} \
                                        failed: {e:#}"),
@@ -312,24 +402,50 @@ fn broadcast(peers: &Arc<Mutex<Vec<TcpStream>>>, msg: &Message) {
     peers.retain_mut(|stream| send_frame(stream, &data).is_ok());
 }
 
-fn lead_publish_loop(peers: Arc<Mutex<Vec<TcpStream>>>, publish_rx: Receiver<i64>,
-                      stop: Arc<AtomicBool>) {
+fn lead_publish_loop(peers: Arc<Mutex<Vec<TcpStream>>>, publish_rx: Receiver<Vec<String>>,
+                      stop: Arc<AtomicBool>, switch_delay: StdDuration,
+                      current_sync_keys: Arc<Mutex<Vec<String>>>) {
     let mut last_sync = Instant::now() - SYNC_INTERVAL; // send one immediately on start
     while !stop.load(Ordering::Relaxed) {
         // A short recv timeout doubles as this loop's own `stop`
         // check interval whenever no layout switch is pending.
         match publish_rx.recv_timeout(StdDuration::from_millis(200)) {
-            Ok(layout_id) => {
-                let target_time = OffsetDateTime::now_utc();
-                broadcast(&peers, &Message::Command { layout_id, target_time });
-                log::info!("Sync Group: published Command layout={layout_id} \
+            Ok(sync_keys) => {
+                // `switch_delay` (the CMS's own configured "Switch
+                // Delay" for this Sync Group, e.g. 750ms -- previously
+                // parsed into PlayerSettings but never actually
+                // threaded through to here at all, a real gap found
+                // while wiring up the first genuine use of this
+                // mechanism) gives every display -- Followers over the
+                // network, and this Lead itself -- enough of a lead-in
+                // window to receive this Command, apply its own clock-
+                // compensation offset, and arm its own local timer
+                // *before* the actual target instant arrives. Without
+                // it, target_time is already in the past for a
+                // Follower by the time the message crosses the network
+                // (however small that latency is), so it would just
+                // apply as soon as it can rather than at a precisely
+                // shared moment -- undermining the whole point of a
+                // shared target_time in the first place.
+                let target_time = OffsetDateTime::now_utc()
+                    + time::Duration::try_from(switch_delay).unwrap_or(time::Duration::ZERO);
+                broadcast(&peers, &Message::Command { sync_keys: sync_keys.clone(), target_time });
+                log::info!("Sync Group: published Command sync_keys={sync_keys:?} \
                             target_time={target_time}");
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break, // SyncGroup itself was dropped
         }
         if last_sync.elapsed() >= SYNC_INTERVAL {
-            broadcast(&peers, &Message::Sync { lead_time: OffsetDateTime::now_utc() });
+            // Read fresh on every heartbeat (not cached/passed in once)
+            // -- reflects whatever mainloop.rs's own
+            // set_current_sync_keys calls have most recently
+            // committed, including reverting to empty once a
+            // Synchronised Event's own scheduled window ends (see
+            // mainloop.rs's own expiry check).
+            let current = current_sync_keys.lock().expect("poisoned lock").clone();
+            broadcast(&peers, &Message::Sync { lead_time: OffsetDateTime::now_utc(),
+                                                current_sync_keys: current });
             last_sync = Instant::now();
         }
     }
@@ -391,6 +507,15 @@ fn follower_session(lead_addr: &str, commands_tx: &Sender<SyncCommand>,
     // The Lead-vs-local clock offset, refreshed on every Sync message
     // -- None until the first one arrives.
     let mut offset: Option<TimeDuration> = None;
+    // The last sync_keys this Follower knows the Lead to currently
+    // have active (whether learned via a real Command, or via a prior
+    // catch-up below) -- starts empty on every fresh session
+    // (including after a restart), which is exactly what makes the
+    // catch-up mechanism below work for a Follower that missed the
+    // original Command entirely: its own first Sync heartbeat's own
+    // `current_sync_keys` (if non-empty) will always differ from this
+    // initial empty state.
+    let mut last_known_sync_keys: Vec<String> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         // ZmqSubSocket's own recv_frame has a ~40s internal read
@@ -409,10 +534,37 @@ fn follower_session(lead_addr: &str, commands_tx: &Sender<SyncCommand>,
             Err(_) => continue, // not our own message format -- ignore, not fatal
         };
         match msg {
-            Message::Sync { lead_time } => {
+            Message::Sync { lead_time, current_sync_keys } => {
                 offset = Some(lead_time - OffsetDateTime::now_utc());
+                // Catch-up mechanism -- a real gap found this way: a
+                // Follower that (re)connects mid-way through an
+                // already-ongoing Synchronised Event never receives a
+                // fresh Command at all (the Lead only publishes one
+                // when it *notices a change*; nothing changes from the
+                // Lead's own perspective for an already-settled event)
+                // -- it would otherwise wait forever. If this
+                // heartbeat's own current_sync_keys differs from what
+                // this Follower already knows about, synthesize a
+                // SyncCommand for it -- applied *immediately*
+                // (target_local = now), deliberately not delayed by
+                // switch_delay like a genuine fresh Command: this is a
+                // one-off correction for a display that's already
+                // behind, not a freshly-coordinated simultaneous
+                // switch, so there's nothing to wait for.
+                if current_sync_keys != last_known_sync_keys {
+                    if !current_sync_keys.is_empty() {
+                        log::info!("Sync Group: catching up to already-active \
+                                    synchronized sync_keys {current_sync_keys:?} via \
+                                    Sync heartbeat");
+                        let _ = commands_tx.send(SyncCommand {
+                            sync_keys: current_sync_keys.clone(),
+                            target_local: OffsetDateTime::now_utc(),
+                        });
+                    }
+                    last_known_sync_keys = current_sync_keys;
+                }
             }
-            Message::Command { layout_id, target_time } => {
+            Message::Command { sync_keys, target_time } => {
                 let target_local = match offset {
                     Some(off) => target_time - off,
                     None => {
@@ -422,7 +574,8 @@ fn follower_session(lead_addr: &str, commands_tx: &Sender<SyncCommand>,
                         target_time
                     }
                 };
-                let _ = commands_tx.send(SyncCommand { layout_id, target_local });
+                last_known_sync_keys = sync_keys.clone();
+                let _ = commands_tx.send(SyncCommand { sync_keys, target_local });
             }
         }
     }
@@ -435,7 +588,7 @@ mod tests {
 
     #[test]
     fn leader_and_follower_exchange_sync_and_command_messages() {
-        let leader = SyncGroup::start_lead(0).expect("starting lead");
+        let leader = SyncGroup::start_lead(0, StdDuration::ZERO).expect("starting lead");
         // start_lead(0) means "any free port" -- but we need the
         // *actual* bound port to connect a follower to it. Rebind
         // deliberately avoided here (0 lets the OS pick, avoiding
@@ -448,7 +601,7 @@ mod tests {
             let probe = TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
         };
-        let leader = SyncGroup::start_lead(port).expect("starting lead");
+        let leader = SyncGroup::start_lead(port, StdDuration::ZERO).expect("starting lead");
         let follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
             .expect("starting follower");
 
@@ -462,10 +615,10 @@ mod tests {
         // confirms the message round-trips end to end).
         let deadline = Instant::now() + StdDuration::from_secs(10);
         while Instant::now() < deadline {
-            leader.publish_layout(4242);
+            leader.publish_sync_keys(vec!["sync1".into()]);
             if let Some(rx) = follower.commands() {
                 if let Ok(cmd) = rx.recv_timeout(StdDuration::from_millis(300)) {
-                    assert_eq!(cmd.layout_id, 4242);
+                    assert_eq!(cmd.sync_keys, vec!["sync1".to_string()]);
                     let now = OffsetDateTime::now_utc();
                     let drift = (cmd.target_local - now).abs();
                     assert!(drift < TimeDuration::seconds(5),
@@ -479,18 +632,131 @@ mod tests {
     }
 
     #[test]
+    fn published_target_time_incorporates_the_configured_switch_delay() {
+        // Regression test for a real gap: switch_delay (the CMS's own
+        // "Switch Delay" setting, parsed into PlayerSettings as
+        // sync_switch_delay) used to be parsed but never actually
+        // threaded through to the Lead's own publish loop at all --
+        // target_time was always essentially "right now", giving
+        // Followers no lead-in window to receive the message, apply
+        // their own clock offset, and arm a timer before the target
+        // instant had already passed.
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let switch_delay = StdDuration::from_millis(750);
+        let leader = SyncGroup::start_lead(port, switch_delay).expect("starting lead");
+        let follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
+            .expect("starting follower");
+
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while Instant::now() < deadline {
+            let before = OffsetDateTime::now_utc();
+            leader.publish_sync_keys(vec!["sync2".into()]);
+            if let Some(rx) = follower.commands() {
+                if let Ok(cmd) = rx.recv_timeout(StdDuration::from_millis(300)) {
+                    assert_eq!(cmd.sync_keys, vec!["sync2".to_string()]);
+                    // target_local should be *ahead* of when we
+                    // published by roughly switch_delay (750ms) -- not
+                    // just "close to now" (which the other test above
+                    // already confirms for the offset-tracking
+                    // machinery itself). Generous bounds (500ms-2s)
+                    // account for real scheduling jitter in a test
+                    // environment, while still clearly distinguishing
+                    // "delay applied" from "delay ignored" (which would
+                    // put this at ~0ms ahead, well outside this range).
+                    let ahead = cmd.target_local - before;
+                    assert!(ahead > TimeDuration::milliseconds(500)
+                            && ahead < TimeDuration::seconds(2),
+                            "target_local should be ~750ms ahead of publish time \
+                             (the configured switch_delay), got {ahead:?} instead");
+                    return;
+                }
+            }
+        }
+        panic!("follower never received a Command within the deadline");
+    }
+
+    #[test]
+    fn peer_connected_fires_when_a_follower_connects() {
+        // Regression coverage for a real report: a Follower that
+        // restarted mid-way through an already-active Synchronised
+        // Event never got re-synchronized at all -- the Lead only
+        // publishes a fresh Command when it *notices a schedule
+        // change*, and nothing changes there for an already-settled
+        // event. mainloop.rs's own fix reacts to *this* channel
+        // firing (re-staging/re-publishing whatever's currently
+        // active) -- this test only confirms the channel itself
+        // fires on a real connection, which that fix depends on.
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let leader = SyncGroup::start_lead(port, StdDuration::ZERO).expect("starting lead");
+        let peer_connected = leader.peer_connected().expect("a Lead's own is always Some");
+
+        assert!(peer_connected.try_recv().is_err(),
+                "must not fire before any Follower has connected");
+
+        let _follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
+            .expect("starting follower");
+
+        peer_connected.recv_timeout(StdDuration::from_secs(5))
+            .expect("peer_connected must fire once the Follower actually connects");
+    }
+
+    #[test]
+    fn a_follower_connecting_after_current_sync_keys_is_set_catches_up_via_sync_heartbeat() {
+        // The other half of the same real report: even once told
+        // *which* sync_keys are active, a Follower that never received
+        // the original Command (because it started, or restarted,
+        // after the Lead already committed the switch) needs to learn
+        // this from the Lead's own state -- not just from a live
+        // Command it necessarily missed. Exercises
+        // set_current_sync_keys + the periodic Sync heartbeat's own
+        // catch-up logic in follower_session, independently of
+        // mainloop.rs's own re-staging reaction to peer_connected.
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let leader = SyncGroup::start_lead(port, StdDuration::ZERO).expect("starting lead");
+        // Simulate the Lead having already committed a synchronized
+        // switch *before* this Follower ever connects (matching
+        // mainloop.rs's own sync_apply_timer handler, which calls
+        // this only once actually committed).
+        leader.set_current_sync_keys(vec!["sync1".into()]);
+
+        let follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
+            .expect("starting follower");
+
+        let cmd = follower.commands().expect("a Follower's own is always Some")
+            .recv_timeout(StdDuration::from_secs(10))
+            .expect("the Follower must learn about the already-active sync_keys via a \
+                     synthesized catch-up SyncCommand, without ever receiving a real Command");
+        assert_eq!(cmd.sync_keys, vec!["sync1".to_string()]);
+        // Applied immediately (this is a one-off correction for a
+        // display that's already behind, not a freshly-coordinated
+        // simultaneous switch) -- not delayed by switch_delay.
+        let drift = (cmd.target_local - OffsetDateTime::now_utc()).abs();
+        assert!(drift < TimeDuration::seconds(2),
+                "a catch-up SyncCommand should apply at ~now, got drift {drift:?}");
+    }
+
+    #[test]
     fn stopping_frees_the_lead_listen_port_for_reuse() {
         let port = {
             let probe = TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
         };
-        let leader = SyncGroup::start_lead(port).expect("starting lead");
+        let leader = SyncGroup::start_lead(port, StdDuration::ZERO).expect("starting lead");
         drop(leader); // should signal the accept thread to stop and release the port
 
         let deadline = Instant::now() + StdDuration::from_secs(5);
         let mut result = None;
         while Instant::now() < deadline {
-            match SyncGroup::start_lead(port) {
+            match SyncGroup::start_lead(port, StdDuration::ZERO) {
                 Ok(g) => { result = Some(g); break; }
                 Err(_) => thread::sleep(StdDuration::from_millis(100)),
             }

@@ -79,6 +79,24 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                         }
                     }
                 }
+                ToGui::ForceReloadLayout(layout_id) => {
+                    // update() also correctly syncs Schedule<T>'s own
+                    // internal state (index/layouts/single_done) to
+                    // reflect this as current -- its own return value
+                    // is deliberately ignored here (unlike the
+                    // ordinary Layouts case above): this message means
+                    // "reload it regardless of whether Schedule<T>
+                    // already believed it was current", which is
+                    // exactly the one case update()'s own return value
+                    // would otherwise say "nothing to do" for.
+                    schedule.lock().update(vec![layout_id]);
+                    log::info!("Sync Group: force-reloading layout {layout_id} to \
+                                restart its own timers in lockstep with the group");
+                    let file = CString::new(format!("{layout_id}.xlf.html")).unwrap();
+                    unsafe {
+                        cpp::navigate(file.as_ptr());
+                    }
+                }
                 ToGui::WebHook(code) => {
                     // Matches layout.rs's own `write_action` -- a
                     // triggerType="webhook" action registers itself as
@@ -418,3 +436,45 @@ fn test_schedule_single_done_triggers_navigation() {
     // navigation should be triggered
     assert_eq!(schedule.update(vec![605]), None);
 }
+
+#[cfg(test)]
+#[test]
+fn force_reload_layout_syncs_schedule_state_to_the_explicit_id_not_stale_current() {
+    // Regression test for a real report, caught on the very first
+    // live Sync Group test: the startup splash/default layout (0) got
+    // force-reloaded instead of the actual synchronized layout (1014)
+    // that was supposed to apply. Root cause: the original
+    // ForceReloadCurrentLayout handler called schedule.current()
+    // *without ever calling update() first* -- current() only
+    // reflects whatever the *last actual* ToGui::Layouts call set it
+    // to (still the startup default here, since this message is sent
+    // *instead of* Layouts for a Sync Group switch), never the new
+    // layout this message was actually meant to show.
+    //
+    // The fix: call update(vec![layout_id]) (syncing Schedule<T>'s own
+    // internal state correctly) and navigate using the explicit
+    // layout_id argument itself, not current() -- this test confirms
+    // the state-sync half of that fix (current() correctly reflects
+    // the intended id afterward, regardless of update()'s own return
+    // value), since the "navigate using the explicit id" half isn't
+    // meaningfully testable at this level (that's a plain function
+    // argument, not state).
+    let mut schedule = Schedule { index: None, layouts: vec![0], single_done: false };
+    // Matches the real startup sequence: layout 0 (the splash/default)
+    // was actually shown via a real, earlier ToGui::Layouts/update()
+    // call -- establishing it as Schedule<T>'s own genuinely-current
+    // state, not just its type-level default.
+    schedule.update(vec![0]);
+    assert_eq!(schedule.current(), 0);
+
+    // The real fix's own exact call, mirroring ToGui::ForceReloadLayout(1014)'s
+    // handler -- return value deliberately ignored, matching the fix.
+    let _ = schedule.update(vec![1014]);
+
+    assert_eq!(schedule.current(), 1014,
+               "after a ForceReloadLayout(1014), Schedule<T>'s own internal state \
+                must reflect 1014 as current -- not still report the previous \
+                layout (here, the startup default, 0) the way calling current() \
+                without ever calling update() first would have");
+}
+
