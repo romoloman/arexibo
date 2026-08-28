@@ -92,6 +92,22 @@ impl Cms {
         // to be left set permanently -- this misrepresents the player to
         // the CMS, which could affect other clientType-conditional CMS
         // behavior in ways beyond just this specific XMR question.
+        //
+        // "android" added for a second, unrelated real investigation:
+        // the official Xibo Sync Groups guide states "Xibo for Android
+        // (v4 R400 and above) is the only player that currently supports
+        // this feature" -- a real report showed a fully, correctly
+        // configured Synchronised Event (Sync Group with Lead + members
+        // saved, event saved with Always/Always dayparting, confirmed
+        // via the CMS's own Schedule grid) never appearing in this
+        // display's own schedule.xml at all, while RegisterDisplay's own
+        // <syncGroup> field was populated correctly (role/membership
+        // information, evidently not gated by clientType) -- suggesting
+        // the CMS's own Schedule generation may separately, additionally
+        // filter Synchronised Events out entirely for any clientType
+        // other than "android", regardless of the display's actual Sync
+        // Group membership. This lets that hypothesis be tested directly
+        // against a real CMS without needing a real Android device.
         let fake_client_type = std::env::var("AREXIBO_FAKE_CLIENTTYPE").ok();
         let (client_type, client_code, operating_system): (&str, i64, &str) =
             match fake_client_type.as_deref() {
@@ -100,10 +116,18 @@ impl Cms {
                                 AREXIBO_FAKE_CLIENTTYPE (diagnostic only)");
                     ("windows", 407, "windows")
                 }
+                Some("android") => {
+                    log::info!("overriding clientType to \"android\" via \
+                                AREXIBO_FAKE_CLIENTTYPE (diagnostic only -- testing \
+                                whether the CMS gates Synchronised Events in \
+                                Schedule.xml on clientType, not just Sync Group \
+                                membership)");
+                    ("android", 407, "android")
+                }
                 Some(other) if !other.is_empty() => {
                     log::warn!("AREXIBO_FAKE_CLIENTTYPE={other:?} not a supported \
-                                override value, ignoring (only \"windows\" is \
-                                implemented) -- using real clientType \"linux\"");
+                                override value, ignoring (only \"windows\"/\"android\" \
+                                are implemented) -- using real clientType \"linux\"");
                     ("linux", 407, "linux")
                 }
                 _ => ("linux", 407, "linux"),
