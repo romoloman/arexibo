@@ -17,7 +17,7 @@ use crate::util::fingerprint;
 /// real register.xml captures (a lead and a follower in the same
 /// group), not guessed: the CMS's own `<syncGroup>` element is a
 /// single string with three possible shapes, not a separate group-id
-/// + leader-boolean pair as might be assumed from the CMS admin UI's
+/// and leader-boolean pair as might be assumed from the CMS admin UI's
 /// own "Sync Groups" terminology:
 ///
 /// - absent/empty: not part of any Sync Group (the overwhelmingly
