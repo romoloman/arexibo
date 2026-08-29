@@ -221,6 +221,23 @@ pub struct Handler {
     /// comment for why trusting the Lead's own layout id directly
     /// would be unsafe for anything other than Mirror Sync).
     pending_sync_keys: Option<Vec<String>>,
+    /// Which layout id (this display's *own* schedule-discovered
+    /// candidate, from schedule_check's own local discovery -- never
+    /// set from an incoming network Command, which only ever carries
+    /// sync_keys) most recently triggered `pending_sync_keys` being
+    /// staged, purely for that discovery's own re-publish guard --
+    /// see its own call site's doc comment for why comparing
+    /// `pending_sync_keys` by *value* alone is a real, distinct bug:
+    /// two structurally-similar layouts (e.g. successive swaps within
+    /// the same live Synchronised Event) can genuinely share the exact
+    /// same sync_keys text, and comparing sync_keys values alone would
+    /// then wrongly treat a genuinely new layout as "already handled"
+    /// just because its own sync_keys happen to match a previous,
+    /// different layout's own. `resolve_layout_for_sync_keys` itself
+    /// is correctly unaffected by this field -- it only ever resolves
+    /// by sync_keys content, as it must (an id is never trusted
+    /// across the network at all).
+    pending_sync_layout_id: Option<i64>,
     /// Fires at the *local* instant (already offset-corrected --
     /// `SyncCommand::target_local`) of the most recently received Sync
     /// Group Command -- deliberately not applied to `override_layout`
@@ -579,7 +596,7 @@ impl Handler {
                                  duration_rx, trigger_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
-                                 sync_commands: never(), pending_sync_keys: None,
+                                 sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None,
                                  sync_apply_timer: never(), sync_layout_active: false, sync_peer_connected: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
@@ -626,7 +643,7 @@ impl Handler {
                                  duration_rx, trigger_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
-                                 sync_commands: never(), pending_sync_keys: None,
+                                 sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None,
                                  sync_apply_timer: never(), sync_layout_active: false, sync_peer_connected: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
@@ -1767,6 +1784,41 @@ impl Handler {
                     if let Some(sync_group) = &self.sync_group {
                         sync_group.set_current_sync_keys(vec![]);
                     }
+                    // (Follower only.) A real bug found this way: the
+                    // CMS swapped which layout a live Synchronised
+                    // Event points to (e.g. 1014 -> 1017, both sharing
+                    // the *same* sync_keys, being visually similar
+                    // templates) -- a Follower whose own schedule.xml
+                    // hadn't downloaded that change *yet* received the
+                    // Lead's own fresh Command (published as soon as
+                    // the Lead's own, already-updated schedule noticed
+                    // it) and, since its own still-stale schedule
+                    // still named the *old* layout as sync-gated with
+                    // the *same* sync_keys value, resolve_layout_for_
+                    // sync_keys matched it anyway -- resolving to the
+                    // wrong (superseded) layout instead of ever
+                    // downloading/rendering the new one. This exact
+                    // expiry check firing (id, the old layout, is no
+                    // longer sync-gated per this display's *own* now-
+                    // updated schedule) is the precise moment this
+                    // display's own view of the world has genuinely
+                    // caught up -- reconnecting the SyncGroup right
+                    // now, deliberately, re-triggers the Lead's own
+                    // `sync_peer_connected` reaction (already built for
+                    // the restart/reconnect case, and already
+                    // unconditional there for the same reason: no way
+                    // to tell a first connection from a reconnection
+                    // apart) -- which re-publishes its current
+                    // sync_keys fresh, letting this display resolve
+                    // correctly now that both sides are genuinely
+                    // caught up. Far simpler than a dedicated
+                    // Follower -> Lead "ready" signal (the existing
+                    // connection is one-way, PUB/SUB-style) -- confirmed
+                    // by the user as the intended fix.
+                    if let SyncRole::Follower { lead_addr } = &self.settings.sync_role {
+                        let lead_addr = lead_addr.clone();
+                        self.connect_as_follower(&lead_addr);
+                    }
                 }
                 Some(_) => {}
                 // Defensive: shouldn't happen (only ever set alongside
@@ -1831,18 +1883,92 @@ impl Handler {
                 // id at all, published/staged below (see
                 // resolve_layout_for_sync_keys's own doc comment for
                 // why an id is never trusted across the network).
-                let sync_keys = self.cache.get_layout(first)
-                    .map(|info| info.sync_keys.clone()).unwrap_or_default();
-                // Guard against re-publishing/re-staging every single
-                // cycle while this exact switch is already pending --
-                // schedule_check() can run many times (every
-                // collection, plus whenever anything else changes)
-                // before sync_apply_timer actually fires.
-                if self.pending_sync_keys.as_ref() != Some(&sync_keys) {
-                    log::info!("new sync-gated layout in schedule: {first} (sync_keys \
-                                {sync_keys:?}) -- staging a synchronized switch instead \
-                                of applying immediately");
-                    self.stage_sync_switch(sync_keys);
+                match self.cache.get_layout(first) {
+                    Some(info) => {
+                        let sync_keys = info.sync_keys.clone();
+                        // Guard against re-publishing/re-staging every
+                        // single cycle while this exact switch is
+                        // already pending -- schedule_check() can run
+                        // many times (every collection, plus whenever
+                        // anything else changes) before
+                        // sync_apply_timer actually fires.
+                        //
+                        // Compares the *layout id* (`first`), not the
+                        // sync_keys value -- a real, severe bug found
+                        // this way: successive layout swaps within the
+                        // same live Synchronised Event (1017 -> 1018
+                        // -> 1019 -> 1020, each confirmed via a real
+                        // schedule.xml/log capture) all shared the
+                        // exact same sync_keys text (["sync1"] --
+                        // structurally-similar templates). Comparing
+                        // pending_sync_keys by *value* alone meant
+                        // that, once any one of them was successfully
+                        // staged, this guard saw every *subsequent*,
+                        // genuinely different layout's own (identical-
+                        // looking) sync_keys as "already handled" and
+                        // silently did nothing -- confirmed real via a
+                        // live TEMP-DIAG capture: new_layouts=[1020]
+                        // differed correctly from self.layouts=[1019],
+                        // entered this branch, found 1020 in cache
+                        // with sync_keys=["sync1"], and then this
+                        // exact guard incorrectly skipped staging
+                        // because pending_sync_keys was *already*
+                        // Some(["sync1"]) from 1019's own earlier,
+                        // separate switch. A display could then never
+                        // advance to a new sync-gated layout again for
+                        // as long as its own sync_keys kept matching a
+                        // previous one -- exactly the "layout that's
+                        // no longer in my schedule" case this whole
+                        // mechanism exists to handle correctly.
+                        if self.pending_sync_layout_id != Some(first) {
+                            log::info!("new sync-gated layout in schedule: {first} \
+                                        (sync_keys {sync_keys:?}) -- staging a \
+                                        synchronized switch instead of applying \
+                                        immediately");
+                            self.pending_sync_layout_id = Some(first);
+                            self.stage_sync_switch(sync_keys);
+                        }
+                    }
+                    // A real, severe bug found this way: a newly
+                    // sync-gated layout (the user swapped which layout
+                    // a live Synchronised Event points to) whose own
+                    // required files hadn't finished downloading yet
+                    // this cycle (see resource_retry_queue's own doc
+                    // comment -- a transient download failure defers
+                    // some files to a *later* cycle, so not everything
+                    // named in a freshly-updated schedule is
+                    // necessarily in cache yet by the time this runs)
+                    // used to still stage an empty Vec here (via
+                    // `.unwrap_or_default()`) -- not because the
+                    // layout genuinely has no sync_keys, but because
+                    // they weren't *knowable* yet. Combined with the
+                    // guard above (needed to fix a separate, real
+                    // infinite-loop bug: never re-staging an
+                    // already-tried value), that wrong, empty value
+                    // then stayed stuck in pending_sync_keys
+                    // *permanently* -- even once this same layout
+                    // finished downloading moments later and its real
+                    // sync_keys became known, the guard saw "already
+                    // tried this" and refused to ever re-stage with
+                    // the correct value. Confirmed real: the Lead
+                    // (whose own download finished fast enough)
+                    // rendered the new layout correctly, while a
+                    // Follower (racing its own, separate download of
+                    // the same files) downloaded the resource but
+                    // never actually rendered it.
+                    //
+                    // Fixed by staging *nothing at all* here instead --
+                    // pending_sync_keys is left exactly as it was, so a
+                    // later schedule_check (once this layout is
+                    // actually in cache) sees a *fresh* discovery and
+                    // stages the real sync_keys normally, rather than
+                    // ever recording a placeholder value that could
+                    // get permanently stuck.
+                    None => {
+                        log::debug!("sync-gated layout {first} not yet in cache -- \
+                                     will determine its own sync_keys and stage a \
+                                     synchronized switch once it's downloaded");
+                    }
                 }
                 // Deliberately not updating self.layouts/ToGui::Layouts
                 // here -- that only happens once sync_apply_timer
@@ -2005,22 +2131,38 @@ impl Handler {
                 self.sync_commands = never();
             }
             SyncRole::Follower { lead_addr } => {
-                let addr = format!("{lead_addr}:{}", self.settings.sync_publisher_port);
-                log::info!("Sync Group: starting/reconnecting as Follower, Lead at {addr}");
-                match syncgroup::SyncGroup::start_follower(addr) {
-                    Ok(g) => {
-                        self.sync_commands = g.commands()
-                            .expect("a Follower's own commands() is always Some").clone();
-                        self.sync_group = Some(g);
-                    }
-                    Err(e) => {
-                        log::error!("Sync Group: starting as Follower: {e:#}");
-                        self.sync_commands = never();
-                    }
-                }
-                self.sync_peer_connected = never();
+                let lead_addr = lead_addr.clone();
+                self.connect_as_follower(&lead_addr);
             }
         }
+    }
+
+    /// (Re)connects this display's own SyncGroup Follower connection to
+    /// `lead_addr` -- shared by `update_sync_group`'s own Follower arm
+    /// (a genuine role/address change) and by the sync-gated override
+    /// expiry check in `schedule_check` (a real, *deliberate*
+    /// reconnection of an *unchanged* Follower role/address, used
+    /// purely to re-trigger the Lead's own `peer_connected` reaction --
+    /// see that call site's own doc comment for the full story). Drops
+    /// whatever SyncGroup handle already existed first (its own Drop
+    /// impl stops the old background thread/connection) -- safe to
+    /// call even when nothing was connected yet.
+    fn connect_as_follower(&mut self, lead_addr: &str) {
+        let addr = format!("{lead_addr}:{}", self.settings.sync_publisher_port);
+        log::info!("Sync Group: starting/reconnecting as Follower, Lead at {addr}");
+        self.sync_group = None;
+        match syncgroup::SyncGroup::start_follower(addr) {
+            Ok(g) => {
+                self.sync_commands = g.commands()
+                    .expect("a Follower's own commands() is always Some").clone();
+                self.sync_group = Some(g);
+            }
+            Err(e) => {
+                log::error!("Sync Group: starting as Follower: {e:#}");
+                self.sync_commands = never();
+            }
+        }
+        self.sync_peer_connected = never();
     }
 
     /// Re-evaluate schedule-driven Overlay Layouts (schedule.rs's
@@ -5346,6 +5488,180 @@ mod sync_group_schedule_check_tests {
     }
 
     #[test]
+    fn expiry_reconnects_a_follower_to_re_trigger_the_leads_own_peer_connected() {
+        // Regression test for a real report: the CMS swapped which
+        // layout a live Synchronised Event points to (1014 -> 1017),
+        // both sharing the *same* sync_keys (visually similar
+        // templates). A Follower whose own schedule.xml hadn't yet
+        // downloaded that change received the Lead's fresh Command
+        // (sync_keys matching) but, since its own still-stale schedule
+        // still named the *old* layout (1014) as sync-gated with that
+        // *same* sync_keys value, resolved to the wrong, superseded
+        // layout instead of ever rendering the new one -- confirmed
+        // real: the Follower downloaded 1017's own resource but kept
+        // showing 1014 until manually restarted.
+        //
+        // Fix confirmed by the user directly: simply reconnecting the
+        // Follower's own SyncGroup connection at the exact moment its
+        // own schedule genuinely catches up (this same expiry check
+        // firing) re-triggers the Lead's own already-built
+        // sync_peer_connected reaction, which re-publishes its current
+        // sync_keys fresh -- letting this display resolve correctly
+        // now that both sides are genuinely caught up. Far simpler
+        // than a dedicated Follower -> Lead "ready" signal, which the
+        // existing one-way PUB/SUB connection can't carry at all.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let lead = syncgroup::SyncGroup::start_lead(port, std::time::Duration::ZERO)
+            .expect("starting a real Lead to reconnect to");
+        let peer_connected = lead.peer_connected().expect("a Lead's own is always Some");
+
+        let (mut handler, _togui_rx) = test_handler();
+        handler.settings.sync_role = SyncRole::Follower { lead_addr: "127.0.0.1".into() };
+        handler.settings.sync_publisher_port = port;
+        handler.cache.insert_fake_layout_for_test(1014);
+        handler.cache.insert_fake_layout_for_test(999);
+        let now = OffsetDateTime::now_local().unwrap();
+        // The old layout's own window has ended (matching the real
+        // report: its own schedule entry was replaced, not merely
+        // time-expired, but is_sync_gated(1014) becoming false is the
+        // same observable condition either way).
+        handler.schedule = schedule_with_sync_layout(
+            1014, now - time::Duration::hours(2), now - time::Duration::minutes(1));
+        handler.override_layout = Some(1014);
+        handler.sync_layout_active = true;
+        handler.layouts = vec![1014];
+
+        handler.schedule_check();
+
+        assert!(handler.override_layout.is_none(), "sanity: the override must expire");
+        assert!(handler.sync_group.is_some(),
+                "a fresh SyncGroup Follower connection must now exist");
+        peer_connected.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the Lead must observe a genuinely new connection -- confirming a \
+                     real reconnect happened, not just a state flag flip");
+    }
+
+    #[test]
+    fn the_exact_real_sequence_eventually_stages_the_new_layout_once_cached() {
+        // Reproduces the *exact* sequence from a real report, step by
+        // step, matching real log timestamps: 1018 expires (schedule
+        // now shows 1019 instead) while 1019 isn't cached yet -- the
+        // expiry check fires and reconnects correctly (confirmed
+        // separately by the test above). Several more schedule_check()
+        // calls follow (matching the real periodic 60s tick timer, see
+        // that timer's own doc comment) while 1019 is *still* not
+        // cached -- each one should just re-warn, no state change.
+        // Finally 1019 finishes downloading -- the *next* schedule_check
+        // (matching either another 60s tick or the end of a full
+        // collection cycle) should discover it as newly sync-gated and
+        // stage it. In the real report, this final step never actually
+        // happened -- no such log line ever appeared, even many
+        // schedule_check cycles after 1019 was confirmed downloaded.
+        let (mut handler, _togui_rx) = test_handler();
+        handler.cache.insert_fake_layout_for_test(1018);
+        let now = OffsetDateTime::now_local().unwrap();
+        // Step 1: 1018 was active and synced, matching the real
+        // starting state right before its own window ended.
+        handler.schedule = schedule_with_sync_layout(
+            1018, now - time::Duration::hours(1), now - time::Duration::minutes(1));
+        handler.override_layout = Some(1018);
+        handler.sync_layout_active = true;
+        handler.layouts = vec![1018];
+
+        // Step 2: schedule now shows 1019 instead (not yet cached) --
+        // matches the 12:47:48 real cycle.
+        handler.schedule = schedule_with_sync_layout(
+            1019, now - time::Duration::hours(1), now + time::Duration::hours(1));
+        handler.schedule_check();
+
+        assert!(handler.override_layout.is_none(), "sanity: 1018's own expiry must fire");
+        assert_eq!(handler.layouts, vec![1018],
+                   "sanity: falls back to what's already showing, 1019 isn't cached yet");
+
+        // Step 3: several more schedule_check() calls while 1019 is
+        // STILL not cached -- matches the repeated 60s-tick WARN lines
+        // in the real log (12:47:59 through 12:51:59, five of them).
+        for _ in 0..5 {
+            handler.schedule_check();
+            assert_eq!(handler.layouts, vec![1018], "must keep showing 1018 while waiting");
+            assert_eq!(handler.pending_sync_keys, None,
+                       "must not stage anything while 1019 isn't cached yet");
+        }
+
+        // Step 4: 1019 finally finishes downloading -- matches the
+        // 12:52:46 real "downloading required file 68/103: layout
+        // 1019.xlf" success, followed by schedule_check() at the end
+        // of that same collection cycle.
+        handler.cache.insert_fake_layout_with_sync_keys_for_test(1019, vec!["sync1".into()]);
+        handler.schedule_check();
+
+        // THE CRITICAL ASSERTION: matching the real bug report, where
+        // this never happened -- no "new sync-gated layout: 1019" log
+        // line ever appeared, even many cycles after 1019 was
+        // confirmed downloaded.
+        assert_eq!(handler.pending_sync_keys, Some(vec!["sync1".to_string()]),
+                   "once 1019 is actually in cache, the very next schedule_check must \
+                    discover and stage it as newly sync-gated -- this is the exact step \
+                    that failed to happen in the real report");
+    }
+
+    #[test]
+    fn a_new_sync_gated_layout_stages_even_when_its_sync_keys_match_a_previous_one() {
+        // Regression test for the real, root-cause bug (found only via
+        // a live TEMP-DIAG capture, after several earlier wrong
+        // hypotheses -- see this test's own sibling above): successive
+        // layout swaps within the same live Synchronised Event (a real
+        // sequence: 1017 -> 1018 -> 1019 -> 1020, each confirmed via a
+        // real schedule.xml/log capture) all shared the *exact same*
+        // sync_keys text (["sync1"] -- structurally-similar
+        // templates). The re-publish guard used to compare
+        // pending_sync_keys by *value* -- so once 1019 was
+        // successfully staged/applied, a *later* schedule swap to 1020
+        // (a genuinely different layout, but with the same-looking
+        // sync_keys) was silently ignored: the guard saw "already
+        // staged this sync_keys value" and never re-staged, even
+        // though new_layouts=[1020] correctly differed from
+        // self.layouts=[1019]. A display could then never advance past
+        // whichever layout it last successfully synced to, for as
+        // long as the CMS kept assigning layouts that happened to
+        // share that same sync_keys value.
+        let (mut handler, _togui_rx) = test_handler();
+        handler.cache.insert_fake_layout_with_sync_keys_for_test(1019, vec!["sync1".into()]);
+        handler.cache.insert_fake_layout_with_sync_keys_for_test(1020, vec!["sync1".into()]);
+        let now = OffsetDateTime::now_local().unwrap();
+
+        // 1019 already successfully staged and applied -- matching the
+        // real state right before the CMS reassigns the event to 1020.
+        handler.schedule = schedule_with_sync_layout(
+            1019, now - time::Duration::hours(1), now - time::Duration::minutes(1));
+        handler.override_layout = Some(1019);
+        handler.sync_layout_active = true;
+        handler.layouts = vec![1019];
+        handler.pending_sync_keys = Some(vec!["sync1".into()]);
+        handler.pending_sync_layout_id = Some(1019);
+
+        // The CMS reassigns the same live event to 1020 -- same
+        // sync_keys, genuinely different layout.
+        handler.schedule = schedule_with_sync_layout(
+            1020, now - time::Duration::hours(1), now + time::Duration::hours(1));
+
+        handler.schedule_check();
+
+        assert!(handler.override_layout.is_none(), "sanity: 1019's own expiry must fire");
+        // THE CRITICAL ASSERTION: must stage 1020 despite its own
+        // sync_keys being textually identical to 1019's own.
+        assert_eq!(handler.pending_sync_layout_id, Some(1020),
+                   "a genuinely new sync-gated layout must be staged even when its own \
+                    sync_keys happen to match a previously-handled layout's own -- this \
+                    is the exact real bug: comparing by sync_keys value alone wrongly \
+                    treated this as \"already handled\"");
+        assert_eq!(handler.pending_sync_keys, Some(vec!["sync1".to_string()]));
+    }
+
+    #[test]
     fn a_scheduled_action_override_is_unaffected_by_the_sync_expiry_check() {
         // sync_layout_active must stay false for a Scheduled Action's
         // own override -- the expiry check above must never interfere
@@ -5616,5 +5932,81 @@ mod sync_group_schedule_check_tests {
                 "must not re-stage/re-arm the timer for a sync_keys set that was \
                  already tried and failed to resolve -- doing so every cycle is \
                  exactly the real, severe infinite-loop bug this test guards against");
+    }
+
+    #[test]
+    fn a_not_yet_cached_layout_stages_nothing_until_it_actually_downloads() {
+        // Regression test for a real, severe production bug: the user
+        // swapped which layout a live Synchronised Event points to
+        // (1014 -> 1017 on the CMS). The Lead's own download of 1017's
+        // required files finished fast enough that its own
+        // schedule_check discovered the *real* sync_keys immediately --
+        // but a Follower, racing its own separate download of the same
+        // files (some of which can be deferred to a later cycle via
+        // resource_retry_queue on a transient failure), had its own
+        // schedule_check run *before* 1017 was actually in its own
+        // cache. The old code computed sync_keys as an empty Vec in
+        // that case (via `.unwrap_or_default()`) -- not because the
+        // layout genuinely has none, but because they weren't knowable
+        // yet -- staged that wrong value, and (thanks to the *separate*
+        // fix for the infinite-loop bug just above, which deliberately
+        // never re-stages an already-tried value) got permanently
+        // stuck on it: even once 1017 finished downloading moments
+        // later and its real sync_keys became known, the guard refused
+        // to ever re-stage with the correct value. Confirmed real: the
+        // Follower downloaded the resource but never rendered the new
+        // layout at all.
+        let (mut handler, _togui_rx) = test_handler();
+        let now = OffsetDateTime::now_local().unwrap();
+        // 1017 is sync-gated in the schedule, but deliberately NOT yet
+        // in cache at all (no insert_fake_layout_for_test call for it)
+        // -- matching the real race: schedule.xml already names it,
+        // but its own required files haven't finished downloading yet.
+        handler.schedule = schedule_with_sync_layout(
+            1017, now - time::Duration::hours(1), now + time::Duration::hours(1));
+
+        handler.schedule_check();
+
+        assert_eq!(handler.pending_sync_keys, None,
+                   "a sync-gated layout that isn't in cache yet must stage *nothing* \
+                    at all -- not even an empty Vec, which would then be \
+                    indistinguishable from a genuinely-resolved empty sync_keys set \
+                    once the guard against re-staging kicks in");
+        assert!(handler.sync_apply_timer.try_recv().is_err(),
+                "nothing should have been armed either");
+
+        // The layout finishes downloading moments later, with its real
+        // sync_keys now known.
+        handler.cache.insert_fake_layout_with_sync_keys_for_test(1017, vec!["sync1".into()]);
+
+        handler.schedule_check();
+
+        assert_eq!(handler.pending_sync_keys, Some(vec!["sync1".to_string()]),
+                   "once the layout is actually in cache, a later schedule_check must \
+                    correctly stage its real sync_keys -- this is the exact case that \
+                    used to stay permanently stuck on an empty Vec instead");
+    }
+
+    #[test]
+    fn a_not_yet_cached_layout_does_not_disturb_an_already_pending_switch() {
+        // Companion to the test above: if a *different* synchronized
+        // switch is already correctly staged (e.g. for an ongoing
+        // event this display's own schedule already resolved), a
+        // separate, not-yet-cached sync-gated layout discovery must
+        // not clobber that existing, valid pending_sync_keys value
+        // with anything (empty or otherwise) -- it should be left
+        // completely untouched.
+        let (mut handler, _togui_rx) = test_handler();
+        handler.pending_sync_keys = Some(vec!["already-pending".to_string()]);
+        let now = OffsetDateTime::now_local().unwrap();
+        handler.schedule = schedule_with_sync_layout(
+            2000, now - time::Duration::hours(1), now + time::Duration::hours(1));
+        // 2000 deliberately not in cache.
+
+        handler.schedule_check();
+
+        assert_eq!(handler.pending_sync_keys, Some(vec!["already-pending".to_string()]),
+                   "an already-pending sync_keys value must be left completely \
+                    untouched when a different, not-yet-cached layout is discovered");
     }
 }
