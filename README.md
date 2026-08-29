@@ -10,6 +10,8 @@ implemented mostly in Rust but making use of Qt GUI components, for Linux platfo
 It is currently almost complete but there are still some features that may present errors or that maybe are not perfectly working, in particular:
 VideoWall/SyncGroup and Cycle Playback (also not working properly in the windows client)
 
+SyncGroup should work properly on normal layout but still require a better synchronisation for video.
+
 All the other settings from the cms should work including allow_wan_access and embedded_server_port.
 
 
@@ -48,7 +50,7 @@ The will install the binary to `/usr/bin/arexibo`.  It requires no other files
 at runtime, except for the system libraries it is linked against.
 
 Builds have been tested with the available dependency library versions on Fedora
-41, RHEL 9 with EPEL and Ubuntu 24.04.  Note that in order to play some media
+41, RHEL 9 with EPEL and Ubuntu 26.04.  Note that in order to play some media
 like mp4 videos, you will require a `ffmpeg` package that includes some codecs
 that RHEL/Fedora don't include in their packages, e.g. from rpmfusion.org.
 
@@ -102,6 +104,10 @@ Environment=NO_AT_BRIDGE=1
 [Install]
 WantedBy=multi-user.target
 ```
+
+anyway if audio or dbus are required, as well other settings for touch screen, better use the provided arexibo.service which runs arexibo-kiosk-start and customize that script.
+
+
 ## Useful flags for development
 
     --debug: verbose logging (SOAP calls, internal state transitions).
