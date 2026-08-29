@@ -19,6 +19,7 @@ use crate::util::fingerprint;
 /// single string with three possible shapes, not a separate group-id
 /// + leader-boolean pair as might be assumed from the CMS admin UI's
 /// own "Sync Groups" terminology:
+///
 /// - absent/empty: not part of any Sync Group (the overwhelmingly
 ///   common case)
 /// - the literal string "lead": this display IS the Lead

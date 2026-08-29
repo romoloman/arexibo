@@ -27,6 +27,7 @@
 //! undocumented C# reference client's own wire format (interoperating
 //! with a non-arexibo Sync Group member is explicitly not a
 //! requirement here) -- two message kinds on the same channel:
+//!
 //! - `Sync`: the Lead's own current clock reading, sent periodically
 //!   (independent of any layout change) so a Follower can track the
 //!   clock offset between the two machines without depending on both

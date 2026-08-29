@@ -1004,6 +1004,7 @@ impl<'a> Translator<'a> {
     /// closely on write_region's own geometry/wrapper handling (a
     /// `<drawer>` element carries the same width/height/top/left
     /// attributes a `<region>` does, confirmed from a real XLF), but:
+    ///
     /// - the wrapper stays `display: none` unconditionally (the
     ///   drawer itself is never shown, only individual widgets pulled
     ///   out of it into some *other* region -- see
