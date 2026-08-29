@@ -238,6 +238,26 @@ pub struct Handler {
     /// by sync_keys content, as it must (an id is never trusted
     /// across the network at all).
     pending_sync_layout_id: Option<i64>,
+    /// Set (to the layout id, alongside the `Instant` it was set at)
+    /// right after `reconnect_after_catching_up_on_own` triggers a
+    /// reconnect -- suppresses `schedule_check`'s own *local*
+    /// discovery of this exact layout for a short grace window,
+    /// avoiding a real race confirmed via a live capture: after a
+    /// successful direct catch-up download, the very next
+    /// `schedule_check` call (already unconditionally made by this
+    /// same handler right after resolving) would *independently*
+    /// discover the layout it just finished caching and stage/apply
+    /// it a second time, a few seconds after the reconnect's own
+    /// freshly-coordinated Command already did -- two
+    /// `ForceReloadLayout` navigations close together, a real risk of
+    /// navigating mid-load if a widget's own JS happens to be running
+    /// at that exact moment (see the "occasional blank screen" gap
+    /// this guards against). Deliberately a *short-lived* suppression,
+    /// not a permanent one: if the reconnect doesn't pan out within a
+    /// few seconds (e.g. the Lead is briefly unreachable), local
+    /// discovery must resume normally rather than silently never
+    /// discovering this layout again.
+    suppress_local_discovery_of: Option<(i64, std::time::Instant)>,
     /// Fires at the *local* instant (already offset-corrected --
     /// `SyncCommand::target_local`) of the most recently received Sync
     /// Group Command -- deliberately not applied to `override_layout`
@@ -596,7 +616,7 @@ impl Handler {
                                  duration_rx, trigger_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
-                                 sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None,
+                                 sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None, suppress_local_discovery_of: None,
                                  sync_apply_timer: never(), sync_layout_active: false, sync_peer_connected: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
@@ -643,7 +663,7 @@ impl Handler {
                                  duration_rx, trigger_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
-                                 sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None,
+                                 sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None, suppress_local_discovery_of: None,
                                  sync_apply_timer: never(), sync_layout_active: false, sync_peer_connected: never(),
                                  schedule_overlays: Vec::new(), schedule_overlay_idx: 0,
                                  resource_retry_queue: Vec::new(),
@@ -1755,10 +1775,98 @@ impl Handler {
     /// the Lead's own id directly), this is what lets each display
     /// find *its own* correct layout instead of blindly showing
     /// whichever one the Lead happens to have.
-    fn resolve_layout_for_sync_keys(&self, sync_keys: &[String]) -> Option<i64> {
+    fn resolve_layout_for_sync_keys(&mut self, sync_keys: &[String]) -> Option<i64> {
         let candidate = self.schedule.active_sync_gated_layout(&self.criteria)?;
+        if self.cache.get_layout(candidate).is_none() {
+            // We know *exactly* which layout we need (our own schedule
+            // already names it as sync-gated) -- we just don't have it
+            // cached yet. This resolution attempt is only ever reached
+            // right as a Command/heartbeat carrying sync_keys is being
+            // processed, which (in this design) the Lead only ever
+            // sends once it has itself already successfully applied
+            // the corresponding switch -- i.e. once it has already
+            // downloaded and translated this exact layout itself. A
+            // real, user-proposed hypothesis: the CMS's own
+            // RequiredFiles computation may specifically release a
+            // newly (re)assigned Synchronised Event layout to a
+            // Follower only *after* the Lead has already fetched it --
+            // meaning this precise moment (a Command/heartbeat just
+            // confirmed the Lead is done) is exactly when a retry is
+            // most likely to actually succeed, unlike a fixed short
+            // delay attempted blindly on every collection cycle (an
+            // earlier version of this fix tried exactly that -- see
+            // this function's own history -- which wouldn't reliably
+            // help if this hypothesis is correct, since the CMS's own
+            // gate is the Lead's download, not merely elapsed time).
+            log::info!("Sync Group: layout {candidate} not yet in cache -- retrying \
+                        RequiredFiles now that a Command/heartbeat confirms the Lead \
+                        has already applied it");
+            match self.retry_and_download_layout(candidate) {
+                Ok(()) => {
+                    self.reconnect_after_catching_up_on_own(candidate);
+                    return None;
+                }
+                Err(e) => {
+                    log::warn!("Sync Group: retrying/downloading layout {candidate}: {e:#}");
+                }
+            }
+        }
         let info = self.cache.get_layout(candidate)?;
         info.sync_keys.iter().any(|k| sync_keys.contains(k)).then_some(candidate)
+    }
+
+    /// Called once `retry_and_download_layout` has just successfully
+    /// caught this display's own cache up on `candidate` -- this
+    /// display's own region/playlist timers would otherwise start
+    /// "now" (whenever this download just finished) rather than at
+    /// the Lead's own originally-published target_time, which could
+    /// already be a real, if small, amount of time in the past by now
+    /// (the Lead published it, this display noticed it was missing
+    /// the layout, retried RequiredFiles, downloaded, and translated
+    /// it -- all real elapsed time). Applying immediately would show
+    /// the *correct content*, but drifted in time from the rest of
+    /// the group -- the same class of problem the reconnect-on-expiry
+    /// mechanism exists to avoid. Reconnecting here (Follower only --
+    /// a Lead has nothing to reconnect *to* for its own locally-
+    /// discovered switches) re-triggers the Lead's own
+    /// `sync_peer_connected` reaction, which re-publishes a *fresh*
+    /// target_time -- this display then applies via that normal,
+    /// freshly-coordinated Command instead of right here, so it
+    /// converges on the same real-world instant as everyone else
+    /// rather than one of its own making. A separate method
+    /// specifically so this reaction is directly testable without
+    /// needing a mock capable of a full RequiredFiles+GetFile round
+    /// trip just to reach it.
+    fn reconnect_after_catching_up_on_own(&mut self, candidate: i64) {
+        log::info!("Sync Group: layout {candidate} now downloaded -- reconnecting to \
+                    get a freshly-coordinated sync from the Lead instead of applying \
+                    immediately with potentially stale timing");
+        // See this field's own doc comment -- avoids racing with the
+        // immediately-following schedule_check() call (already made
+        // unconditionally by this function's own caller) independently
+        // re-discovering this exact, just-cached layout on its own and
+        // staging/applying it a second time.
+        self.suppress_local_discovery_of = Some((candidate, std::time::Instant::now()));
+        if let SyncRole::Follower { lead_addr } = &self.settings.sync_role {
+            let lead_addr = lead_addr.clone();
+            self.connect_as_follower(&lead_addr);
+        }
+    }
+
+    /// Re-queries `RequiredFiles` and, if it now offers `id` as a
+    /// layout-typed entry, downloads and translates it immediately --
+    /// see `resolve_layout_for_sync_keys`'s own call site for why this
+    /// specific moment (not a blind, fixed-delay retry) is the right
+    /// time to try this.
+    fn retry_and_download_layout(&mut self, id: i64) -> Result<()> {
+        let (required, _purge) = self.xmds.required_files()
+            .context("retrying RequiredFiles")?;
+        let file = required.into_iter()
+            .find(|f| matches!(f, ReqFile::File { typ: "layout", id: fid, .. } if *fid == id))
+            .with_context(|| format!("layout {id} still not offered by RequiredFiles"))?;
+        self.cache.download(file, &mut self.xmds)
+            .with_context(|| format!("downloading layout {id}"))?;
+        Ok(())
     }
 
     fn schedule_check(&mut self) {
@@ -1879,6 +1987,22 @@ impl Handler {
                 .is_some_and(|&id| self.schedule.is_sync_gated(id, &self.criteria));
             if sync_gated {
                 let first = new_layouts[0];
+                // See suppress_local_discovery_of's own doc comment --
+                // a short-lived grace window (long enough for a
+                // reconnect + fresh Command round trip, matching real,
+                // observed timing of ~1-2s; falls back to normal
+                // discovery on its own if that doesn't pan out) to
+                // avoid racing with a reconnect
+                // reconnect_after_catching_up_on_own just triggered
+                // for this exact layout.
+                let suppressed = matches!(self.suppress_local_discovery_of,
+                    Some((id, at)) if id == first
+                        && at.elapsed() < std::time::Duration::from_secs(5));
+                if suppressed {
+                    log::debug!("Sync Group: local discovery of layout {first} \
+                                 suppressed briefly -- a reconnect already triggered \
+                                 for it is expected to produce a fresh Command shortly");
+                } else {
                 // This display's own layout's own sync_keys -- not an
                 // id at all, published/staged below (see
                 // resolve_layout_for_sync_keys's own doc comment for
@@ -1969,6 +2093,7 @@ impl Handler {
                                      will determine its own sync_keys and stage a \
                                      synchronized switch once it's downloaded");
                     }
+                }
                 }
                 // Deliberately not updating self.layouts/ToGui::Layouts
                 // here -- that only happens once sync_apply_timer
@@ -5800,6 +5925,139 @@ mod sync_group_schedule_check_tests {
         let resolved = handler.resolve_layout_for_sync_keys(&["sync-x".to_string()]);
 
         assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn a_scheduled_but_not_yet_cached_layout_retries_required_files_and_fails_gracefully() {
+        // The user's own proposed fix: when we already know exactly
+        // which layout we need (our own schedule names it as
+        // sync-gated) but don't have it cached yet, this is precisely
+        // the moment (a Command/heartbeat carrying sync_keys is being
+        // resolved) to retry RequiredFiles directly -- rather than a
+        // blind, fixed-delay retry attempted on every collection cycle
+        // regardless of whether it could possibly help (an earlier,
+        // since-reverted version of this fix did exactly that). The
+        // simple mock this test uses can't correctly answer a real
+        // RequiredFiles/GetFile round trip -- this test only confirms
+        // the attempt is made and fails *gracefully* (no panic, a
+        // clean None -- not part of the specific test_handler's own
+        // request log, since checking that would need a more capable
+        // mock server than this module's own tests otherwise need).
+        let (mut handler, _togui_rx) = test_handler();
+        let now = OffsetDateTime::now_local().unwrap();
+        // Named as sync-gated in the schedule, but deliberately never
+        // cached at all -- matching the real gap this retry targets.
+        handler.schedule = schedule_with_sync_layout(
+            1024, now - time::Duration::hours(1), now + time::Duration::hours(1));
+
+        let resolved = handler.resolve_layout_for_sync_keys(&["sync1".to_string()]);
+
+        assert_eq!(resolved, None,
+                   "the retry attempt must fail gracefully against a mock that can't \
+                    serve a real RequiredFiles/GetFile round trip -- no panic, and no \
+                    incorrect resolution");
+    }
+
+    #[test]
+    fn catching_up_on_our_own_reconnects_for_a_freshly_coordinated_sync() {
+        // The user's own follow-up insight: even once this display has
+        // successfully caught up on its own (via retry_and_download_
+        // layout), applying the switch *immediately* here would start
+        // this display's own region/playlist timers at whatever real-
+        // world moment its own download happened to finish -- not at
+        // the Lead's own originally-published target_time, which is
+        // already a real (if usually small) amount of time in the past
+        // by the time all this retrying/downloading finishes. Correct
+        // *content*, but drifted *timing* -- exactly the class of
+        // problem the reconnect-on-expiry mechanism already exists to
+        // avoid. Reconnecting here re-triggers the Lead's own
+        // sync_peer_connected reaction (already confirmed real,
+        // working correctly, via a live capture), which re-publishes a
+        // fresh target_time for this display to apply against
+        // instead. Tested by calling the extracted reaction directly
+        // (see its own doc comment for why) -- a full round trip
+        // through a real download success would need a mock capable
+        // of a whole RequiredFiles+GetFile exchange, which this
+        // module's own tests don't otherwise require.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let lead = syncgroup::SyncGroup::start_lead(port, std::time::Duration::ZERO)
+            .expect("starting a real Lead to reconnect to");
+        let peer_connected = lead.peer_connected().expect("a Lead's own is always Some");
+
+        let (mut handler, _togui_rx) = test_handler();
+        handler.settings.sync_role = SyncRole::Follower { lead_addr: "127.0.0.1".into() };
+        handler.settings.sync_publisher_port = port;
+
+        handler.reconnect_after_catching_up_on_own(1024);
+
+        assert!(handler.sync_group.is_some(),
+                "a fresh SyncGroup Follower connection must now exist");
+        peer_connected.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the Lead must observe a genuinely new connection");
+    }
+
+    #[test]
+    fn an_active_suppression_prevents_the_race_this_whole_mechanism_guards_against() {
+        // Regression test for a real, live-observed race: after a
+        // successful direct catch-up download (via
+        // retry_and_download_layout), reconnect_after_catching_up_on_own
+        // triggers a reconnect for a freshly-coordinated sync -- but the
+        // very next schedule_check() call (already made unconditionally
+        // by this same handler right after resolving) would otherwise
+        // *independently* discover the very layout that was just cached
+        // and stage/apply it a second time, a few seconds after the
+        // reconnect's own fresh Command already did. Confirmed real via
+        // a live capture: two `ForceReloadLayout` navigations close
+        // together -- a real risk of navigating mid-load if a widget's
+        // own JS happens to be running at that exact moment.
+        let (mut handler, _togui_rx) = test_handler();
+        handler.cache.insert_fake_layout_with_sync_keys_for_test(1024, vec!["sync1".into()]);
+        let now = OffsetDateTime::now_local().unwrap();
+        handler.schedule = schedule_with_sync_layout(
+            1024, now - time::Duration::hours(1), now + time::Duration::hours(1));
+        // Matches exactly what reconnect_after_catching_up_on_own sets,
+        // simulating "a reconnect for this exact layout was just
+        // triggered, moments ago".
+        handler.suppress_local_discovery_of = Some((1024, std::time::Instant::now()));
+
+        handler.schedule_check();
+
+        assert_eq!(handler.pending_sync_layout_id, None,
+                   "local discovery must be suppressed while the reconnect-triggered \
+                    fresh Command is still expected imminently -- staging it locally \
+                    too would race with that fresh Command, causing two \
+                    ForceReloadLayout navigations close together");
+    }
+
+    #[test]
+    fn an_expired_suppression_lets_local_discovery_resume_normally() {
+        // The other half of the same mechanism: if the reconnect
+        // doesn't pan out within a reasonable window (e.g. the Lead is
+        // briefly unreachable), this display must not be left
+        // permanently unable to discover a layout it has every right to
+        // show -- the suppression is deliberately short-lived, not a
+        // permanent block.
+        let (mut handler, _togui_rx) = test_handler();
+        handler.cache.insert_fake_layout_with_sync_keys_for_test(1024, vec!["sync1".into()]);
+        let now = OffsetDateTime::now_local().unwrap();
+        handler.schedule = schedule_with_sync_layout(
+            1024, now - time::Duration::hours(1), now + time::Duration::hours(1));
+        // Simulate a suppression set well past its own grace window
+        // (real code uses 5s; well over a minute here removes any
+        // possible timing flakiness in this assertion).
+        handler.suppress_local_discovery_of = Some((1024,
+            std::time::Instant::now() - std::time::Duration::from_secs(90)));
+
+        handler.schedule_check();
+
+        assert_eq!(handler.pending_sync_layout_id, Some(1024),
+                   "an expired suppression must not block local discovery from \
+                    resuming normally -- otherwise a failed reconnect attempt could \
+                    leave this display stuck, never discovering a layout it has \
+                    every right to show");
     }
 
     #[test]
