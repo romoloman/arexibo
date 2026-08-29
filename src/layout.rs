@@ -399,6 +399,20 @@ enum Trans {
 /// -- see write_media's transition-resolution logic.
 type MediaInfo = (i32, String, String, String, Trans, u32, Trans, u32);
 
+/// Enter/exit animation for a single media item -- groups what used to
+/// be four separate parameters (trans_in, ms_in, trans_out, ms_out) on
+/// `write_show_stop_functions` into one value, since clippy's own
+/// `too_many_arguments` lint (default threshold 7, this crate builds
+/// with `-D warnings`) counted that function's total at 9 including
+/// `&mut self`.
+#[derive(Clone, Copy)]
+struct Transitions {
+    in_kind: Trans,
+    in_ms: u32,
+    out_kind: Trans,
+    out_ms: u32,
+}
+
 pub struct Translator<'a> {
     id: LayoutId,
     tree: Option<Element>,
@@ -839,7 +853,9 @@ impl<'a> Translator<'a> {
         for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in sequence {
             writeln!(self.out, "    [")?;
             self.write_show_stop_functions(mid, &add_start, &add_stop,
-                                            trans_in, ms_in, trans_out, ms_out, nitems > 1)?;
+                                            Transitions { in_kind: trans_in, in_ms: ms_in,
+                                                          out_kind: trans_out, out_ms: ms_out },
+                                            nitems > 1)?;
             writeln!(self.out, "    , {duration}, {mid}],")?;
         }
         writeln!(self.out, "  ],")?;
@@ -871,8 +887,9 @@ impl<'a> Translator<'a> {
     /// functions should always pass `true` here regardless of the
     /// target region's own item count.
     fn write_show_stop_functions(&mut self, mid: i32, add_start: &str, add_stop: &str,
-                                  trans_in: Trans, ms_in: u32, trans_out: Trans, ms_out: u32,
-                                  always_hide: bool) -> Result<()> {
+                                  transitions: Transitions, always_hide: bool) -> Result<()> {
+        let Transitions { in_kind: trans_in, in_ms: ms_in, out_kind: trans_out, out_ms: ms_out }
+            = transitions;
         writeln!(self.out, "      function() {{")?;
         // Diagnostic log (found genuinely useful investigating a
         // real "content renders correctly inside its own iframe but
@@ -1107,7 +1124,9 @@ impl<'a> Translator<'a> {
             self.drawer_widgets.insert(mid);
             writeln!(self.out, "window.arexibo.drawerWidgets[{mid}] = [")?;
             self.write_show_stop_functions(mid, &add_start, &add_stop,
-                                            trans_in, ms_in, trans_out, ms_out, true)?;
+                                            Transitions { in_kind: trans_in, in_ms: ms_in,
+                                                          out_kind: trans_out, out_ms: ms_out },
+                                            true)?;
             writeln!(self.out, ", {duration}];")?;
         }
         writeln!(self.out, "</script>")?;
