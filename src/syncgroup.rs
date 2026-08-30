@@ -412,6 +412,36 @@ fn lead_publish_loop(peers: Arc<Mutex<Vec<TcpStream>>>, publish_rx: Receiver<Vec
         // check interval whenever no layout switch is pending.
         match publish_rx.recv_timeout(StdDuration::from_millis(200)) {
             Ok(sync_keys) => {
+                // Broadcasts a Sync right alongside every Command --
+                // a real, severe regression found this way: a
+                // Follower that receives a Command before it has
+                // ever received a Sync message has no real clock
+                // offset to correct target_time with. Deferring that
+                // Command until a real offset is known (rather than
+                // applying it "verbatim", uncorrected) is correct in
+                // principle -- but without this, the wait for the
+                // *next* periodic Sync (up to SYNC_INTERVAL, 5s away,
+                // since the two run on independent schedules) was
+                // confirmed real via a live capture to take upwards
+                // of 3 seconds -- far worse than the small (~100-
+                // 150ms), uncorrected clock-skew error the deferral
+                // was meant to fix in the first place. Sending one
+                // right here means a Follower's own offset is
+                // established (or refreshed) at essentially the same
+                // instant it receives this Command, eliminating that
+                // multi-second wait entirely. This Sync's own
+                // current_sync_keys may be momentarily stale (this
+                // Lead's own current_sync_keys only updates once its
+                // own apply timer actually fires, same as every other
+                // display in the group) -- harmless: the Follower's
+                // own catch-up check just compares it against what it
+                // already knows, and the Command broadcast right
+                // after carries the authoritative new value regardless.
+                let current = current_sync_keys.lock().expect("poisoned lock").clone();
+                broadcast(&peers, &Message::Sync { lead_time: OffsetDateTime::now_utc(),
+                                                    current_sync_keys: current });
+                last_sync = Instant::now();
+
                 // `switch_delay` (the CMS's own configured "Switch
                 // Delay" for this Sync Group, e.g. 750ms -- previously
                 // parsed into PlayerSettings but never actually
@@ -664,19 +694,35 @@ mod tests {
     }
 
     #[test]
-    fn a_command_arriving_before_any_sync_is_deferred_then_applied_with_a_real_offset() {
-        // Regression test for a real design flaw, found via a live
-        // capture: the Lead's own accept_loop can broadcast a fresh
-        // Command to a newly-connected Follower *before* its own next
-        // periodic Sync heartbeat is due (the two run on independent
-        // schedules) -- confirmed real via "received a Command before
-        // any Sync message" appearing in a live log. Applying
-        // `target_time` "verbatim" (no offset correction) in that case
-        // is close to useless for this mechanism's whole point,
-        // precise coordination -- the user's own proposed fix: defer
-        // it until a real offset is known (the first Sync heartbeat),
-        // then apply it correctly then, rather than immediately but
-        // meaningfully.
+    fn a_command_arrives_quickly_even_right_after_connecting_thanks_to_an_accompanying_sync() {
+        // Regression test for a real, *severe* problem found via a
+        // live capture, in two stages:
+        //
+        // 1. The Lead's own accept_loop can broadcast a fresh Command
+        //    to a newly-connected Follower *before* its own next
+        //    periodic Sync heartbeat is due (the two used to run on
+        //    independent schedules) -- confirmed real via "received a
+        //    Command before any Sync message" in a live log. Applying
+        //    `target_time` "verbatim" (no offset correction) in that
+        //    case is close to useless for this mechanism's whole
+        //    point, precise coordination.
+        //
+        // 2. The first fix for that (defer the Command until a real
+        //    offset is known, via the next Sync) made things *worse*,
+        //    not better: confirmed via a live capture, the wait for
+        //    that next periodic Sync (up to SYNC_INTERVAL, 5s, since
+        //    the two ran on independent schedules) took upwards of 3
+        //    real seconds in one capture -- far worse than the small
+        //    (~100-150ms), uncorrected clock-skew error the deferral
+        //    was meant to fix in the first place.
+        //
+        // The real fix (this test's own subject): the Lead now sends
+        // a Sync *immediately alongside* every Command it publishes,
+        // so a Follower's own offset is established (or refreshed) at
+        // essentially the same instant it receives that Command --
+        // this test confirms the whole round trip (publish -> receive
+        // a usable Command) now completes quickly, not after a
+        // multi-second wait.
         let port = {
             let probe = TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
@@ -686,8 +732,8 @@ mod tests {
         // on its own publish loop starting, before any Follower has
         // connected at all) fire harmlessly to an empty peer list --
         // its own *next* one won't be due for another ~SYNC_INTERVAL,
-        // reliably opening the same real window a live Command can
-        // arrive first in.
+        // reliably reproducing the same real window a live Command
+        // used to arrive first (unaccompanied) in.
         std::thread::sleep(StdDuration::from_millis(500));
 
         let follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
@@ -703,27 +749,21 @@ mod tests {
         // Published immediately -- mirrors mainloop.rs's own
         // sync_peer_connected handler reacting to this same
         // connection, well before the Lead's own next periodic Sync
-        // (not due for several more seconds) could possibly arrive
-        // first.
+        // (not due for several more seconds) would otherwise arrive.
         leader.publish_sync_keys(vec!["sync1".into()]);
 
         let commands = follower.commands().expect("a Follower's own is always Some");
-        // Nothing should arrive yet -- the Command must be held back,
-        // not forwarded with a meaningless "verbatim" target_local.
-        assert!(commands.recv_timeout(StdDuration::from_millis(500)).is_err(),
-                "a Command arriving before any Sync message must be deferred, not \
-                 applied immediately with an unknown/zero clock offset");
-
-        // The Lead's own next periodic Sync (~SYNC_INTERVAL away) then
-        // arrives, establishing a real offset -- the deferred Command
-        // must be applied then, with that real offset incorporated.
-        let cmd = commands.recv_timeout(StdDuration::from_secs(10))
-            .expect("the deferred Command must be applied once a real clock offset \
-                     becomes known, not lost entirely");
+        // Must arrive quickly -- well under SYNC_INTERVAL (5s) -- since
+        // an accompanying Sync is sent right alongside this Command,
+        // not several seconds later via the next periodic one.
+        let cmd = commands.recv_timeout(StdDuration::from_secs(2))
+            .expect("a Command must arrive quickly, thanks to its own accompanying Sync \
+                     establishing a real clock offset immediately -- not several seconds \
+                     later via the next unrelated periodic Sync");
         assert_eq!(cmd.sync_keys, vec!["sync1".to_string()]);
         let now = OffsetDateTime::now_utc();
         let drift = (cmd.target_local - now).abs();
-        assert!(drift < TimeDuration::seconds(5),
+        assert!(drift < TimeDuration::seconds(2),
                 "target_local ({:?}) should be close to now ({now:?}) once a real \
                  offset was applied, got drift {drift:?}", cmd.target_local);
     }
