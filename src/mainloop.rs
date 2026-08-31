@@ -153,6 +153,17 @@ pub struct Handler {
     /// run" check has to live here instead.
     commands_run: std::collections::HashSet<i64>,
     current_layout: i64,
+    /// Set by the `Purge` XMR handler (a real bug found this way: a
+    /// currently-playing video widget left stuck/frozen mid-playback
+    /// after a live "purgeAll" CMS action -- see that handler's own
+    /// doc comment for why) -- checked and cleared right after the
+    /// very next `collect_once()` completes, forcing a real GUI reload
+    /// of whatever's currently showing regardless of whether the
+    /// schedule/layout id itself changed at all (an ordinary
+    /// `ToGui::Layouts` is silently no-op'd by the GUI's own
+    /// `Schedule<T>::update` on an unchanged id -- see
+    /// `ForceReloadLayout`'s own doc comment).
+    force_reload_after_collect: bool,
     /// Set by an XMR `changeLayout` action: while `Some`, completely
     /// bypasses the normal CMS-driven schedule (see `schedule_check()`)
     /// and forces this one layout to be shown, exactly like the C#
@@ -606,7 +617,7 @@ impl Handler {
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
                                  layouts, commands_run: std::collections::HashSet::new(),
-                                 envdir: envdir.into(), current_layout: 0,
+                                 envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -653,7 +664,7 @@ impl Handler {
             let mut slf = Self { to_gui, from_gui, settings: PlayerSettings::default(),
                                  cache, xmds, xmr: never(), schedule: Schedule::default(),
                                  layouts: vec![], commands_run: std::collections::HashSet::new(),
-                                 envdir: envdir.into(), current_layout: 0,
+                                 envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -738,6 +749,18 @@ impl Handler {
                     // is sooner than whatever's currently armed --
                     // harmless no-op if nothing changed.
                     self.rearm_data_refresh_timer();
+                    // See this flag's own doc comment (set by the
+                    // `Purge` XMR handler) -- forces a real reload of
+                    // whatever's currently showing now that the fresh
+                    // files purge triggered are back, regardless of
+                    // whether collect_once() above actually succeeded
+                    // (even a failed collection may have still managed
+                    // to redownload enough for the currently-stuck
+                    // widget specifically -- and if not, this is
+                    // harmless: the reload just re-hits the same
+                    // missing files it would have anyway, no worse off
+                    // than not reloading at all).
+                    self.maybe_force_reload_after_purge();
                     // While waiting for CMS authorization or a working
                     // network (see pending_auth/pending_network), retry
                     // much sooner than the normal collect_interval (which
@@ -983,6 +1006,32 @@ impl Handler {
                             log::error!("during cache purge: {e:#}");
                         }
                         collect = after(Duration::from_secs(0));  // force re-download
+                        // A real, severe bug found this way: purge()
+                        // deletes every file on disk *immediately* --
+                        // including whatever a currently-playing video
+                        // widget's own <video> element is still
+                        // actively streaming from arexibo's own
+                        // embedded HTTP server (which reads each
+                        // request straight from disk, not from some
+                        // already-open, purge-proof handle). A
+                        // mid-stream byte-range request for a file
+                        // that's just been deleted fails outright,
+                        // and -- confirmed by a live report -- the
+                        // widget then stays stuck/frozen right there
+                        // indefinitely: schedule_check()'s own reload
+                        // decision is keyed on the *layout id*
+                        // actually changing, but a purge changes only
+                        // the files underneath an *unchanged*
+                        // schedule, so nothing would otherwise ever
+                        // tell the GUI to recover. Forcing a real
+                        // reload once the fresh files are back (see
+                        // this flag's own check below, right after the
+                        // very next collect_once() completes) gives
+                        // every widget currently showing a clean
+                        // restart against the newly-redownloaded
+                        // content, rather than leaving anything
+                        // whatever purge managed to interrupt stuck.
+                        self.force_reload_after_collect = true;
                     }
                     Ok(xmr::Message::WebHook(code)) => {
                         if self.handle_trigger_code(&code) {
@@ -1462,74 +1511,7 @@ impl Handler {
         // schedule.xml samples, before and after a real publish).
         let current_scheduleid = self.schedule.scheduleid_for(self.current_layout);
 
-        // download all missing files
-        let mut result = Vec::new();
-        let total = required.len();
-        // DownloadStartWindow/DownloadEndWindow gates only bulk file
-        // downloads below, not the lightweight XMDS calls above --
-        // schedule/layout-switching still needs current info even
-        // outside the window, using whatever's already cached.
-        if !self.settings.is_within_download_window() {
-            log::info!("outside the configured download window \
-                        ({}-{}), skipping {total} pending file download(s) \
-                        this cycle", self.settings.download_start_window,
-                       self.settings.download_end_window);
-        } else {
-        for (i, file) in required.into_iter().enumerate() {
-            if !self.cache.has(&file)
-               && !is_exempt_as_currently_playing_layout(&file, current_scheduleid,
-                                                          &schedule,
-                                                          self.settings.expire_modified_layouts) {
-                let filedesc = file.description();
-                let inventory = file.inventory();
-                // Captured before `file` is moved into `download()` below
-                // -- used only to attach a layoutId to a fault report if
-                // this specific download fails and it was a layout (see
-                // faults.rs; other required-file types aren't reported
-                // as faults yet, deliberately scoped out for now).
-                let layout_id_if_any = match &file {
-                    ReqFile::File { typ: "layout", id, .. } => Some(*id),
-                    _ => None,
-                };
-                log::info!("downloading required file {}/{}: {}", i+1, total, filedesc);
-                // Dependencies are excluded from the MediaInventory
-                // report below (not pushed to `result` at all) --
-                // unlike media/layout files, they have no single
-                // meaningful integer id to report (see ReqFile::
-                // Dependency's own doc comment), and the reference
-                // client doesn't appear to report on them via
-                // MediaInventory either. Reporting a synthetic
-                // placeholder id for every dependency downloaded in
-                // the same cycle would produce multiple identical,
-                // meaningless entries in that report.
-                let is_dependency = matches!(file, crate::resource::ReqFile::Dependency { .. });
-                match self.cache.download(file.clone(), &mut self.xmds)
-                                .with_context(|| format!("downloading {filedesc}"))
-                {
-                    Ok(()) => if !is_dependency { result.push((inventory, true)); },
-                    Err(e) => {
-                        log::error!("{e:#}");
-                        if let Some(layout_id) = layout_id_if_any {
-                            self.faults.record(
-                                faults::Fault::new(
-                                    faults::FAULT_CODE_LAYOUT_TRANSLATE_FAILED,
-                                    format!("{e:#}"),
-                                ).with_layout(layout_id)
-                            );
-                        }
-                        // Resource downloads get a short-delay retry
-                        // (see resource_retry_queue's own doc comment)
-                        // instead of just being reported as failed.
-                        if matches!(file, crate::resource::ReqFile::Resource { .. }) {
-                            self.resource_retry_queue.push((file, 0));
-                            self.resource_retry_timer = after(RESOURCE_RETRY_DELAY);
-                        }
-                        if !is_dependency { result.push((inventory, false)); }
-                    }
-                }
-            }
-        }
-        }
+        let result = self.download_required_files(required, current_scheduleid, &schedule);
 
         // let the CMS know we have the media
         self.xmds.submit_media_inventory(result)?;
@@ -1605,6 +1587,112 @@ impl Handler {
 
         log::info!("collection successful");
         Ok(())
+    }
+
+    /// For each file RequiredFiles said this display needs: download
+    /// it if missing, and build the MediaInventory report to submit
+    /// back to the CMS confirming what's actually on disk. A separate
+    /// method specifically so this is directly testable against a
+    /// real `Cache` without needing to mock the full RegisterDisplay/
+    /// RequiredFiles/Schedule/GetWeather/SubmitLog/NotifyStatus SOAP
+    /// chain `collect_once` otherwise requires just to reach it.
+    fn download_required_files(&mut self, required: Vec<ReqFile>, current_scheduleid: i64,
+                                schedule: &Schedule) -> Vec<((&'static str, i64), bool)> {
+        let mut result = Vec::new();
+        let total = required.len();
+        // DownloadStartWindow/DownloadEndWindow gates only bulk file
+        // downloads here, not the lightweight XMDS calls in
+        // collect_once around this call -- schedule/layout-switching
+        // still needs current info even outside the window, using
+        // whatever's already cached.
+        if !self.settings.is_within_download_window() {
+            log::info!("outside the configured download window \
+                        ({}-{}), skipping {total} pending file download(s) \
+                        this cycle", self.settings.download_start_window,
+                       self.settings.download_end_window);
+            return result;
+        }
+        for (i, file) in required.into_iter().enumerate() {
+            let filedesc = file.description();
+            let inventory = file.inventory();
+            // Dependencies are excluded from the MediaInventory report
+            // below entirely -- unlike media/layout files, they have
+            // no single meaningful integer id to report (see ReqFile::
+            // Dependency's own doc comment), and the reference client
+            // doesn't appear to report on them via MediaInventory
+            // either. Reporting a synthetic placeholder id for every
+            // dependency downloaded/cached in the same cycle would
+            // produce multiple identical, meaningless entries in that
+            // report.
+            let is_dependency = matches!(file, crate::resource::ReqFile::Dependency { .. });
+            if self.cache.has(&file) {
+                // A real, confirmed bug found this way: a file already
+                // fully cached from an earlier collection cycle (e.g.
+                // this exact content was downloaded once, the schedule
+                // referencing it was then removed, and it's now simply
+                // being re-scheduled) used to be reported here *only*
+                // at the moment it was first downloaded, inside the
+                // branch further below -- never again on any later
+                // cycle where it's already cached, meaning it was
+                // never included in *this* collection's own
+                // MediaInventory submission at all. Confirmed real via
+                // a live report: "Playlist stays pending in CMS after
+                // re-scheduling already-downloaded content" -- the
+                // CMS's own Manage Display view kept showing it as
+                // pending/incomplete indefinitely, even though it was
+                // already playing correctly, since the CMS was simply
+                // never told again that this display actually has it.
+                if !is_dependency { result.push((inventory, true)); }
+                continue;
+            }
+            if is_exempt_as_currently_playing_layout(&file, current_scheduleid, schedule,
+                                                      self.settings.expire_modified_layouts) {
+                // Deliberately deferred (a *different*/modified version
+                // is needed, but this exact layout is currently
+                // playing) -- correctly left unreported either way this
+                // cycle, same as before this fix: it's genuinely not
+                // yet the version the CMS is asking for, unlike the
+                // already-fully-cached case just above.
+                continue;
+            }
+            {
+                // Captured before `file` is moved into `download()` below
+                // -- used only to attach a layoutId to a fault report if
+                // this specific download fails and it was a layout (see
+                // faults.rs; other required-file types aren't reported
+                // as faults yet, deliberately scoped out for now).
+                let layout_id_if_any = match &file {
+                    ReqFile::File { typ: "layout", id, .. } => Some(*id),
+                    _ => None,
+                };
+                log::info!("downloading required file {}/{}: {}", i+1, total, filedesc);
+                match self.cache.download(file.clone(), &mut self.xmds)
+                                .with_context(|| format!("downloading {filedesc}"))
+                {
+                    Ok(()) => if !is_dependency { result.push((inventory, true)); },
+                    Err(e) => {
+                        log::error!("{e:#}");
+                        if let Some(layout_id) = layout_id_if_any {
+                            self.faults.record(
+                                faults::Fault::new(
+                                    faults::FAULT_CODE_LAYOUT_TRANSLATE_FAILED,
+                                    format!("{e:#}"),
+                                ).with_layout(layout_id)
+                            );
+                        }
+                        // Resource downloads get a short-delay retry
+                        // (see resource_retry_queue's own doc comment)
+                        // instead of just being reported as failed.
+                        if matches!(file, crate::resource::ReqFile::Resource { .. }) {
+                            self.resource_retry_queue.push((file, 0));
+                            self.resource_retry_timer = after(RESOURCE_RETRY_DELAY);
+                        }
+                        if !is_dependency { result.push((inventory, false)); }
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Proof of Play (layout-level, see stats.rs): close out the
@@ -2483,6 +2571,19 @@ impl Handler {
             Some(d) => after(d),
             None => never(),
         };
+    }
+
+    /// Checks and clears `force_reload_after_collect` (see its own
+    /// doc comment) -- called right after every `collect_once()`
+    /// completes, regardless of success or failure. A separate method
+    /// specifically so this is directly testable without needing to
+    /// drive the whole (infinite, blocking) `run()` loop just to
+    /// reach it.
+    fn maybe_force_reload_after_purge(&mut self) {
+        if self.force_reload_after_collect {
+            self.force_reload_after_collect = false;
+            self.to_gui.send(ToGui::ForceReloadLayout(self.current_layout)).unwrap();
+        }
     }
 
     /// Apply new player settings.
@@ -5195,6 +5296,133 @@ mod data_refresh_timer_tests {
         // (re-confirms rearm gets called even with nothing to do).
         handler.refresh_due_data_widgets();
         assert!(handler.next_data_refresh.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn maybe_force_reload_after_purge_reloads_only_when_the_flag_is_set() {
+        // Regression test for a real, severe bug found via a live
+        // report: "purgeAll from CMS leaves a currently playing video
+        // widget stuck/frozen mid-playback." Root cause: purge()
+        // deletes every file on disk *immediately*, including whatever
+        // a currently-playing widget's own element is still actively
+        // streaming from arexibo's own embedded HTTP server (which
+        // reads each request straight from disk) -- a mid-stream
+        // request for a file that's just been deleted fails outright,
+        // and nothing ever told the GUI to recover: schedule_check()'s
+        // own reload decision is keyed on the *layout id* actually
+        // changing, but a purge changes only the files underneath an
+        // *unchanged* schedule. This method (called after every
+        // collect_once(), see its own call site) forces a real reload
+        // once the fresh, purge-triggered redownload is back --
+        // giving a stuck widget a clean restart.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        // With the flag unset (the ordinary case, every other
+        // collect_once() completion that isn't purge-triggered), this
+        // must be a safe no-op -- no reload for every normal collection.
+        handler.maybe_force_reload_after_purge();
+        assert!(togui_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "must not force a reload when the flag was never set");
+
+        // With the flag set (as the `Purge` XMR handler does), the
+        // *current* layout must be force-reloaded, and the flag must be
+        // cleared afterward (so it doesn't keep reloading on every
+        // subsequent, unrelated collection).
+        handler.current_layout = 4242;
+        handler.force_reload_after_collect = true;
+        handler.maybe_force_reload_after_purge();
+        let msg = togui_rx.recv_timeout(Duration::from_millis(500))
+            .expect("must force a reload when the flag was set");
+        assert!(matches!(msg, ToGui::ForceReloadLayout(4242)),
+                "must reload the *current* layout specifically, not an ordinary \
+                 ToGui::Layouts (which the GUI's own Schedule<T>::update would silently \
+                 no-op on an unchanged id -- see ForceReloadLayout's own doc comment)");
+        assert!(!handler.force_reload_after_collect,
+                "the flag must be cleared after acting on it, or every later collection \
+                 (unrelated to the purge that set it) would keep force-reloading forever");
+    }
+
+    #[test]
+    fn an_already_cached_file_is_still_reported_complete_in_media_inventory() {
+        // Regression test for a real, confirmed bug: "Playlist stays
+        // pending in CMS after re-scheduling already-downloaded
+        // content." Root cause: a required file already fully cached
+        // from an earlier collection cycle (e.g. downloaded once, the
+        // schedule referencing it was then removed, and it's now
+        // simply being re-scheduled) used to be reported in the
+        // MediaInventory submission *only* at the moment it was first
+        // downloaded -- never again on any later cycle where it's
+        // already cached (the whole reporting branch was nested
+        // *inside* the "needs downloading" check). It was therefore
+        // never included in *this* collection's own submission at
+        // all, and the CMS's own Manage Display view kept showing it
+        // as pending/incomplete indefinitely, even though it was
+        // already playing correctly on the display.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        // Already fully cached (matching md5, an empty Vec here) --
+        // simulating this exact layout having been downloaded in an
+        // earlier collection cycle, entirely without needing to mock
+        // a real network download for this test.
+        handler.cache.insert_fake_layout_for_test(100);
+        let file = ReqFile::File { id: 100, typ: "layout", size: 0, md5: vec![],
+                                    http: false, path: String::new(), name: String::new(),
+                                    code: None };
+
+        let result = handler.download_required_files(vec![file], 0, &Schedule::default());
+
+        assert_eq!(result, vec![(("layout", 100), true)],
+                    "an already-cached file must still be reported as complete in this \
+                     collection's own MediaInventory submission, not silently omitted \
+                     just because it didn't need downloading this cycle");
+    }
+
+    #[test]
+    fn a_missing_file_that_fails_to_download_is_reported_incomplete() {
+        // Companion to the test above -- confirms the opposite case
+        // (a file that's genuinely missing, and fails to download)
+        // still correctly reports `false`/incomplete, unaffected by
+        // the fix above (which only changes the *already-cached*
+        // path).
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        // Not cached at all -- and start_mock_ready's own GetResource/
+        // GetFile-equivalent endpoints aren't wired up to serve real
+        // content, so the download attempt genuinely fails.
+        let file = ReqFile::File { id: 999, typ: "layout", size: 0, md5: vec![1, 2, 3],
+                                    http: false, path: String::new(), name: String::new(),
+                                    code: None };
+
+        let result = handler.download_required_files(vec![file], 0, &Schedule::default());
+
+        assert_eq!(result, vec![(("layout", 999), false)],
+                    "a genuinely missing file that fails to download must still be \
+                     reported as incomplete, same as before this fix");
     }
 
     #[test]
