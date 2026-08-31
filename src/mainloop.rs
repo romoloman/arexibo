@@ -2106,14 +2106,38 @@ impl Handler {
                 self.layouts = new_layouts;
             }
         }
+        // Update schedule-driven overlays *before* pruning below, so a
+        // freshly-discovered overlay's own layout id is already
+        // reflected in self.schedule_overlays by the time we build the
+        // combined "still active" list.
+        self.recheck_schedule_overlays();
         // Stop polling GetData for any data widget whose own layout
         // isn't in the current schedule anymore -- run unconditionally
         // (not just when the schedule actually changed above), a cheap
         // no-op call otherwise, and more robust against other paths
         // that could change what's active without going through the
         // check just above.
-        self.cache.prune_data_widgets_not_in(&self.layouts);
-        self.recheck_schedule_overlays();
+        //
+        // A real, severe bug found this way: a data widget living
+        // inside an *overlay* layout (tracked separately in
+        // self.schedule_overlays, never in self.layouts -- overlays
+        // and the "main" schedule are two entirely independent
+        // mechanisms) was discovered correctly on download, but then
+        // immediately pruned right back out on the very next
+        // schedule_check() (which runs frequently -- after every
+        // collection, plus every 60s tick) -- this check used to only
+        // ever consider self.layouts, so an overlay's own layout id
+        // was *never* considered "still active" no matter what,
+        // permanently preventing that widget from ever completing a
+        // single successful GetData refresh. Confirmed real: a live
+        // report of a data widget whose own `<widgetId>.json` was
+        // never written to disk at all, despite the widget itself
+        // being correctly parsed/tracked on discovery (confirmed via
+        // a direct, isolated test using the exact real widget markup).
+        let active_layouts: Vec<i64> = self.layouts.iter().copied()
+            .chain(self.schedule_overlays.iter().map(|&(id, _)| id))
+            .collect();
+        self.cache.prune_data_widgets_not_in(&active_layouts);
     }
 
 
@@ -5096,6 +5120,7 @@ mod validate_new_cms_tests {
 #[cfg(test)]
 mod data_refresh_timer_tests {
     use super::*;
+    use elementtree::Element;
 
     fn start_mock_ready() -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -5224,6 +5249,62 @@ mod data_refresh_timer_tests {
         let msg = togui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(msg, ToGui::ReloadWidget(1)),
                 "expected ToGui::ReloadWidget(1) (the resource id)");
+    }
+
+    #[test]
+    fn a_data_widget_inside_an_overlay_layout_survives_schedule_check() {
+        // Regression test for a real, severe bug: a data widget (v7
+        // GetData polling) living inside an *overlay* layout (tracked
+        // separately in self.schedule_overlays, never in self.layouts
+        // -- overlays and the "main" schedule are two entirely
+        // independent mechanisms) was discovered correctly on
+        // download, but then immediately pruned right back out on the
+        // very next schedule_check() (which runs frequently -- after
+        // every collection, plus every 60s tick) -- prune_data_widgets_
+        // not_in used to only ever consider self.layouts, so an
+        // overlay's own layout id was never considered "still active"
+        // no matter what, permanently preventing that widget from ever
+        // completing a single successful GetData refresh. Confirmed
+        // real: a live report of a data widget whose own
+        // `<widgetId>.json` was never written to disk at all, despite
+        // being correctly parsed/tracked on discovery.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+
+        // Real overlay XML shape (see schedule.rs's own
+        // parses_real_overlays_xml_from_user test) -- overlay layout
+        // 1031, main layout 913 (matching the real report's own ids).
+        let xml = r#"<schedule generated="2026-08-31 10:00:00" filterFrom="2026-08-31 10:00:00" filterTo="2026-08-31 12:00:00">
+  <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="0" playCount="0" maxPlaysPerHour="0"/>
+  <overlays>
+    <overlay file="1031" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="2" priority="0" duration="30" isGeoAware="0" geoLocation="" maxPlaysPerHour="0"/>
+  </overlays>
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = Element::from_reader(xml.as_bytes()).unwrap();
+        handler.schedule = Schedule::parse(&tree).unwrap();
+        handler.cache.insert_fake_layout_for_test(913);
+        handler.cache.insert_fake_layout_for_test(1031);
+        // Discovered as part of downloading resource 4950, which lives
+        // inside the *overlay* layout (1031) -- not the main one.
+        handler.cache.discover_data_widgets(
+            r#"<script>widgetData.push({"widgetId":4950,"url":"4950.json","data":null});</script>"#,
+            4950, 1031);
+
+        handler.schedule_check();
+
+        assert!(handler.cache.is_tracked_data_widget(4950),
+                "a data widget inside an active overlay layout must survive \
+                 schedule_check's own pruning -- this is the exact real bug: it used to \
+                 be pruned immediately because only self.layouts (never overlay layout \
+                 ids) was considered \"still active\"");
     }
 }
 

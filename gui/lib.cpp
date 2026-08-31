@@ -383,6 +383,40 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                                                  characterData: true });
                 } catch (e) {}
             }
+            // A real, severe follow-up bug found this way: this
+            // frame's own w/h above come from its own URL's static
+            // query string, baked in at *translation* time -- correct
+            // for a normal region widget (its own w/h *is* its real
+            // region's own size), but always the *drawer's* own size
+            // (typically the whole screen) for a drawer widget, since
+            // which real target region it eventually gets swapped
+            // into by navWidgetFromDrawer (see its own doc comment) is
+            // a runtime decision, unknowable here at the time this
+            // frame first loads. Left as the only input, the grow
+            // path above (content authored smaller than its own
+            // region, e.g. a small countdown/dataset table) would
+            // grow that content to fill the *drawer's* own full-screen
+            // size -- confirmed real via a live screenshot comparison
+            // against the CMS's own correct rendering: the content
+            // rendered enormously oversized once swapped into a real,
+            // much smaller target region. navWidgetFromDrawer posts
+            // this frame the *real* target region's own size once it
+            // actually knows it (at swap time) -- strictly validated
+            // by its own distinct property name (`arexiboResizeShrink
+            // Target`) before acting on it, since this same script
+            // runs in *every* frame, including native webpage widgets
+            // showing arbitrary real external sites, whose own
+            // unrelated postMessage traffic must never be mistaken for
+            // this.
+            window.addEventListener('message', function(event) {
+                var data = event.data;
+                if (!data || data.arexiboResizeShrinkTarget !== true) return;
+                var newW = parseFloat(data.w), newH = parseFloat(data.h);
+                if (!(newW > 0) || !(newH > 0)) return;
+                w = newW;
+                h = newH;
+                run();
+            });
             if (document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', function() { run(); armObserver(); });
             } else {

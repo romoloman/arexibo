@@ -293,11 +293,80 @@ window.arexibo = {
     const el = document.getElementById('m' + drawerWidgetId);
     const targetWrapper = document.querySelector('.r' + rid);
     if (el && targetWrapper) {
+      // A real, severe bug found via a live report: "scaling problem
+      // inside swapped widgets if navigate widget points to pdf or
+      // countdown table or dataset." Unlike video/image (which scale
+      // their own rendered content naturally via CSS -- see
+      // object_fit -- regardless of their own box's actual size),
+      // these widget types bake *absolute pixel dimensions* into
+      // their own internal rendering at translation time: a PDF's own
+      // canvas is rendered at a specific pixel resolution
+      // (window.arexiboPdf.start's own w/h arguments, see write_media's
+      // own doc comment on the pdf arm), and a "shrink-to-fit"
+      // resource iframe (dataset/countdown/ticker/etc, `render="html"`)
+      // has its own w/h baked into its *URL's own query string*, for
+      // its own internal layout script (see gui/lib.cpp's own
+      // shrinkToFitScript) to size against. For a normal, non-drawer
+      // widget this is correct (its own w/h *is* its real region's own
+      // size) -- but a drawer widget's own w/h is always the
+      // *drawer's* own size (typically the whole screen), since which
+      // real target region it eventually gets swapped into is a
+      // runtime decision this function makes, unknowable at
+      // translation time.
+      //
+      // The first fix here (a CSS `transform: scale(...)` on this
+      // whole element, computed from its own *original* dimensions)
+      // correctly handles a PDF's own canvas -- a fixed-resolution
+      // bitmap with no competing internal scaling logic, so visually
+      // rescaling the entire rendered element as a unit works cleanly.
+      // It does *not* fully fix a resource iframe though (confirmed by
+      // a live screenshot comparison against the CMS's own correct
+      // rendering, still oversized after that first fix): its own
+      // internal shrinkToFitScript *also* tries to grow/shrink the
+      // content to fill its own (still wrong, drawer-sized) target --
+      // preserving the content's own aspect ratio while doing so, so
+      // it may only fill *one* of the two dimensions, not both --
+      // meaning this function's own *independent*, per-axis transform
+      // on top can't cleanly cancel that back out (the two scaling
+      // steps don't compose into "correctly fills the real target,
+      // undistorted" in general).
+      //
+      // Fixed properly for an iframe specifically: resize its own box
+      // directly to the real target size (exactly like a normal,
+      // non-drawer widget's own iframe always is), and tell its own
+      // shrinkToFitScript the *real* target dimensions via postMessage
+      // (see that script's own doc comment) -- letting it redo its own
+      // grow/shrink math against the truth, instead of trying to
+      // externally compensate for a wrong internal calculation.
+      // `'*'` as the target origin is safe here: this stays entirely
+      // within this display's own local loopback origins, with no
+      // externally-reachable window that could ever receive it.
+      const origW = el.offsetWidth;
+      const origH = el.offsetHeight;
       targetWrapper.appendChild(el);
       el.style.left = '0px';
       el.style.top = '0px';
-      el.style.width = '100%';
-      el.style.height = '100%';
+      const targetW = targetWrapper.offsetWidth;
+      const targetH = targetWrapper.offsetHeight;
+      if (el.tagName === 'IFRAME') {
+        el.style.width = targetW + 'px';
+        el.style.height = targetH + 'px';
+        if (el.contentWindow) {
+          el.contentWindow.postMessage(
+            { arexiboResizeShrinkTarget: true, w: targetW, h: targetH }, '*');
+        }
+      } else if (origW > 0 && origH > 0) {
+        const scaleX = targetW / origW;
+        const scaleY = targetH / origH;
+        el.style.transformOrigin = 'top left';
+        el.style.transform = 'scale(' + scaleX + ', ' + scaleY + ')';
+      } else {
+        console.warn('navWidgetFromDrawer: widget m' + drawerWidgetId +
+                      ' has zero own width/height, cannot compute a scale factor -- ' +
+                      'falling back to 100%/100%');
+        el.style.width = '100%';
+        el.style.height = '100%';
+      }
     } else {
       console.warn('navWidgetFromDrawer: could not find element m' + drawerWidgetId +
                     ' or target wrapper .r' + rid + ' to resize into');
@@ -305,18 +374,10 @@ window.arexibo = {
 
     const [show, hide, duration] = drawerItem;
     show();
-    // `duration` is a `() => N` function, same shape as a normal
-    // region item's own media[cur][2] (see region_switch's own
-    // `media[next][2]()` call) -- not a raw number. Found from a real
-    // report: treating it as a plain value here made durationMs come
-    // out NaN (a function times 1000), which setTimeout then likely
-    // clamped to ~0 -- the widget swapped in and immediately back out
-    // again, faster than visibly perceptible, looking exactly like
-    // "nothing happened".
-    const durationMs = (duration() || 1) * 1000;
-    region.timeoutDuration = durationMs;
-    region.timeoutStart = Date.now();
-    region.timeoutid = window.setTimeout(() => {
+    // The actual, correct "return to normal" logic -- shared between
+    // the video/audio `ended` event below and the setTimeout safety
+    // net further down, so both paths behave identically.
+    const revert = () => {
       hide();
       // Move the widget's own DOM element back to the drawer -- its
       // own left/top/width/height stay overridden to the *previous*
@@ -335,7 +396,53 @@ window.arexibo = {
       // completing again (see region_switch's own "region_done"
       // check).
       this.region_switch(rid, prevCur === null ? 0 : prevCur, true);
-    }, durationMs);
+    };
+    // A real, related bug found via the same live report as the
+    // reparenting fix above: a video/audio widget's own `onended`
+    // handler (see the video/audio arms' own doc comment in
+    // Translator::write_media) is baked in at *translation* time with
+    // whatever region id it's *originally* written into -- for a
+    // drawer widget, that's always the synthetic DRAWER_RID (-1), the
+    // only one ever knowable at translation time, since which *real*
+    // target region a drawer widget eventually gets swapped into is
+    // entirely a runtime decision (this very function). Left as-is,
+    // the widget's own `show()` call above (which sets `onended` as
+    // part of its own add_start) would still point `onended` at
+    // `region_switch(-1, ...)` -- region -1 was never registered at
+    // all (see write_region's own `nitems == 0` handling -- the
+    // drawer's own synthetic id never goes through it), so
+    // `region_switch`'s own destructuring of `this.regions[-1]`
+    // (undefined) would throw the moment the video/audio actually
+    // finishes playing.
+    //
+    // A second, related bug found from the *same* live report, once
+    // the above was fixed: calling `region_switch(rid, -1, false)`
+    // directly here is *not* the same as actually reverting -- at
+    // this point `region.cur` still points at whatever was showing
+    // *before* the swap (navWidgetFromDrawer never touches it), and
+    // this region has only one normal item (this widget's own
+    // targetId), so `region_switch`'s own "only one item, nothing to
+    // actually switch to" short-circuit (`total <= 1`) fires and
+    // returns immediately -- *never* actually re-showing the
+    // original widget at all. Calling the same `revert` function the
+    // setTimeout safety net below already correctly uses avoids this
+    // entirely -- it explicitly passes `first: true` specifically to
+    // bypass that short-circuit.
+    if (el) {
+      el.onended = () => { window.clearTimeout(region.timeoutid); revert(); };
+    }
+    // `duration` is a `() => N` function, same shape as a normal
+    // region item's own media[cur][2] (see region_switch's own
+    // `media[next][2]()` call) -- not a raw number. Found from a real
+    // report: treating it as a plain value here made durationMs come
+    // out NaN (a function times 1000), which setTimeout then likely
+    // clamped to ~0 -- the widget swapped in and immediately back out
+    // again, faster than visibly perceptible, looking exactly like
+    // "nothing happened".
+    const durationMs = (duration() || 1) * 1000;
+    region.timeoutDuration = durationMs;
+    region.timeoutStart = Date.now();
+    region.timeoutid = window.setTimeout(revert, durationMs);
   },
 };
 "##;
@@ -441,6 +548,27 @@ pub struct Translator<'a> {
     /// (itself populated by `write_drawer` too) -- this field only
     /// needs to answer "is this id a known drawer widget at all".
     drawer_widgets: std::collections::HashSet<i32>,
+    /// Region ids that are the `targetId` of some `navWidget` action
+    /// pointing at a drawer widget (a real, live-report-confirmed bug
+    /// found this way: a region containing exactly one *normal* item
+    /// -- like a persistent "interactive-button" -- got `always_hide:
+    /// false` passed to its own show/stop function pair (see
+    /// write_show_stop_functions's own `nitems > 1` check), since
+    /// there's normally nothing else in that region to hide *for* with
+    /// only one item. But `navWidgetFromDrawer` (see its own doc
+    /// comment) explicitly needs that single item's own stop function
+    /// to actually hide it, to make room for the drawer widget being
+    /// swapped in -- with `always_hide: false`, that stop function is
+    /// a no-op, so the original item (and any drawer widget swapped in
+    /// underneath it, since DOM order alone doesn't guarantee visible
+    /// stacking) never actually disappears. Populated by a pre-scan of
+    /// every collected `<action>` (see `translate`'s own doc comment
+    /// for why the full list is already available before any region is
+    /// written) -- resolving to a genuine drawer widget id (not just
+    /// any `navWidget`, which can also target a normal region item)
+    /// requires knowing `drawer_widgets` first, which write_drawer
+    /// already populates earlier in `translate`.
+    swap_target_regions: std::collections::HashSet<i32>,
     /// Maps a region's `id` to its (x, y, w, h) geometry -- needed for
     /// touch actions, which get an invisible click-catching overlay
     /// `<div>` positioned over the *region* (not attached to the
@@ -498,6 +626,7 @@ impl<'a> Translator<'a> {
 
         Ok(Self { id, tree, out, regions: Vec::new(), size: (0, 0), code_map, has_pdf: false,
                   widget_regions: HashMap::new(), drawer_widgets: std::collections::HashSet::new(),
+                  swap_target_regions: std::collections::HashSet::new(),
                   region_geom: HashMap::new(),
                   enable_stat: true, adspace, html_port,
                   sync_keys: std::collections::HashSet::new() })
@@ -546,6 +675,23 @@ impl<'a> Translator<'a> {
             }
             if let Err(e) = self.write_drawer(drawer) {
                 log::error!("layout: could not translate drawer: {:#}", e);
+            }
+        }
+
+        // See swap_target_regions's own doc comment -- must run after
+        // write_drawer above (self.drawer_widgets needs to already be
+        // populated to tell a genuine drawer-widget navWidget action
+        // apart from one targeting an ordinary region item), but
+        // before the region-writing loop below (each region's own
+        // always_hide decision, made while it's written, needs this
+        // already known).
+        for action in &actions {
+            if action.get_attr("actionType") != Some("navWidget") { continue; }
+            let Some(widget_id) = action.get_attr("widgetId").and_then(|v| v.parse().ok())
+                else { continue };
+            if !self.drawer_widgets.contains(&widget_id) { continue; }
+            if let Some(target_id) = action.get_attr("targetId").and_then(|v| v.parse().ok()) {
+                self.swap_target_regions.insert(target_id);
             }
         }
 
@@ -850,12 +996,25 @@ impl<'a> Translator<'a> {
         writeln!(self.out, "  media: [")?;
 
         // for each media, write functions to start/stop displaying it
+        //
+        // `nitems > 1` alone used to be the whole story here -- a real,
+        // severe bug found this way: a region containing exactly one
+        // *normal* item (e.g. a persistent "interactive-button")
+        // otherwise got `always_hide: false` (nothing else in the
+        // region to hide *for*), silently no-opping its own stop
+        // function -- but navWidgetFromDrawer (see swap_target_regions's
+        // own doc comment) explicitly needs that stop function to work,
+        // to make room for a drawer widget being swapped in on top of
+        // it. `swap_target_regions` (populated by a pre-scan in
+        // `translate`) names every region that's the actual target of
+        // such a swap, regardless of how many items it normally has.
+        let always_hide = nitems > 1 || self.swap_target_regions.contains(&rid);
         for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in sequence {
             writeln!(self.out, "    [")?;
             self.write_show_stop_functions(mid, &add_start, &add_stop,
                                             Transitions { in_kind: trans_in, in_ms: ms_in,
                                                           out_kind: trans_out, out_ms: ms_out },
-                                            nitems > 1)?;
+                                            always_hide)?;
             writeln!(self.out, "    , {duration}, {mid}],")?;
         }
         writeln!(self.out, "  ],")?;
@@ -1285,7 +1444,19 @@ impl<'a> Translator<'a> {
                 // native `ended` event.
                 let use_duration = media.get_attr("useDuration").is_some_and(|v| v == "1");
                 if loop_video || use_duration {
-                    add_start = format!("document.getElementById('m{mid}').play();");
+                    // `.play()` can genuinely fail here too (see the
+                    // main branch's own comment below for why) --
+                    // same `.catch()`+`canplay` retry, just without
+                    // the `onended` wiring this branch doesn't use.
+                    // Stashing the retry function on the element
+                    // itself (`_canplayRetry`) lets add_stop below
+                    // remove it explicitly -- see that comment for why
+                    // `{ once: true }` alone isn't quite enough.
+                    add_start = format!(
+                        "{{ let el = document.getElementById('m{mid}'); \
+                           el.play().catch(() => {{}}); \
+                           el._canplayRetry = () => el.play().catch(() => {{}}); \
+                           el.addEventListener('canplay', el._canplayRetry, {{ once: true }}); }}");
                     // `duration` already defaults to the XLF-configured
                     // value; loop's own repetition is handled by the
                     // native `loop` attribute above.
@@ -1296,9 +1467,63 @@ impl<'a> Translator<'a> {
                     // would treat that as falsy and restart the video
                     // every ~1s. Use the native `ended` event instead,
                     // with an 86400s duration as a safety-net timeout only.
+                    //
+                    // `.play()` right after element creation can fail
+                    // silently too -- a real, severe bug found this
+                    // way: navWidgetFromDrawer (see its own doc
+                    // comment) reparents a drawer widget's own element
+                    // into a *different* parent via `appendChild`
+                    // before calling this same add_start -- moving a
+                    // <video> element to a new DOM parent is a
+                    // documented browser behavior that resets/reloads
+                    // its own media resource. Calling `.play()`
+                    // immediately afterward, synchronously, can race
+                    // that reload and reject (an AbortError on the
+                    // returned Promise) -- silently, since nothing
+                    // here awaited or caught it, with no visible
+                    // console output in this project's own log
+                    // pipeline. Confirmed real: a live report of a
+                    // drawer-sourced video widget that never showed
+                    // any frame at all, despite the swap itself
+                    // (region lookup, DOM reparenting, `show()` call)
+                    // completing with no errors whatsoever. `.catch()`
+                    // silences the rejection; the `canplay` listener
+                    // is the actual fix -- retries once the element's
+                    // own reload (if any) has genuinely finished,
+                    // harmless (a no-op restart at the same position)
+                    // for the normal, non-reparented case where the
+                    // first `.play()` already succeeded.
+                    //
+                    // `{ once: true }` alone stops this from
+                    // *permanently* re-firing on every later canplay
+                    // (a real, severe follow-up bug, also confirmed by
+                    // live report: without it, this project's own
+                    // add_stop below resetting `currentTime` to 0 can
+                    // itself trigger a fresh canplay once the browser
+                    // re-buffers from the new position -- with the
+                    // listener still attached, that called `.play()`
+                    // again, restarting a video that had just legit-
+                    // imately ended and been sent back to the drawer,
+                    // which would hit `ended` again, calling onended
+                    // -> revert() -> hide() -> reset -> canplay ->
+                    // play() again: a genuine infinite loop). But
+                    // `{ once: true }` on its own still allows *one*
+                    // such extra, unwanted playthrough -- confirmed by
+                    // a live report ("does one loop in the background
+                    // then stops"): the reset-triggered canplay is
+                    // very likely to be the *next* one to fire after a
+                    // real ended event, consuming the listener's one
+                    // remaining shot. Stashing it as `_canplayRetry` so
+                    // add_stop can remove it *explicitly and
+                    // synchronously*, before its own `currentTime = 0`
+                    // line ever runs, closes this precisely -- no
+                    // stray canplay can trigger a call that no longer
+                    // has a listener to answer it.
                     add_start = format!(
                         "{{ let el = document.getElementById('m{mid}'); \
-                           el.play(); \
+                           el.play().catch(() => {{}}); \
+                           el._canplayRetry = () => el.play().catch(() => {{}}); \
+                           el.addEventListener('canplay', el._canplayRetry, {{ once: true }}); \
                            el.onended = () => window.arexibo.region_switch({rid}, -1, false); }}");
                     duration = "() => 86400".to_string();
                 }
@@ -1306,8 +1531,15 @@ impl<'a> Translator<'a> {
                 // branch above) -- otherwise the video kept playing
                 // invisibly, and would resume from wherever it was left
                 // off next time instead of restarting cleanly.
+                //
+                // Removing `_canplayRetry` first (if it's still
+                // pending) is essential, not cosmetic -- see add_start's
+                // own comment above for the exact infinite-loop/extra-
+                // playthrough bugs this closes.
                 add_stop = format!(
                     "{{ let el = document.getElementById('m{mid}'); \
+                       if (el._canplayRetry) {{ el.removeEventListener('canplay', el._canplayRetry); \
+                                                 el._canplayRetry = null; }} \
                        el.pause(); el.currentTime = 0; }}");
             }
             (_, Some("audio")) => {
@@ -1329,16 +1561,29 @@ impl<'a> Translator<'a> {
                          if loop_audio { "loop" } else { "" })?;
                 let use_duration = media.get_attr("useDuration").is_some_and(|v| v == "1");
                 if loop_audio || use_duration {
-                    add_start = format!("document.getElementById('m{mid}').play();");
-                } else {
                     add_start = format!(
                         "{{ let el = document.getElementById('m{mid}'); \
-                           el.play(); \
+                           el.play().catch(() => {{}}); \
+                           el._canplayRetry = () => el.play().catch(() => {{}}); \
+                           el.addEventListener('canplay', el._canplayRetry, {{ once: true }}); }}");
+                } else {
+                    // See the video arm's own doc comment for why
+                    // `.play()` needs the `.catch()`+`canplay` retry,
+                    // and why the retry itself must be stashed as
+                    // `_canplayRetry` and explicitly removed in
+                    // add_stop below.
+                    add_start = format!(
+                        "{{ let el = document.getElementById('m{mid}'); \
+                           el.play().catch(() => {{}}); \
+                           el._canplayRetry = () => el.play().catch(() => {{}}); \
+                           el.addEventListener('canplay', el._canplayRetry, {{ once: true }}); \
                            el.onended = () => window.arexibo.region_switch({rid}, -1, false); }}");
                     duration = "() => 86400".to_string();
                 }
                 add_stop = format!(
                     "{{ let el = document.getElementById('m{mid}'); \
+                       if (el._canplayRetry) {{ el.removeEventListener('canplay', el._canplayRetry); \
+                                                 el._canplayRetry = null; }} \
                        el.pause(); el.currentTime = 0; }}");
             }
             (_, Some("shellcommand")) => {
@@ -2065,6 +2310,8 @@ mod loop_tests {
         assert!(html.contains("() => 86400"));
         // must pause and reset playback position when sent to background
         assert!(html.contains("{ let el = document.getElementById('m5005'); \
+                               if (el._canplayRetry) { el.removeEventListener('canplay', el._canplayRetry); \
+                                                         el._canplayRetry = null; } \
                                el.pause(); el.currentTime = 0; }"),
                 "audio must pause+reset on stop, same as video -- got:\n{html}");
     }
@@ -2104,10 +2351,16 @@ mod loop_tests {
         assert!(!html.contains(" loop "));
         assert!(html.contains("() => 15"));
         assert!(!html.contains("() => 86400"));
-        assert!(!html.contains("el.onended"));
-        assert!(html.contains("document.getElementById('m5007').play();"));
+        // See the video test's own comment for why the generic
+        // "el.onended" substring is no longer a precise check.
+        assert!(!html.contains("region_switch(1, -1, false)"));
+        assert!(html.contains("el.play().catch(() => {});"));
+        assert!(html.contains("el._canplayRetry = () => el.play().catch(() => {});"));
+        assert!(html.contains("el.addEventListener('canplay', el._canplayRetry, { once: true });"));
         // add_stop must still apply regardless of which branch was taken
         assert!(html.contains("{ let el = document.getElementById('m5007'); \
+                               if (el._canplayRetry) { el.removeEventListener('canplay', el._canplayRetry); \
+                                                         el._canplayRetry = null; } \
                                el.pause(); el.currentTime = 0; }"));
     }
 
@@ -2123,6 +2376,8 @@ mod loop_tests {
         // branches since the fix needed to apply regardless of which
         // one is taken.
         let expected_stop = "{ let el = document.getElementById('m5004'); \
+                              if (el._canplayRetry) { el.removeEventListener('canplay', el._canplayRetry); \
+                                                        el._canplayRetry = null; } \
                               el.pause(); el.currentTime = 0; }";
 
         // Branch 1: useDuration=1 (static duration, no native ended event)
@@ -2197,9 +2452,95 @@ mod loop_tests {
         // safety-net fallback.
         assert!(html.contains("() => 15"));
         assert!(!html.contains("() => 86400"));
-        assert!(!html.contains("el.onended"));
-        assert!(html.contains("document.getElementById('m5003').play();"));
+        // Not the generic "el.onended" substring -- navWidgetFromDrawer's
+        // own shared-script body (present on every layout regardless of
+        // widget type, see its own doc comment for why) now also
+        // contains that literal text unconditionally. The *specific*,
+        // baked-in-at-translation-time call this widget's own add_start
+        // would use (region id "1", not the shared script's own `rid`
+        // variable reference) is the precise thing this branch must NOT
+        // emit.
+        assert!(!html.contains("region_switch(1, -1, false)"));
+        assert!(html.contains("el.play().catch(() => {});"));
+        assert!(html.contains("el._canplayRetry = () => el.play().catch(() => {});"));
+        assert!(html.contains("el.addEventListener('canplay', el._canplayRetry, { once: true });"));
     }
+
+    #[test]
+    fn the_canplay_retry_listener_only_fires_once() {
+        // Regression test for a real, severe bug found via a live
+        // report, introduced by the `.play()` reparenting fix itself
+        // (see the video arm's own doc comment above): the `canplay`
+        // retry listener, added without `{ once: true }`, stayed
+        // attached for the widget's *entire* lifetime -- not just
+        // through its own first, possibly-reparent-disrupted play
+        // attempt. `canplay` can legitimately re-fire many times over
+        // a video's normal lifecycle, including from this project's
+        // own code: `hide()` (add_stop, called by navWidgetFromDrawer's
+        // own `revert()` once the video ends) does `el.currentTime =
+        // 0`, and resetting playback position can itself trigger a
+        // fresh `canplay` once the browser re-buffers from the new
+        // position. With the listener still attached, *that* `canplay`
+        // called `.play()` again -- restarting a video that had just
+        // legitimately ended and been sent back to the drawer,
+        // invisible but still playing, which would in turn hit `ended`
+        // again, calling `onended` -> `revert()` -> `hide()` -> reset
+        // -> `canplay` -> `.play()` again: a genuine infinite loop,
+        // confirmed real ("the video underneath stays looping" in a
+        // live report). `{ once: true }` limits the listener to firing
+        // for its own single, intended purpose -- retrying the first
+        // play attempt -- without interfering with anything the
+        // widget's own lifecycle legitimately does afterward.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5010" type="video" duration="10">
+                    <options><uri>a.mp4</uri><loop>0</loop></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains(
+            "el.addEventListener('canplay', el._canplayRetry, { once: true });"),
+            "the canplay retry listener must be registered with {{ once: true }} -- \
+             otherwise it re-fires on every later canplay event too (including one \
+             this project's own hide()/add_stop can itself trigger by resetting \
+             currentTime), not just the widget's own first play attempt");
+    }
+
+    #[test]
+    fn add_stop_explicitly_removes_the_canplay_retry_listener() {
+        // Regression test for a real, follow-up bug found via a live
+        // report, even with the `{ once: true }` fix above already
+        // live: "now it disappears, does one more loop in the
+        // background, then stops." `{ once: true }` alone still
+        // allows *one* extra, unwanted playthrough -- add_stop's own
+        // `currentTime = 0` reset is very likely to be the *very next*
+        // canplay to fire after a genuine `ended` event, consuming the
+        // listener's one remaining shot before the widget is actually
+        // done. Explicitly removing `_canplayRetry` as the *first*
+        // thing add_stop does -- synchronously, before its own
+        // `currentTime = 0` line ever runs -- closes this precisely:
+        // no stray canplay (from this reset or otherwise) can trigger
+        // a call that no longer has a listener left to answer it.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="5011" type="video" duration="10">
+                    <options><uri>a.mp4</uri><loop>0</loop></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        let stop_marker = "{ let el = document.getElementById('m5011'); \
+                            if (el._canplayRetry) { el.removeEventListener('canplay', el._canplayRetry); \
+                                                      el._canplayRetry = null; } \
+                            el.pause(); el.currentTime = 0; }";
+        assert!(html.contains(stop_marker),
+                "add_stop must remove the _canplayRetry listener (and null it out) \
+                 *before* pausing/resetting -- otherwise a canplay triggered by that \
+                 same reset can still consume the listener's one `{{ once: true }}` shot, \
+                 causing one extra, unwanted playthrough");
+    }
+
 
     #[test]
     fn region_loop_option_is_wired_into_js_object() {
@@ -2692,6 +3033,167 @@ mod drawer_tests {
     }
 
     #[test]
+    fn navwidgetfromdrawer_scales_via_transform_instead_of_resizing_content() {
+        // Regression test for a real, severe bug found via a live
+        // report: "scaling problem inside swapped widgets if navigate
+        // widget points to pdf or countdown table or dataset." Unlike
+        // video/image (which scale their own rendered content
+        // naturally via CSS regardless of their own box's actual
+        // size), these widget types bake *absolute pixel dimensions*
+        // into their own internal rendering at translation time (a
+        // PDF's own canvas resolution via window.arexiboPdf.start's
+        // own w/h arguments; a "shrink-to-fit" resource iframe's own
+        // w/h baked into its URL's own query string) -- always the
+        // *drawer's* own size for a drawer widget, never the real
+        // target region's (unknowable at translation time). The
+        // previous fix (resizing the wrapper to `width: 100%; height:
+        // 100%`) only resized the *outer* element -- meaningless for
+        // content that renders itself at a fixed internal resolution,
+        // leaving it absurdly oversized or clipped once swapped into a
+        // real (typically much smaller) target region.
+        //
+        // A CSS `transform: scale(...)` on the whole element (this
+        // test's own subject) correctly handles a canvas (PDF) --
+        // a fixed-resolution bitmap with no competing internal scaling
+        // logic. It does *not* fully fix an iframe though (confirmed
+        // by a live screenshot comparison against the CMS's own
+        // correct rendering, still oversized with this fix alone):
+        // its own internal shrinkToFitScript (gui/lib.cpp) *also*
+        // tries to grow/shrink its own content to fill its own (still
+        // wrong, drawer-sized) target, preserving aspect ratio while
+        // doing so -- meaning this function's own independent,
+        // per-axis transform on top can't cleanly cancel that back
+        // out. See navwidgetfromdrawer_resizes_iframes_directly_and_
+        // notifies_shrink_to_fit below for the iframe-specific fix.
+        //
+        // Like the duration() check above, this can only be verified
+        // against the *shared* runtime JS text -- confirms
+        // navWidgetFromDrawer computes a scale factor from the
+        // widget's own *original* dimensions (read before anything
+        // changes them) against the target wrapper's own real size,
+        // and applies it via `transform: scale(...)` for the non-
+        // iframe (canvas/video/image) case -- agnostic to whatever's
+        // actually rendered inside the element, unlike trying to
+        // resize the content itself.
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_transform_scale");
+        assert!(html.contains("const origW = el.offsetWidth;"),
+                "must read the widget's own original width before changing anything");
+        assert!(html.contains("const origH = el.offsetHeight;"),
+                "must read the widget's own original height before changing anything");
+        assert!(html.contains("const scaleX = targetW / origW;"),
+                "must compute the horizontal scale factor from the *real* target \
+                 wrapper's own size, not a hardcoded/percentage value");
+        assert!(html.contains("const scaleY = targetH / origH;"),
+                "must compute the vertical scale factor from the *real* target \
+                 wrapper's own size, not a hardcoded/percentage value");
+        assert!(html.contains("el.style.transform = 'scale(' + scaleX + ', ' + scaleY + ')';"),
+                "must apply the computed scale via a CSS transform for the non-iframe \
+                 (canvas/video/image) case -- this rescales whatever's already rendered \
+                 as a unit, unlike resizing the element itself, which does nothing for \
+                 content that renders at a fixed internal resolution based on its own \
+                 original width/height");
+    }
+
+    #[test]
+    fn navwidgetfromdrawer_resizes_iframes_directly_and_notifies_shrink_to_fit() {
+        // Regression test for a real, severe follow-up bug found via a
+        // live screenshot comparison against the CMS's own correct
+        // rendering, even with the CSS-transform fix (see the test
+        // above) already live: a countdown/dataset table swapped in
+        // from the drawer still rendered enormously oversized,
+        // unlike a PDF (a canvas), which the transform fix already
+        // correctly handled. Root cause: unlike a canvas, a resource
+        // iframe (dataset/countdown/ticker/etc, `render="html"`) has
+        // its own competing internal scaling logic --
+        // gui/lib.cpp's own shrinkToFitScript, injected into every
+        // frame, reads its own target size from its own URL's static
+        // `arexiboShrinkW`/`arexiboShrinkH` query params (always the
+        // *drawer's* own, typically full-screen, size for a drawer
+        // widget) and grows/shrinks its own content to fill *that*
+        // target, preserving its own aspect ratio. This function's
+        // own independent, per-axis CSS transform on top of an
+        // already-wrongly-scaled iframe can't cleanly cancel that back
+        // out in general (the content may only fill *one* of the two
+        // dimensions after the internal grow, not both).
+        //
+        // Fixed by treating an iframe differently: resize its own box
+        // directly to the *real* target size (exactly like a normal,
+        // non-drawer widget's own iframe always is) and tell its own
+        // shrinkToFitScript the real target dimensions via
+        // `postMessage` -- letting that script redo its own grow/
+        // shrink math against the truth, instead of trying to
+        // externally compensate for an already-wrong internal
+        // calculation.
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_iframe_resize");
+        assert!(html.contains("if (el.tagName === 'IFRAME') {"),
+                "must branch specifically for iframes -- they have their own competing \
+                 internal scaling logic that a canvas/video/image doesn't");
+        assert!(html.contains("el.style.width = targetW + 'px';") &&
+                html.contains("el.style.height = targetH + 'px';"),
+                "an iframe must be resized directly to the real target size, not left at \
+                 its own original (drawer-sized) dimensions with an external transform on \
+                 top of it");
+        assert!(html.contains(
+            "{ arexiboResizeShrinkTarget: true, w: targetW, h: targetH }"),
+                "must notify the iframe's own shrinkToFitScript of the real target \
+                 dimensions via postMessage, using the same distinctive property name \
+                 that script listens for (see gui/lib.cpp)");
+    }
+
+    #[test]
+    fn navwidgetfromdrawer_overrides_onended_with_the_real_target_region() {
+        // Regression test for a real, related bug found via the same
+        // live report as the video/audio `.play()` reparenting fix
+        // (see write_media's own doc comment on the video arm): a
+        // video/audio widget's own `onended` handler is baked in at
+        // *translation* time with whatever region id it's originally
+        // written into -- for a drawer widget, that's always the
+        // synthetic DRAWER_RID (-1), the only one ever knowable at
+        // translation time (which *real* target region it eventually
+        // gets swapped into is a runtime decision). Left uncorrected,
+        // once the video/audio genuinely finished playing, `onended`
+        // would call `region_switch(-1, ...)` -- region -1 was never
+        // registered (drawer widgets never go through write_region's
+        // own `nitems == 0` handling), so region_switch's own
+        // destructuring of `this.regions[-1]` (undefined) would throw.
+        //
+        // A second, related bug found from a live report once the
+        // first fix above was live: calling `region_switch(rid, -1,
+        // false)` directly from `onended` isn't the same as actually
+        // reverting -- `region.cur` still points at whatever was
+        // showing *before* the swap, and a region with only one
+        // normal item hits region_switch's own "nothing to actually
+        // switch to" short-circuit (`total <= 1`), returning
+        // immediately *without ever re-showing the original widget at
+        // all*. `onended` must instead trigger the same `revert`
+        // function the setTimeout safety net already correctly uses
+        // (which explicitly passes `first: true` to bypass that
+        // short-circuit).
+        //
+        // Like the duration() check above, this can only be verified
+        // against the *shared* runtime JS text.
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_onended_fix");
+        let show_pos = html.find("show();").expect("navWidgetFromDrawer calls show()");
+        let revert_def_pos = html.find("const revert = () => {")
+            .expect("navWidgetFromDrawer must define a shared revert function, reused by \
+                     both onended and the setTimeout safety net");
+        let onended_pos = html.find("el.onended = () => { window.clearTimeout(region.timeoutid); revert(); };")
+            .expect("navWidgetFromDrawer must re-assign onended to call the shared revert \
+                     function (clearing the pending safety-net timeout first) -- not call \
+                     region_switch directly, which hits its own single-item short-circuit \
+                     and never re-shows the original widget");
+        let timeout_pos = html.find("window.setTimeout(revert, durationMs);")
+            .expect("the setTimeout safety net must also use the same shared revert \
+                     function, not a separate/duplicated inline body");
+        assert!(onended_pos > show_pos,
+                "must re-assign onended *after* show() -- otherwise the widget's own \
+                 add_start (called by show()) would just overwrite it right back to the \
+                 wrong, translation-time value");
+        assert!(revert_def_pos < onended_pos && revert_def_pos < timeout_pos,
+                "revert must be defined before either onended or the setTimeout reference it");
+    }
+
+    #[test]
     fn a_normal_navwidget_action_targeting_a_real_region_widget_is_unaffected() {
         // Regression safety: the original, already-working case (a
         // navWidget action targeting a widget that's genuinely part
@@ -2716,6 +3218,56 @@ mod drawer_tests {
                 "must not go anywhere near the drawer fallback for a genuinely \
                  normal region widget (navWidgetFromDrawer is always *defined* in the \
                  shared runtime JS regardless -- this checks for an actual *call*)");
+    }
+
+    #[test]
+    fn a_single_item_region_targeted_by_a_drawer_swap_still_gets_a_working_hide_function() {
+        // Regression test for a real, severe bug found via a live
+        // report: "navWidget shows a video from the drawer in place of
+        // a button, but the button never disappears and the video
+        // renders underneath it." Root cause: a region with exactly
+        // one *normal* item (here, and in the real report, a
+        // persistent "interactive-button") got `always_hide: false`
+        // (see write_show_stop_functions's own `nitems > 1` check --
+        // reasonable on its own: with only one item, there's normally
+        // nothing else in the region to hide *for*) -- but
+        // navWidgetFromDrawer explicitly calls that same item's own
+        // stop function to hide it, to make room for the drawer
+        // widget being swapped in on top of it. With `always_hide:
+        // false`, that stop function was a silent no-op -- the button
+        // never actually disappeared, regardless of the separate
+        // video `.play()`/`onended` fixes elsewhere.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="240" height="255">
+                <media id="200" type="image" duration="30">
+                    <options><uri>button.png</uri></options>
+                    <action layoutCode="" target="region" source="widget"
+                            actionType="navWidget" triggerType="touch" triggerCode=""
+                            id="1" widgetId="300" targetId="1" sourceId="200"/>
+                </media>
+            </region>
+            <drawer id="2" width="1080" height="1920" top="0" left="0">
+                <media id="300" type="video" duration="0">
+                    <options><uri>a.mp4</uri><loop>0</loop></options>
+                </media>
+            </drawer>
+        </layout>"#;
+        let html = translate_xlf(xlf, &HashMap::new(), "drawer_single_item_always_hide");
+        // The region's own single-item "total: 1" must still be
+        // correct (this isn't about pretending there's more than one
+        // item) -- only the show/stop functions' own always_hide
+        // behavior changes.
+        assert!(html.contains("total: 1,"));
+        // The button's own stop function (its show/hide pair, the
+        // *first* one written for region 1) must actually set
+        // visibility: hidden -- confirms always_hide took effect for
+        // this specific widget, not just theoretically computed.
+        let stop_marker = "document.getElementById('m200').style.visibility = 'hidden';";
+        assert!(html.contains(stop_marker),
+                "region 1's own single item (widget 200) is a navWidget swap target \
+                 (see its own action's targetId) -- its stop function must actually hide \
+                 it, not silently no-op just because it's normally the only item in its \
+                 own region");
     }
 
     #[test]
