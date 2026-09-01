@@ -343,6 +343,52 @@ window.arexibo = {
       // externally-reachable window that could ever receive it.
       const origW = el.offsetWidth;
       const origH = el.offsetHeight;
+      if (el.tagName === 'IFRAME') {
+        // A real, severe follow-up bug found via a live report,
+        // confirmed by a live log capture showing the swapped-in
+        // widget's own iframe fully re-fetching everything (its own
+        // HTML, bundle.min.js, fonts.css, pdf.worker.js, the raw PDF
+        // itself) a *second* time on touch, with the exact same
+        // (still wrong, drawer-sized) query string as its very first
+        // load: reparenting an <iframe> into a new DOM parent via
+        // `appendChild` (unlike a canvas, video, or image) is
+        // documented browser behavior that *always* triggers a full
+        // reload of its own content, discarding any JS state inside
+        // it -- including this same function's own postMessage below,
+        // sent to a content window that's about to be (or already
+        // has been) torn down and replaced by a freshly-loading one,
+        // which never receives it. The freshly-reloaded page reads
+        // its own w/h straight back from its *own, still-static* URL
+        // query string -- exactly the wrong, drawer-sized values --
+        // so the postMessage fix alone never actually took effect for
+        // an iframe specifically (it does for a canvas/video/image,
+        // none of which reload their own content on reparenting).
+        //
+        // Fixed by rewriting the iframe's own `src` (and therefore
+        // its own w/h, arexiboShrinkW, arexiboShrinkH query params)
+        // to the real target dimensions *before* the reparenting
+        // below -- since a reload is unavoidable either way, this
+        // makes sure the *correct* values are baked into the fresh
+        // load from the very start, rather than racing a postMessage
+        // against a reload that always wins. The postMessage further
+        // below is kept as a harmless fallback for the one case where
+        // no reload happens at all (this exact widget swapped into a
+        // same-sized target region twice in a row, where `src` never
+        // actually changes) -- there, the existing content is already
+        // correctly sized regardless, so this is a no-op safety net,
+        // not something load-bearing.
+        try {
+          const url = new URL(el.src, window.location.href);
+          url.searchParams.set('w', targetWrapper.offsetWidth);
+          url.searchParams.set('h', targetWrapper.offsetHeight);
+          url.searchParams.set('arexiboShrinkW', targetWrapper.offsetWidth);
+          url.searchParams.set('arexiboShrinkH', targetWrapper.offsetHeight);
+          el.src = url.toString();
+        } catch (e) {
+          console.warn('navWidgetFromDrawer: could not rewrite src for widget m' +
+                        drawerWidgetId + ': ' + e);
+        }
+      }
       targetWrapper.appendChild(el);
       el.style.left = '0px';
       el.style.top = '0px';
@@ -814,10 +860,27 @@ impl<'a> Translator<'a> {
             // Key Press trigger (CMS 4.4+): same triggerType="touch"
             // action, with triggerCode carrying a keyboard key name
             // (KeyboardEvent.code) as an alternative to touch/click.
-            // Safe to always add: a non-matching triggerCode simply
-            // never fires.
-            writeln!(self.out, "document.addEventListener('keydown', function(e) {{ \
-                                if (e.code === {code:?}) {{ {call}; }} }});")?;
+            //
+            // A real, severe bug found via a live report: an empty
+            // triggerCode="" (a genuinely common, valid CMS
+            // configuration -- a touch action simply doesn't require a
+            // keyboard shortcut) used to still generate this listener,
+            // comparing against an empty string -- "safe to always
+            // add: a non-matching triggerCode simply never fires" was
+            // a false assumption. Confirmed real: on this specific
+            // kiosk's own touch hardware, a genuine touch is translated
+            // (at some lower level, before ever reaching this page's
+            // own JS) into a synthetic keydown event whose own `.code`
+            // property is itself an empty string -- meaning *any*
+            // touch *anywhere* on the entire screen matched this
+            // listener and fired this action, regardless of where its
+            // own overlay div actually was. An empty/unset triggerCode
+            // means "no keyboard shortcut configured" -- it must never
+            // be treated as "matches an empty code string".
+            if !code.is_empty() && code != "<not set>" {
+                writeln!(self.out, "document.addEventListener('keydown', function(e) {{ \
+                                    if (e.code === {code:?}) {{ {call}; }} }});")?;
+            }
         } else {
             log::warn!("unsupported action type: {typ}");
         }
@@ -2632,6 +2695,62 @@ mod action_tests {
     }
 
     #[test]
+    fn an_empty_triggercode_does_not_bind_a_keydown_listener_at_all() {
+        // Regression test for a real, severe bug found via a live
+        // report: a drawer-swap button (navWidgetFromDrawer, targeting
+        // a PDF widget) kept firing on *every* touch *anywhere* on the
+        // entire screen, regardless of where its own overlay div
+        // actually was. Root cause: `triggerCode=""` is a genuinely
+        // common, valid CMS configuration (a touch action simply
+        // doesn't require a keyboard shortcut) -- but this used to
+        // still generate `document.addEventListener('keydown', e =>
+        // e.code === "" && ...)` regardless, on the (false) assumption
+        // that "a non-matching triggerCode simply never fires". On
+        // this specific kiosk's own touch hardware, a genuine touch is
+        // translated (at some lower level, before ever reaching this
+        // page's own JS) into a synthetic keydown event whose own
+        // `.code` property is itself an empty string -- matching this
+        // listener for *any* touch, anywhere, confirmed by a live,
+        // global click-listener diagnostic capturing zero real `click`
+        // events despite the swap visibly happening on every touch.
+        // An empty/unset triggerCode must mean "no keyboard shortcut
+        // configured", never "matches an empty code string".
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="430" height="516">
+                <media id="200" type="interactive-button" render="html" duration="30">
+                    <options/>
+                    <action layoutCode="" target="region" source="widget"
+                            actionType="navWidget" triggerType="touch" triggerCode=""
+                            id="1" widgetId="300" targetId="1" sourceId="200"/>
+                </media>
+            </region>
+            <drawer id="2" width="1080" height="1920" top="0" left="0">
+                <media id="300" type="pdf" duration="60">
+                    <options><uri>a.pdf</uri></options>
+                </media>
+            </drawer>
+        </layout>"#;
+        let dir = std::env::temp_dir().join(format!("arexibo_empty_triggercode_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let code_map = HashMap::new();
+        let t = Translator::new(1, &xlf_path, &html_path, &code_map, None, 0).unwrap();
+        t.translate().unwrap();
+        let mut html = String::new();
+        fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
+        assert!(!html.contains("document.addEventListener('keydown'"),
+                "an empty triggerCode must not bind any keydown listener at all -- \
+                 otherwise it can match a real, empty-`.code` synthetic keydown event \
+                 that some touch hardware genuinely produces, firing on every touch \
+                 anywhere on screen instead of only its own overlay's own area");
+        // the click/overlay-based touch handling must still be present
+        // -- this removes *only* the keydown fallback, not touch itself.
+        assert!(html.contains("navWidgetFromDrawer(1, 300)"));
+    }
+
+    #[test]
     fn navlayout_falls_back_to_layoutcode_when_targetid_absent() {
         // The layoutCode-based resolution path must still work for the
         // case it was originally written for: no usable targetId at
@@ -3138,6 +3257,56 @@ mod drawer_tests {
                 "must notify the iframe's own shrinkToFitScript of the real target \
                  dimensions via postMessage, using the same distinctive property name \
                  that script listens for (see gui/lib.cpp)");
+    }
+
+    #[test]
+    fn navwidgetfromdrawer_rewrites_iframe_src_before_reparenting() {
+        // Regression test for a real, severe follow-up bug found via a
+        // live log capture: the swapped-in widget's own iframe was
+        // seen fully re-fetching everything (its own HTML,
+        // bundle.min.js, fonts.css, pdf.worker.js, the raw PDF itself)
+        // a *second* time on touch, with the exact same (still wrong,
+        // drawer-sized) query string as its very first load -- meaning
+        // the postMessage fix above (see that test's own doc comment)
+        // never actually took effect for an iframe specifically.
+        // Root cause: reparenting an <iframe> into a new DOM parent via
+        // `appendChild` (unlike a canvas, video, or image) is
+        // documented browser behavior that *always* triggers a full
+        // reload of its own content -- discarding any JS state inside
+        // it, including a postMessage sent to a content window that's
+        // about to be (or already has been) torn down and replaced.
+        // The freshly-reloaded page reads its own w/h straight back
+        // from its own, still-static URL query string -- exactly the
+        // wrong, drawer-sized values it had before.
+        //
+        // Fixed by rewriting the iframe's own `src` (and therefore its
+        // own w/h, arexiboShrinkW, arexiboShrinkH query params) to the
+        // real target dimensions *before* the reparenting -- since a
+        // reload is unavoidable either way, this makes sure the
+        // correct values are baked into the fresh load from the very
+        // start, rather than racing a postMessage against a reload
+        // that always wins.
+        let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_iframe_src_rewrite");
+        let src_rewrite_pos = html.find("const url = new URL(el.src, window.location.href);")
+            .expect("must rewrite the iframe's own src using its real URL, not a bare \
+                     relative string that URL() would otherwise reject");
+        assert!(html.contains("url.searchParams.set('w', targetWrapper.offsetWidth);"),
+                "must rewrite the src's own w param to the real target wrapper's width");
+        assert!(html.contains("url.searchParams.set('h', targetWrapper.offsetHeight);"),
+                "must rewrite the src's own h param to the real target wrapper's height");
+        assert!(html.contains("url.searchParams.set('arexiboShrinkW', targetWrapper.offsetWidth);") &&
+                html.contains("url.searchParams.set('arexiboShrinkH', targetWrapper.offsetHeight);"),
+                "must also rewrite the src's own arexiboShrinkW/H params -- these are what \
+                 the shrinkToFitScript (gui/lib.cpp) actually reads");
+        assert!(html.contains("el.src = url.toString();"),
+                "must actually apply the rewritten URL back to the iframe's own src");
+        let append_pos = html.find("targetWrapper.appendChild(el);")
+            .expect("must still reparent the element into the target wrapper");
+        assert!(src_rewrite_pos < append_pos,
+                "the src rewrite must happen *before* reparenting -- since reparenting \
+                 unavoidably triggers its own reload regardless, doing the rewrite first \
+                 ensures that reload (whichever one actually completes) uses the correct, \
+                 already-rewritten src from the start, rather than the original wrong one");
     }
 
     #[test]

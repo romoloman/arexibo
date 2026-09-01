@@ -283,17 +283,17 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                 // This shrink mechanism was designed for a different,
                 // genuine bug (a widget like a clock rendering 2-3x too
                 // large due to a font/CSS sizing issue) -- a MODEST
-                // overflow ratio. A scale this extreme (over ~5x too
-                // "big") is a strong signal the content is *designed* to
-                // overflow (a scrolling ticker/marquee, not a sizing bug),
-                // and forcibly shrinking it to fit -- besides visually
-                // squashing it into imperceptibility -- also repeatedly
-                // resets and re-measures `body.style.transform` on every
-                // DOM mutation (see armObserver below), which can race
-                // with a marquee plugin's *own* width measurement/
-                // animation setup happening at the same time. Below this
-                // threshold, skip shrinking entirely and leave the
-                // content exactly as the CMS/widget itself intended.
+                // overflow ratio. A scale this extreme is a strong signal
+                // the content is *designed* to overflow (a scrolling
+                // ticker/marquee, not a sizing bug), and forcibly
+                // shrinking it to fit -- besides visually squashing it
+                // into imperceptibility -- also repeatedly resets and
+                // re-measures `body.style.transform` on every DOM
+                // mutation (see armObserver below), which can race with a
+                // marquee plugin's *own* width measurement/animation
+                // setup happening at the same time. Below this threshold,
+                // skip shrinking entirely and leave the content exactly
+                // as the CMS/widget itself intended.
                 //
                 // HISTORY: briefly set to 1 (disabling this mechanism
                 // entirely) after a deliberate decision to trade the
@@ -307,12 +307,32 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                 // client architecture that never went through this
                 // mechanism at all -- but overflowing into a clipped,
                 // near-black box on Linux/arexibo the moment this was
-                // disabled). 0.2 is confirmed, via real functional
-                // testing, to fix both cases correctly at once: the clock
-                // (a modest, genuine sizing bug) gets shrunk; the marquee
-                // (content intentionally far larger than its box) does
-                // not.
-                var MIN_SHRINK_SCALE = 0.2;
+                // disabled).
+                //
+                // Lowered from 0.2 to 0.05 after a real, severe bug found
+                // via a live diagnostic capture (a temporary fetch() call
+                // reporting w/h/sw/sh/scale back to arexibo::server's own
+                // log, since console output from inside a subframe isn't
+                // forwarded by --web-debug): a 5-column dataset/table
+                // widget (drawer-swapped into a real target region, see
+                // navWidgetFromDrawer's own doc comment) measured
+                // scale=0.134 (sw=4699 against a real target of 629) --
+                // just above the old 0.2 threshold, so this mechanism
+                // skipped shrinking it entirely, same as it would a
+                // marquee -- leaving the table at its full natural width,
+                // with only its own leftmost column visible through the
+                // target region's own overflow:hidden. A wide, genuinely
+                // multi-column table (not wrapping its own cells) is
+                // neither a "modest sizing bug" (a clock 2-3x too big)
+                // nor a marquee (whose own confirmed real scrollWidth,
+                // ~1,000,000px, produces a scale several orders of
+                // magnitude more extreme, around 0.001 for a similarly-
+                // sized target) -- 0.05 leaves ample margin on both
+                // sides: comfortably above a genuine marquee's own ratio
+                // (still shrinking nothing that's actually designed to
+                // scroll), comfortably below this table's own 0.134 (so
+                // it now correctly shrinks instead of being skipped).
+                var MIN_SHRINK_SCALE = 0.05;
                 if (scale < MIN_SHRINK_SCALE) {
                     if (window.arexiboDebug) {
                         console.log('arexibo-shrink: target=' + w + 'x' + h +
