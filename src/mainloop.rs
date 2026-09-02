@@ -164,6 +164,17 @@ pub struct Handler {
     /// `Schedule<T>::update` on an unchanged id -- see
     /// `ForceReloadLayout`'s own doc comment).
     force_reload_after_collect: bool,
+    /// Whether the most recent collect_once() reported *any* required
+    /// file (media, layout, or resource) failing to download -- see
+    /// maybe_force_reload_after_purge's own doc comment for why this
+    /// matters (a real, severe bug found via a live report, and its
+    /// user's own preferred fix over the more surgical, per-layout
+    /// alternative: simpler, at the cost of a persistently-failing
+    /// unrelated file blocking the purge-triggered reload indefinitely
+    /// -- an accepted trade-off). Set right after every
+    /// download_required_files() call in collect_once(), before the
+    /// per-file results are consumed by submit_media_inventory.
+    last_collect_had_failures: bool,
     /// Set by an XMR `changeLayout` action: while `Some`, completely
     /// bypasses the normal CMS-driven schedule (see `schedule_check()`)
     /// and forces this one layout to be shown, exactly like the C#
@@ -453,6 +464,28 @@ const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
 /// requests while genuinely just waiting.
 const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Whether any *media* or *layout* file in a collection cycle's own
+/// per-file download results failed -- used by
+/// `maybe_force_reload_after_purge` (see its own doc comment) to avoid
+/// firing a purge-triggered reload before every piece the currently-
+/// showing layout might need is actually back on disk.
+///
+/// "resource" failures (dataset/webpage-manual/bestfit widgets, see
+/// their own `ReqFile::inventory()`) are deliberately excluded: those
+/// already have their own, separate recovery mechanism
+/// (`resource_retry_queue`'s own short-delay retry, plus
+/// `note_layout_file_downloaded`'s own reload-on-arrival for the
+/// currently-showing layout) once they eventually download
+/// successfully, so waiting on them here too would only add an
+/// unnecessary delay before the purge-triggered reload can ever fire,
+/// for no real benefit. A free function (not a method) specifically so
+/// this one small piece of logic is directly unit-testable against a
+/// plain, hand-built slice, without needing a real `Handler` or any
+/// network/collection machinery at all.
+fn any_non_resource_failure(result: &[((&'static str, i64), bool)]) -> bool {
+    result.iter().any(|((typ, _), success)| *typ != "resource" && !success)
+}
+
 impl Handler {
     /// Create a new handler, with channels to the GUI thread.
     // Not bundled into an options struct: purely a clippy style lint,
@@ -617,7 +650,7 @@ impl Handler {
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
                                  layouts, commands_run: std::collections::HashSet::new(),
-                                 envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false,
+                                 envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -664,7 +697,7 @@ impl Handler {
             let mut slf = Self { to_gui, from_gui, settings: PlayerSettings::default(),
                                  cache, xmds, xmr: never(), schedule: Schedule::default(),
                                  layouts: vec![], commands_run: std::collections::HashSet::new(),
-                                 envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false,
+                                 envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
                                  override_layout: None, overlay_layout: None,
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
@@ -1511,6 +1544,10 @@ impl Handler {
         let current_scheduleid = self.schedule.scheduleid_for(self.current_layout);
 
         let result = self.download_required_files(required, current_scheduleid, &schedule);
+
+        // See maybe_force_reload_after_purge's own doc comment for why
+        // this matters.
+        self.last_collect_had_failures = any_non_resource_failure(&result);
 
         // let the CMS know we have the media
         self.xmds.submit_media_inventory(result)?;
@@ -2626,12 +2663,20 @@ impl Handler {
     /// re-download places on it), navigating to it produces an actual,
     /// live browser error page -- categorically worse than simply
     /// staying on the previous (stale, but at least *rendered*) page a
-    /// moment longer. Fixed by actually checking the file is there
-    /// before firing the reload -- if it isn't yet, the flag is left
-    /// set (not cleared) so this same check runs again after the
-    /// *next* collection cycle, once the file has had a further chance
-    /// to actually arrive, rather than ever navigating to a target
-    /// confirmed missing.
+    /// moment longer. Fixed with two checks, both needed: the current
+    /// layout's own translated HTML must actually be present on disk
+    /// (catches a translation failure even if the raw download itself
+    /// succeeded), *and* this cycle's own download_required_files() call
+    /// must have reported zero failures for any media/layout file (see
+    /// `last_collect_had_failures`'s own doc comment for why "resource"
+    /// failures specifically don't count here -- discussed directly
+    /// with the user, who explicitly chose this simpler, whole-cycle
+    /// check over a more surgical, per-layout-media alternative, at the
+    /// accepted cost of a persistently-failing *unrelated* file
+    /// blocking this reload indefinitely). If either check fails, the
+    /// flag is left set (not cleared) so this same check runs again
+    /// after the *next* collection cycle, rather than ever navigating
+    /// to a target that may still be missing pieces.
     fn maybe_force_reload_after_purge(&mut self) {
         if self.force_reload_after_collect {
             let html_path = self.cache.dir().join(format!("{}.xlf.html", self.current_layout));
@@ -2639,6 +2684,12 @@ impl Handler {
                 log::warn!("purge-triggered reload: {} not found on disk yet (current \
                             layout {}) -- not reloading this cycle, will retry after the \
                             next collection", html_path.display(), self.current_layout);
+                return;
+            }
+            if self.last_collect_had_failures {
+                log::warn!("purge-triggered reload: at least one required file failed to \
+                            download this cycle -- not reloading yet, will retry after the \
+                            next collection");
                 return;
             }
             self.force_reload_after_collect = false;
@@ -5481,6 +5532,77 @@ mod data_refresh_timer_tests {
                 "the flag must stay set when the file wasn't found, so the same check \
                  retries after the next collection cycle instead of silently giving up \
                  on the reload entirely");
+    }
+
+    #[test]
+    fn any_non_resource_failure_ignores_resource_entries() {
+        // Regression test for a real design decision discussed directly
+        // with the user: expanding maybe_force_reload_after_purge's own
+        // check (see the test above) to also cover media referenced by
+        // the currently-showing layout, not just its own top-level
+        // translated HTML -- e.g. a video widget whose own file is
+        // still missing even though the layout's HTML itself downloaded
+        // fine. The user explicitly chose the simpler, whole-cycle
+        // check (over a more surgical, per-layout-media alternative)
+        // with one deliberate exception: "resource" failures (dataset/
+        // webpage-manual/bestfit widgets) should NOT block the reload,
+        // since those already have their own, separate recovery
+        // mechanism once they eventually download successfully.
+        assert!(!any_non_resource_failure(&[]),
+                "an empty result (e.g. nothing needed downloading) must not count as a \
+                 failure");
+        assert!(!any_non_resource_failure(&[(("media", 1), true), (("layout", 2), true)]),
+                "all-success must not count as a failure");
+        assert!(any_non_resource_failure(&[(("media", 1), false)]),
+                "a failed media file must count as a failure");
+        assert!(any_non_resource_failure(&[(("layout", 1), false)]),
+                "a failed layout file must count as a failure");
+        assert!(!any_non_resource_failure(&[(("resource", 1), false)]),
+                "a failed *resource* (dataset/webpage-manual/bestfit) must NOT count -- \
+                 those already self-heal via resource_retry_queue/\
+                 note_layout_file_downloaded once they eventually succeed");
+        assert!(any_non_resource_failure(&[(("resource", 1), false), (("media", 2), false)]),
+                "a genuine media failure must still count even alongside an ignored \
+                 resource failure");
+        assert!(!any_non_resource_failure(&[(("resource", 1), false), (("media", 2), true)]),
+                "an ignored resource failure alongside an otherwise fully successful \
+                 collection must not count as a failure overall");
+    }
+
+    #[test]
+    fn maybe_force_reload_after_purge_waits_if_this_cycle_had_media_failures() {
+        // Regression test for the same design decision as the test
+        // above, covering the *consuming* side: even with the current
+        // layout's own translated HTML confirmed present on disk (the
+        // narrower check the previous fix already covers), a real,
+        // unrelated media file referenced by that same layout (e.g. a
+        // video) may still have failed to download this cycle --
+        // reloading anyway would show the layout with that media
+        // broken/missing, alongside whatever else might be affected.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        handler.current_layout = 4242;
+        std::fs::create_dir_all(envdir.join("res")).unwrap();
+        std::fs::write(envdir.join("res").join("4242.xlf.html"), b"<html></html>").unwrap();
+        handler.force_reload_after_collect = true;
+        handler.last_collect_had_failures = true;
+        handler.maybe_force_reload_after_purge();
+        assert!(togui_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "must not force a reload when this cycle reported a media/layout failure, \
+                 even with the current layout's own HTML confirmed present -- some other \
+                 piece it depends on may still be missing");
+        assert!(handler.force_reload_after_collect,
+                "the flag must stay set so the same check retries after the next \
+                 collection cycle");
     }
 
     #[test]
