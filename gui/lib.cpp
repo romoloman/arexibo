@@ -266,10 +266,100 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
             var h = parseFloat(params.get('arexiboShrinkH'));
             if (!(w > 0) || !(h > 0)) return;
 
+            // The REAL root cause of the "correctly-proportioned but
+            // uniformly squashed" report, found by reading the CMS's
+            // own real generated resource HTML directly (a dataset/
+            // table widget, in this case): the widget's own inline
+            // script sets `window.globalOptions = { originalWidth:
+            // 1080, originalHeight: 1920, ... }` -- baked in at
+            // *translation* time, matching the drawer's own full
+            // canvas size (since this widget was authored/translated
+            // while still inside the drawer -- see
+            // navWidgetFromDrawer's own doc comment). Xibo's own
+            // bundled `xiboLayoutScaler` (called from inside the
+            // template's own `onTemplateRender_...`, itself triggered
+            // once the widget's data finishes loading -- asynchronous,
+            // well after this script's own first run) compares THIS
+            // "original" size against the container's *actual*
+            // current size to compute its own separate scale-down
+            // transform. For an ordinary (non-drawer) widget,
+            // arexibo's own layout.rs always sets originalWidth/Height
+            // equal to the widget's own real region by construction,
+            // so this ratio is always exactly 1 -- a harmless no-op,
+            // confirmed via an earlier, unrelated bug fix (see the
+            // MAX_GROW_SCALE comment below, "arexibo always sets it
+            // equal to the container by construction"). But a
+            // drawer-swapped widget's own real target region (629x257
+            // in the real report) is nothing like the drawer's own
+            // 1080x1920 canvas baked into its HTML -- xiboLayoutScaler
+            // computes a genuine ~0.13 ratio and applies its *own*
+            // CSS transform, squashing the correctly-proportioned
+            // table (its own `table-layout: fixed` from the CMS's own
+            // template CSS was never the problem -- confirmed by
+            // reading that template's own source directly) down to a
+            // fraction of its real size, well before -- and
+            // independently of -- anything this script's own
+            // tryShrink() below does to it afterward.
+            //
+            // Fix: intercept the *assignment* to window.globalOptions
+            // (this script runs at DocumentCreation, guaranteed before
+            // the widget's own inline script executes, so a simple
+            // one-time patch immediately after parsing w/h above would
+            // run too early -- globalOptions doesn't exist yet at that
+            // point) and patch originalWidth/originalHeight to the
+            // real target dimensions the instant the widget's own
+            // script assigns to it, well before xiboLayoutScaler ever
+            // gets a chance to read it (its own call happens later,
+            // gated behind the widget's own async data load) -- making
+            // its own ratio exactly 1, the same harmless no-op as the
+            // ordinary, non-drawer case, and leaving this script's own
+            // tryShrink() as the sole thing actually scaling the
+            // content.
+            try {
+                var _actualGlobalOptions;
+                Object.defineProperty(window, 'globalOptions', {
+                    configurable: true,
+                    get: function() { return _actualGlobalOptions; },
+                    set: function(value) {
+                        if (value && typeof value === 'object') {
+                            value.originalWidth = w;
+                            value.originalHeight = h;
+                        }
+                        _actualGlobalOptions = value;
+                    }
+                });
+            } catch (e) {}
+
             function tryShrink() {
                 var body = document.body;
                 if (!body) return;
                 body.style.transform = '';
+                // A real, severe follow-up bug found via a live
+                // screenshot comparison, even with the MIN_SHRINK_SCALE
+                // fix above already live: a genuinely wide multi-column
+                // table (dataset/table widget, drawer-swapped into a
+                // real, much smaller target region -- see
+                // navWidgetFromDrawer's own doc comment) DID shrink now,
+                // and every column WAS visible -- but the resulting text
+                // was uniformly squashed down by the same large factor
+                // (scale~0.13 in the real report) needed to fit its own
+                // unconstrained natural width, rendering it illegibly
+                // tiny. The user's own correct insight: since the real
+                // target region's own dimensions are already known
+                // *before* this content ever renders, there's no reason
+                // to let it lay out at an unconstrained natural width
+                // and shrink everything (text included) afterward --
+                // constrain the *available* width to the real target
+                // first, giving genuinely responsive content the chance
+                // to reflow/wrap within that width at its own normal
+                // font size, instead of being uniformly squashed
+                // afterward. (Turned out not to be the actual cause for
+                // this specific report -- see the globalOptions
+                // interception above -- but left in place: harmless,
+                // and may still help other, non-table responsive
+                // content.)
+                document.documentElement.style.maxWidth = w + 'px';
+                document.documentElement.style.overflowX = 'hidden';
                 var sw = body.scrollWidth, sh = body.scrollHeight;
                 if (sw <= 0 || sh <= 0) return;
                 var scale = Math.min(1, w / sw, h / sh);
