@@ -752,14 +752,13 @@ impl Handler {
                     // See this flag's own doc comment (set by the
                     // `Purge` XMR handler) -- forces a real reload of
                     // whatever's currently showing now that the fresh
-                    // files purge triggered are back, regardless of
-                    // whether collect_once() above actually succeeded
-                    // (even a failed collection may have still managed
-                    // to redownload enough for the currently-stuck
-                    // widget specifically -- and if not, this is
-                    // harmless: the reload just re-hits the same
-                    // missing files it would have anyway, no worse off
-                    // than not reloading at all).
+                    // files purge triggered are back. Whether this
+                    // actually reloads now, or waits for a later cycle,
+                    // is handled entirely inside the method itself (see
+                    // its own doc comment for a real, severe bug found
+                    // from reloading unconditionally here) -- it checks
+                    // the current layout's own translated HTML is
+                    // actually present on disk first.
                     self.maybe_force_reload_after_purge();
                     // While waiting for CMS authorization or a working
                     // network (see pending_auth/pending_network), retry
@@ -1669,7 +1668,35 @@ impl Handler {
                 match self.cache.download(file.clone(), &mut self.xmds)
                                 .with_context(|| format!("downloading {filedesc}"))
                 {
-                    Ok(()) => if !is_dependency { result.push((inventory, true)); },
+                    Ok(()) => {
+                        if !is_dependency { result.push((inventory, true)); }
+                        // A real, severe bug found via a live report: a
+                        // media item changed in the CMS's own library,
+                        // *without* republishing the layout that uses
+                        // it, still made the CMS bump the layout's own
+                        // required version too (a real, observed CMS
+                        // behavior, not something this client controls)
+                        // -- both the layout and the new media
+                        // genuinely got redownloaded here, correctly,
+                        // onto disk. But if that layout is the one
+                        // *currently showing*, nothing told the GUI to
+                        // actually reload it: schedule_check()'s own
+                        // reload decision (see its own doc comment) is
+                        // keyed on the *layout id* changing, and here
+                        // the id is identical to before -- only the
+                        // *content* underneath it changed. Left
+                        // unfixed, the display would keep showing the
+                        // old, already-loaded page (with its own still-
+                        // cached reference to the old media) forever --
+                        // confirmed real: only a full process restart
+                        // or a `purgeAll` (which already forces a
+                        // reload via this same flag, see the `Purge`
+                        // XMR handler) ever actually picked up the
+                        // change. Reusing that same flag here forces
+                        // the same recovery once this cycle's
+                        // collect_once() completes.
+                        self.note_layout_file_downloaded(layout_id_if_any);
+                    },
                     Err(e) => {
                         log::error!("{e:#}");
                         if let Some(layout_id) = layout_id_if_any {
@@ -2579,10 +2606,61 @@ impl Handler {
     /// specifically so this is directly testable without needing to
     /// drive the whole (infinite, blocking) `run()` loop just to
     /// reach it.
+    ///
+    /// A real, severe bug found via a live report: after a `purgeAll`
+    /// while a video widget was playing, the freeze this flag was
+    /// originally introduced to fix (see the `Purge` XMR handler's own
+    /// doc comment) was indeed gone -- but in its place, the display
+    /// got stuck on a raw browser 404 error page
+    /// (`http://localhost:9696/{id}.xlf.html`) that never recovered on
+    /// its own, only clearing once the user deleted the schedule
+    /// entirely. Root cause: this method's own doc comment used to
+    /// claim firing the reload "regardless of whether collect_once()
+    /// above actually succeeded" was harmless, "no worse off than not
+    /// reloading at all" -- that reasoning was simply wrong. If the
+    /// purge-triggered re-download of the current layout's own file
+    /// hasn't actually landed back on disk yet (a real possibility the
+    /// user's own report suggests may be more likely with an HTTP
+    /// direct-download setup -- e.g. Apache -- falling back to XMDS,
+    /// under the significant extra load a purge's own mass
+    /// re-download places on it), navigating to it produces an actual,
+    /// live browser error page -- categorically worse than simply
+    /// staying on the previous (stale, but at least *rendered*) page a
+    /// moment longer. Fixed by actually checking the file is there
+    /// before firing the reload -- if it isn't yet, the flag is left
+    /// set (not cleared) so this same check runs again after the
+    /// *next* collection cycle, once the file has had a further chance
+    /// to actually arrive, rather than ever navigating to a target
+    /// confirmed missing.
     fn maybe_force_reload_after_purge(&mut self) {
         if self.force_reload_after_collect {
+            let html_path = self.cache.dir().join(format!("{}.xlf.html", self.current_layout));
+            if !html_path.exists() {
+                log::warn!("purge-triggered reload: {} not found on disk yet (current \
+                            layout {}) -- not reloading this cycle, will retry after the \
+                            next collection", html_path.display(), self.current_layout);
+                return;
+            }
             self.force_reload_after_collect = false;
             self.to_gui.send(ToGui::ForceReloadLayout(self.current_layout)).unwrap();
+        }
+    }
+
+    /// Called right after a required file's own download succeeds
+    /// (see `download_required_files`'s own call site for the full
+    /// story) -- if it was the layout file for whatever's *currently
+    /// showing*, sets `force_reload_after_collect` (see its own doc
+    /// comment) so the GUI actually picks up the change, since
+    /// schedule_check()'s own reload decision alone (keyed on the
+    /// layout id changing) would otherwise never notice a same-id
+    /// layout's own content being updated underneath it. A separate
+    /// method specifically so this is directly testable without
+    /// needing to mock an actual XMDS GetFile download succeeding.
+    fn note_layout_file_downloaded(&mut self, layout_id_if_any: Option<i64>) {
+        if let Some(layout_id) = layout_id_if_any {
+            if layout_id == self.current_layout {
+                self.force_reload_after_collect = true;
+            }
         }
     }
 
@@ -5336,8 +5414,14 @@ mod data_refresh_timer_tests {
         // With the flag set (as the `Purge` XMR handler does), the
         // *current* layout must be force-reloaded, and the flag must be
         // cleared afterward (so it doesn't keep reloading on every
-        // subsequent, unrelated collection).
+        // subsequent, unrelated collection) -- but only once the
+        // current layout's own translated HTML is actually confirmed
+        // present on disk (see this method's own doc comment for a
+        // real, severe bug found from skipping this check -- a
+        // separate test below covers that missing-file case directly).
         handler.current_layout = 4242;
+        std::fs::create_dir_all(envdir.join("res")).unwrap();
+        std::fs::write(envdir.join("res").join("4242.xlf.html"), b"<html></html>").unwrap();
         handler.force_reload_after_collect = true;
         handler.maybe_force_reload_after_purge();
         let msg = togui_rx.recv_timeout(Duration::from_millis(500))
@@ -5349,6 +5433,116 @@ mod data_refresh_timer_tests {
         assert!(!handler.force_reload_after_collect,
                 "the flag must be cleared after acting on it, or every later collection \
                  (unrelated to the purge that set it) would keep force-reloading forever");
+    }
+
+    #[test]
+    fn maybe_force_reload_after_purge_waits_if_the_html_isnt_back_on_disk_yet() {
+        // Regression test for a real, severe bug found via a live
+        // report: after a `purgeAll` while a video widget was playing,
+        // the earlier freeze this flag was introduced to fix (see the
+        // test above) was indeed gone -- but in its place, the display
+        // got stuck on a raw browser 404 error page
+        // (http://localhost:9696/{id}.xlf.html) that never recovered
+        // on its own, only clearing once the user deleted the schedule
+        // entirely. Root cause: this method used to fire the reload
+        // "regardless of whether collect_once() actually succeeded" --
+        // if the purge-triggered re-download of the current layout's
+        // own file hadn't actually landed back on disk yet (plausible
+        // under an HTTP-direct-download setup falling back to XMDS,
+        // under the extra load a purge's own mass re-download places
+        // on it -- the user's own suspicion), navigating to it produced
+        // an actual, live browser error page -- worse than just staying
+        // on the previous, stale-but-rendered page a moment longer.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        // The flag is set, but 4242.xlf.html was never actually
+        // written to disk (e.g. collect_once() failed to redownload
+        // it this cycle) -- must NOT reload to a target confirmed
+        // missing, and must leave the flag set so this same check
+        // runs again after the *next* collection cycle, once the file
+        // has had a further chance to actually arrive.
+        handler.current_layout = 4242;
+        handler.force_reload_after_collect = true;
+        handler.maybe_force_reload_after_purge();
+        assert!(togui_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "must not force a reload when the current layout's own translated HTML \
+                 isn't actually on disk yet -- that would navigate straight to a live \
+                 browser 404 error page");
+        assert!(handler.force_reload_after_collect,
+                "the flag must stay set when the file wasn't found, so the same check \
+                 retries after the next collection cycle instead of silently giving up \
+                 on the reload entirely");
+    }
+
+    #[test]
+    fn note_layout_file_downloaded_forces_a_reload_only_for_the_currently_showing_layout() {
+        // Regression test for a real, severe bug found via a live
+        // report: a media item changed in the CMS's own library,
+        // *without* republishing the layout that uses it, still made
+        // the CMS bump the layout's own required version too (a real,
+        // observed CMS behavior) -- both the layout and the new media
+        // genuinely got redownloaded onto disk, correctly. But if that
+        // layout was the one *currently showing*, nothing told the GUI
+        // to actually reload it: schedule_check()'s own reload
+        // decision is keyed on the *layout id* changing, and here the
+        // id is identical to before -- only the *content* underneath
+        // it changed. Confirmed real: the display kept showing the
+        // old, already-loaded page (with its own still-cached
+        // reference to the old media) indefinitely -- on a single-
+        // layout kiosk with no natural rotation point, this could
+        // persist forever, until a full process restart or a
+        // `purgeAll`.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+        handler.current_layout = 4242;
+
+        // A *different* layout's own file being downloaded (e.g. one
+        // that's merely scheduled, not currently showing) must not
+        // force anything.
+        handler.note_layout_file_downloaded(Some(9999));
+        assert!(!handler.force_reload_after_collect,
+                "a downloaded file for a layout other than the currently-showing one \
+                 must not set the force-reload flag");
+
+        // A non-layout download (layout_id_if_any is None -- media,
+        // resources, dependencies) must also not force anything.
+        handler.note_layout_file_downloaded(None);
+        assert!(!handler.force_reload_after_collect,
+                "a non-layout file download must not set the force-reload flag");
+
+        // The *currently showing* layout's own file being downloaded
+        // (an update, since download() only runs for files not
+        // already correctly cached) must set the flag.
+        handler.note_layout_file_downloaded(Some(4242));
+        assert!(handler.force_reload_after_collect,
+                "a fresh download of the currently-showing layout's own file must set \
+                 the force-reload flag, so maybe_force_reload_after_purge (called after \
+                 every collect_once(), not just purge-triggered ones) actually reloads \
+                 the GUI once the updated content is back on disk");
+        // maybe_force_reload_after_purge (the consuming side, already
+        // tested above) is what actually turns this into a real
+        // ToGui::ForceReloadLayout -- not re-tested here again.
+        assert!(togui_rx.try_recv().is_err(),
+                "note_layout_file_downloaded itself must only set the flag -- the actual \
+                 reload message is sent later, by maybe_force_reload_after_purge, once \
+                 collect_once() has fully finished");
     }
 
     #[test]
