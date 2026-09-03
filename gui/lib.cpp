@@ -266,54 +266,25 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
             var h = parseFloat(params.get('arexiboShrinkH'));
             if (!(w > 0) || !(h > 0)) return;
 
-            // The REAL root cause of the "correctly-proportioned but
-            // uniformly squashed" report, found by reading the CMS's
-            // own real generated resource HTML directly (a dataset/
-            // table widget, in this case): the widget's own inline
-            // script sets `window.globalOptions = { originalWidth:
-            // 1080, originalHeight: 1920, ... }` -- baked in at
-            // *translation* time, matching the drawer's own full
-            // canvas size (since this widget was authored/translated
-            // while still inside the drawer -- see
-            // navWidgetFromDrawer's own doc comment). Xibo's own
-            // bundled `xiboLayoutScaler` (called from inside the
-            // template's own `onTemplateRender_...`, itself triggered
-            // once the widget's data finishes loading -- asynchronous,
-            // well after this script's own first run) compares THIS
-            // "original" size against the container's *actual*
-            // current size to compute its own separate scale-down
-            // transform. For an ordinary (non-drawer) widget,
-            // arexibo's own layout.rs always sets originalWidth/Height
-            // equal to the widget's own real region by construction,
-            // so this ratio is always exactly 1 -- a harmless no-op,
-            // confirmed via an earlier, unrelated bug fix (see the
-            // MAX_GROW_SCALE comment below, "arexibo always sets it
-            // equal to the container by construction"). But a
-            // drawer-swapped widget's own real target region (629x257
-            // in the real report) is nothing like the drawer's own
-            // 1080x1920 canvas baked into its HTML -- xiboLayoutScaler
-            // computes a genuine ~0.13 ratio and applies its *own*
-            // CSS transform, squashing the correctly-proportioned
-            // table (its own `table-layout: fixed` from the CMS's own
-            // template CSS was never the problem -- confirmed by
-            // reading that template's own source directly) down to a
-            // fraction of its real size, well before -- and
-            // independently of -- anything this script's own
-            // tryShrink() below does to it afterward.
+            // A drawer-swapped widget's own inline script sets
+            // `window.globalOptions = { originalWidth, originalHeight,
+            // ... }` baked in at translation time to match the
+            // *drawer's* own canvas -- Xibo's bundled xiboLayoutScaler
+            // (called once the widget's data loads) compares this
+            // against the container's real size to compute its own
+            // scale transform. For an ordinary widget this ratio is
+            // always 1 (a harmless no-op, see MAX_GROW_SCALE below) --
+            // but for a drawer widget it's a real, wrong ratio,
+            // squashing already-correctly-proportioned content.
             //
-            // Fix: intercept the *assignment* to window.globalOptions
-            // (this script runs at DocumentCreation, guaranteed before
-            // the widget's own inline script executes, so a simple
-            // one-time patch immediately after parsing w/h above would
-            // run too early -- globalOptions doesn't exist yet at that
-            // point) and patch originalWidth/originalHeight to the
-            // real target dimensions the instant the widget's own
-            // script assigns to it, well before xiboLayoutScaler ever
-            // gets a chance to read it (its own call happens later,
-            // gated behind the widget's own async data load) -- making
-            // its own ratio exactly 1, the same harmless no-op as the
-            // ordinary, non-drawer case, and leaving this script's own
-            // tryShrink() as the sole thing actually scaling the
+            // Fix: intercept the assignment to window.globalOptions
+            // (this script runs at DocumentCreation, before the
+            // widget's own inline script, so a one-time patch would
+            // run too early) and patch originalWidth/originalHeight to
+            // the real target dimensions the instant the widget's own
+            // script assigns them -- before xiboLayoutScaler ever
+            // reads it, making its own ratio 1 and leaving this
+            // script's own tryShrink() as the sole thing scaling the
             // content.
             try {
                 var _actualGlobalOptions;
@@ -334,94 +305,25 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                 var body = document.body;
                 if (!body) return;
                 body.style.transform = '';
-                // A real, severe follow-up bug found via a live
-                // screenshot comparison, even with the MIN_SHRINK_SCALE
-                // fix above already live: a genuinely wide multi-column
-                // table (dataset/table widget, drawer-swapped into a
-                // real, much smaller target region -- see
-                // navWidgetFromDrawer's own doc comment) DID shrink now,
-                // and every column WAS visible -- but the resulting text
-                // was uniformly squashed down by the same large factor
-                // (scale~0.13 in the real report) needed to fit its own
-                // unconstrained natural width, rendering it illegibly
-                // tiny. The user's own correct insight: since the real
-                // target region's own dimensions are already known
-                // *before* this content ever renders, there's no reason
-                // to let it lay out at an unconstrained natural width
-                // and shrink everything (text included) afterward --
-                // constrain the *available* width to the real target
-                // first, giving genuinely responsive content the chance
-                // to reflow/wrap within that width at its own normal
-                // font size, instead of being uniformly squashed
-                // afterward. (Turned out not to be the actual cause for
-                // this specific report -- see the globalOptions
-                // interception above -- but left in place: harmless,
-                // and may still help other, non-table responsive
-                // content.)
+                // Constrain available width to the real target first,
+                // so responsive content can reflow/wrap at its own
+                // normal font size instead of being uniformly squashed
+                // by the scale below. Harmless even where it isn't the
+                // fix (e.g. a table using table-layout:auto, unaffected
+                // by max-width).
                 document.documentElement.style.maxWidth = w + 'px';
                 document.documentElement.style.overflowX = 'hidden';
                 var sw = body.scrollWidth, sh = body.scrollHeight;
                 if (sw <= 0 || sh <= 0) return;
                 var scale = Math.min(1, w / sw, h / sh);
-                // BUG fix (found from a real report: "RSS marquee scroller
-                // does not display text" -- confirmed via real DevTools
-                // inspection on a real widget: body.scrollWidth measured
-                // in the ~1,000,000px range for a horizontally-scrolling
-                // marquee ticker, whose plugin duplicates its own content
-                // several times over to create a seamless scrolling loop
-                // -- entirely intentional, not oversized content to fix).
-                // This shrink mechanism was designed for a different,
-                // genuine bug (a widget like a clock rendering 2-3x too
-                // large due to a font/CSS sizing issue) -- a MODEST
-                // overflow ratio. A scale this extreme is a strong signal
-                // the content is *designed* to overflow (a scrolling
-                // ticker/marquee, not a sizing bug), and forcibly
-                // shrinking it to fit -- besides visually squashing it
-                // into imperceptibility -- also repeatedly resets and
-                // re-measures `body.style.transform` on every DOM
-                // mutation (see armObserver below), which can race with a
-                // marquee plugin's *own* width measurement/animation
-                // setup happening at the same time. Below this threshold,
-                // skip shrinking entirely and leave the content exactly
-                // as the CMS/widget itself intended.
-                //
-                // HISTORY: briefly set to 1 (disabling this mechanism
-                // entirely) after a deliberate decision to trade the
-                // clock-sizing fix for reduced risk of unknown
-                // interactions with other, untested third-party widget
-                // plugins. Reverted immediately -- confirmed via a direct
-                // Linux-vs-Windows screenshot comparison from the user
-                // that this reintroduced the exact original clock bug
-                // (Europe/Rome digital clock rendering correctly, cleanly
-                // sized on Windows -- a completely separate CEF-based
-                // client architecture that never went through this
-                // mechanism at all -- but overflowing into a clipped,
-                // near-black box on Linux/arexibo the moment this was
-                // disabled).
-                //
-                // Lowered from 0.2 to 0.05 after a real, severe bug found
-                // via a live diagnostic capture (a temporary fetch() call
-                // reporting w/h/sw/sh/scale back to arexibo::server's own
-                // log, since console output from inside a subframe isn't
-                // forwarded by --web-debug): a 5-column dataset/table
-                // widget (drawer-swapped into a real target region, see
-                // navWidgetFromDrawer's own doc comment) measured
-                // scale=0.134 (sw=4699 against a real target of 629) --
-                // just above the old 0.2 threshold, so this mechanism
-                // skipped shrinking it entirely, same as it would a
-                // marquee -- leaving the table at its full natural width,
-                // with only its own leftmost column visible through the
-                // target region's own overflow:hidden. A wide, genuinely
-                // multi-column table (not wrapping its own cells) is
-                // neither a "modest sizing bug" (a clock 2-3x too big)
-                // nor a marquee (whose own confirmed real scrollWidth,
-                // ~1,000,000px, produces a scale several orders of
-                // magnitude more extreme, around 0.001 for a similarly-
-                // sized target) -- 0.05 leaves ample margin on both
-                // sides: comfortably above a genuine marquee's own ratio
-                // (still shrinking nothing that's actually designed to
-                // scroll), comfortably below this table's own 0.134 (so
-                // it now correctly shrinks instead of being skipped).
+                // A marquee/ticker plugin duplicates its own content
+                // several times to scroll seamlessly, producing
+                // scrollWidth in the ~1,000,000px range -- an
+                // intentional overflow, not a sizing bug this mechanism
+                // should "fix" by squashing it into imperceptibility
+                // (and forcibly transforming it can race the plugin's
+                // own width/animation setup). Below MIN_SHRINK_SCALE,
+                // skip shrinking entirely.
                 var MIN_SHRINK_SCALE = 0.05;
                 if (scale < MIN_SHRINK_SCALE) {
                     if (window.arexiboDebug) {
@@ -493,31 +395,15 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
                                                  characterData: true });
                 } catch (e) {}
             }
-            // A real, severe follow-up bug found this way: this
-            // frame's own w/h above come from its own URL's static
-            // query string, baked in at *translation* time -- correct
-            // for a normal region widget (its own w/h *is* its real
-            // region's own size), but always the *drawer's* own size
-            // (typically the whole screen) for a drawer widget, since
-            // which real target region it eventually gets swapped
-            // into by navWidgetFromDrawer (see its own doc comment) is
-            // a runtime decision, unknowable here at the time this
-            // frame first loads. Left as the only input, the grow
-            // path above (content authored smaller than its own
-            // region, e.g. a small countdown/dataset table) would
-            // grow that content to fill the *drawer's* own full-screen
-            // size -- confirmed real via a live screenshot comparison
-            // against the CMS's own correct rendering: the content
-            // rendered enormously oversized once swapped into a real,
-            // much smaller target region. navWidgetFromDrawer posts
-            // this frame the *real* target region's own size once it
-            // actually knows it (at swap time) -- strictly validated
-            // by its own distinct property name (`arexiboResizeShrink
-            // Target`) before acting on it, since this same script
-            // runs in *every* frame, including native webpage widgets
-            // showing arbitrary real external sites, whose own
-            // unrelated postMessage traffic must never be mistaken for
-            // this.
+            // A drawer widget's own w/h above come from its static URL
+            // query string, baked in at translation time to the
+            // *drawer's* own size -- always wrong once swapped into a
+            // real, smaller target region. navWidgetFromDrawer posts
+            // this frame the real target size once it knows it (at
+            // swap time); validated by its own distinct property name
+            // since this script runs in every frame, including native
+            // webpage widgets whose own unrelated postMessage traffic
+            // must never be mistaken for this.
             window.addEventListener('message', function(event) {
                 var data = event.data;
                 if (!data || data.arexiboResizeShrinkTarget !== true) return;

@@ -97,15 +97,14 @@ pub enum ToGui {
     /// not just have the same layout id silently confirmed as already
     /// correct. See mainloop.rs's own sync_peer_connected handling.
     ///
-    /// Carries the id explicitly (BUG FIXED: an earlier version
-    /// derived it from the GUI's own Schedule<T>::current() instead --
-    /// but that reflects whatever the *last actual* ToGui::Layouts
-    /// call set it to, which this message is specifically sent
-    /// *instead of* for a Sync Group switch. A real report caught this
-    /// directly: the very first synchronized switch of a session
-    /// force-reloaded layout 0 -- the startup splash/default, still
-    /// the GUI's own stale "current" from before this mechanism ever
-    /// ran -- instead of the actual synchronized layout at all).
+    /// Carries the id explicitly -- an earlier version derived it from
+    /// the GUI's own Schedule<T>::current() instead, but that reflects
+    /// whatever the *last actual* ToGui::Layouts call set it to, which
+    /// this message is specifically sent *instead of* for a Sync Group
+    /// switch. The very first synchronized switch of a session
+    /// force-reloaded layout 0 (the startup splash/default, still the
+    /// GUI's own stale "current") instead of the actual synchronized
+    /// layout.
     ForceReloadLayout(i64),
 }
 
@@ -153,27 +152,23 @@ pub struct Handler {
     /// run" check has to live here instead.
     commands_run: std::collections::HashSet<i64>,
     current_layout: i64,
-    /// Set by the `Purge` XMR handler (a real bug found this way: a
-    /// currently-playing video widget left stuck/frozen mid-playback
-    /// after a live "purgeAll" CMS action -- see that handler's own
-    /// doc comment for why) -- checked and cleared right after the
-    /// very next `collect_once()` completes, forcing a real GUI reload
-    /// of whatever's currently showing regardless of whether the
-    /// schedule/layout id itself changed at all (an ordinary
-    /// `ToGui::Layouts` is silently no-op'd by the GUI's own
+    /// Set by the `Purge` XMR handler -- checked and cleared right
+    /// after the very next `collect_once()` completes, forcing a real
+    /// GUI reload of whatever's currently showing regardless of
+    /// whether the schedule/layout id itself changed at all (an
+    /// ordinary `ToGui::Layouts` is silently no-op'd by the GUI's own
     /// `Schedule<T>::update` on an unchanged id -- see
     /// `ForceReloadLayout`'s own doc comment).
     force_reload_after_collect: bool,
     /// Whether the most recent collect_once() reported *any* required
-    /// file (media, layout, or resource) failing to download -- see
-    /// maybe_force_reload_after_purge's own doc comment for why this
-    /// matters (a real, severe bug found via a live report, and its
-    /// user's own preferred fix over the more surgical, per-layout
-    /// alternative: simpler, at the cost of a persistently-failing
-    /// unrelated file blocking the purge-triggered reload indefinitely
-    /// -- an accepted trade-off). Set right after every
-    /// download_required_files() call in collect_once(), before the
-    /// per-file results are consumed by submit_media_inventory.
+    /// media/layout file failing to download -- see
+    /// maybe_force_reload_after_purge's own doc comment. Chosen over a
+    /// more surgical, per-layout-media check: simpler, at the cost of
+    /// a persistently-failing unrelated file blocking the
+    /// purge-triggered reload indefinitely (accepted trade-off). Set
+    /// right after every download_required_files() call in
+    /// collect_once(), before the per-file results are consumed by
+    /// submit_media_inventory.
     last_collect_had_failures: bool,
     /// Set by an XMR `changeLayout` action: while `Some`, completely
     /// bypasses the normal CMS-driven schedule (see `schedule_check()`)
@@ -205,29 +200,20 @@ pub struct Handler {
     /// Follower's own `lead_addr` changes while staying a Follower.
     sync_group_role: SyncRole,
     /// Whether the very first collection cycle (schedule.xml
-    /// downloaded and parsed, *every* required file successfully
-    /// downloaded/translated -- i.e. the point right before "collection
-    /// successful" is logged) has completed at least once. Gates
-    /// `update_sync_group` (see its own doc comment for why):
-    /// deliberately false at construction, so the two `update_settings`
-    /// calls `Handler::new` itself makes (processing the *initial*
-    /// RegisterDisplay response, well before any collection has ever
-    /// run) don't connect to/announce readiness to a Sync Group Lead
-    /// while this display's own cache is still empty -- confirmed real
-    /// via a live report: a Follower connecting this early would
-    /// receive a Command (or catch-up Sync heartbeat) for sync_keys it
-    /// couldn't yet resolve (its own schedule/cache genuinely not
-    /// downloaded yet), and worse, once it *did* finish downloading and
-    /// discovered its own matching sync-gated layout independently,
-    /// that discovery would stage a *fresh*, ordinarily-delayed switch
-    /// (switch_delay) as if this were a brand-new coordinated event --
-    /// completely uncoordinated with whenever the Lead (or other,
-    /// already-caught-up Followers) had actually applied theirs,
-    /// possibly hours earlier. Set true (and `update_sync_group`
-    /// explicitly (re)invoked once) at the end of the first genuinely
-    /// successful `collect_once` -- from then on this display's own
-    /// cache is guaranteed to already hold whatever it needs to resolve
-    /// any sync_keys it might already be part of, immediately.
+    /// downloaded and parsed, every required file successfully
+    /// downloaded/translated) has completed at least once. Gates
+    /// `update_sync_group` (see its own doc comment): deliberately
+    /// false at construction, so the two `update_settings` calls
+    /// `Handler::new` itself makes (processing the initial
+    /// RegisterDisplay response) don't connect to/announce readiness
+    /// to a Sync Group Lead while this display's own cache is still
+    /// empty -- a Follower connecting this early could receive a
+    /// Command/Sync for sync_keys it can't yet resolve, and once it
+    /// later discovers a matching layout independently, that would
+    /// stage an uncoordinated fresh switch, possibly hours out of
+    /// step with the Lead. Set true (and `update_sync_group` invoked
+    /// once) at the end of the first genuinely successful
+    /// `collect_once`.
     first_collection_done: bool,
     /// A Follower's own incoming, already offset-corrected SyncCommands
     /// -- `never()` whenever this display isn't currently a Sync Group
@@ -262,23 +248,16 @@ pub struct Handler {
     pending_sync_layout_id: Option<i64>,
     /// Set (to the layout id, alongside the `Instant` it was set at)
     /// right after `reconnect_after_catching_up_on_own` triggers a
-    /// reconnect -- suppresses `schedule_check`'s own *local*
-    /// discovery of this exact layout for a short grace window,
-    /// avoiding a real race confirmed via a live capture: after a
-    /// successful direct catch-up download, the very next
-    /// `schedule_check` call (already unconditionally made by this
-    /// same handler right after resolving) would *independently*
-    /// discover the layout it just finished caching and stage/apply
-    /// it a second time, a few seconds after the reconnect's own
-    /// freshly-coordinated Command already did -- two
-    /// `ForceReloadLayout` navigations close together, a real risk of
-    /// navigating mid-load if a widget's own JS happens to be running
-    /// at that exact moment (see the "occasional blank screen" gap
-    /// this guards against). Deliberately a *short-lived* suppression,
-    /// not a permanent one: if the reconnect doesn't pan out within a
+    /// reconnect -- suppresses `schedule_check`'s own local discovery
+    /// of this exact layout for a short grace window. Without it, the
+    /// very next `schedule_check` call would independently discover
+    /// the layout just finished caching and stage/apply it a second
+    /// time, a few seconds after the reconnect's own Command already
+    /// did -- two `ForceReloadLayout` navigations close together, risking
+    /// a mid-load navigation if a widget's own JS is running. Short-
+    /// lived, not permanent: if the reconnect doesn't pan out within a
     /// few seconds (e.g. the Lead is briefly unreachable), local
-    /// discovery must resume normally rather than silently never
-    /// discovering this layout again.
+    /// discovery must resume normally.
     suppress_local_discovery_of: Option<(i64, std::time::Instant)>,
     /// Fires at the *local* instant (already offset-corrected --
     /// `SyncCommand::target_local`) of the most recently received Sync
@@ -809,10 +788,7 @@ impl Handler {
                 },
                 // timer channel that fires when screenshot is needed
                 recv(screenshot) -> _ => {
-                    // Diagnostic log (found genuinely useful investigating
-                    // a real report: screenshots not reaching the CMS with
-                    // --debug active, no error anywhere) -- confirms
-                    // whether this timer arm actually fires and the
+                    // Confirms this timer arm actually fires and the
                     // message to the GUI thread is sent, since neither
                     // was logged anywhere before.
                     log::debug!("screenshot timer fired, requesting capture from GUI thread");
@@ -887,29 +863,19 @@ impl Handler {
                 // allows) the same real-world moment every other
                 // display in the group does too.
                 recv(self.sync_apply_timer) -> _ => {
-                    // Deliberately a clone/read, NOT `.take()` -- a
-                    // real bug found this way: taking it (clearing to
-                    // None regardless of whether resolution below
-                    // succeeded or failed) meant the very next
-                    // schedule_check() call's own re-publish guard
-                    // (`self.pending_sync_keys.as_ref() != Some(&sync_keys)`)
-                    // could never recognize "I already processed this
-                    // exact sync_keys set" once it had failed to
-                    // resolve to anything -- so a display not part of
-                    // a given synchronized grouping (the correct,
-                    // intended outcome of resolve_layout_for_sync_keys
-                    // returning None) would re-stage and re-fail the
-                    // exact same sync_keys every single cycle,
-                    // forever, in a tight loop (confirmed real: a
-                    // fresh log showed this repeating roughly once a
-                    // second, hammering both the log and the Sync
-                    // Group network channel, indefinitely). Now stays
-                    // set until a genuinely *different* sync_keys set
-                    // gets staged, either by this same schedule_check
-                    // discovering a new one locally or by a fresh
-                    // Command arriving over the network (both paths
-                    // already unconditionally overwrite this field
-                    // with the new value when that happens).
+                    // Deliberately a clone/read, NOT `.take()` --
+                    // taking it (clearing regardless of whether
+                    // resolution succeeded) meant the next
+                    // schedule_check()'s own re-publish guard could
+                    // never recognize "already processed this exact
+                    // sync_keys" once resolution had failed -- a
+                    // display not part of a given group (None from
+                    // resolve_layout_for_sync_keys, the correct
+                    // outcome) would re-stage and re-fail the same
+                    // sync_keys every cycle, forever, in a tight loop.
+                    // Now stays set until a genuinely different
+                    // sync_keys set gets staged (local discovery or a
+                    // fresh Command both already overwrite it).
                     if let Some(sync_keys) = self.pending_sync_keys.clone() {
                         match self.resolve_layout_for_sync_keys(&sync_keys) {
                             Some(layout_id) => {
@@ -992,14 +958,13 @@ impl Handler {
                 // itself, on whichever sync_keys are currently active
                 // (if any). There's no way to tell a genuinely
                 // first-time connection apart from a reconnection
-                // after a restart on either side (a real report:
-                // restarting a Follower mid-event left it stuck
+                // after a restart on either side (restarting a
+                // Follower mid-event would otherwise leave it stuck
                 // showing unrelated content forever, since the Lead
-                // only publishes a fresh Command when it *notices a
-                // schedule change* -- nothing changes there for an
-                // already-settled event) -- so this fires
-                // unconditionally on every single connection,
-                // deliberately not trying to guess which case it is.
+                // only publishes a fresh Command on a schedule change)
+                // -- so this fires unconditionally on every
+                // connection, deliberately not trying to guess which
+                // case it is.
                 recv(self.sync_peer_connected) -> _ => {
                     if self.sync_layout_active {
                         if let Some(layout_id) = self.override_layout {
@@ -1038,31 +1003,15 @@ impl Handler {
                             log::error!("during cache purge: {e:#}");
                         }
                         collect = after(Duration::from_secs(0));  // force re-download
-                        // A real, severe bug found this way: purge()
-                        // deletes every file on disk *immediately* --
-                        // including whatever a currently-playing video
-                        // widget's own <video> element is still
-                        // actively streaming from arexibo's own
-                        // embedded HTTP server (which reads each
-                        // request straight from disk, not from some
-                        // already-open, purge-proof handle). A
-                        // mid-stream byte-range request for a file
-                        // that's just been deleted fails outright,
-                        // and -- confirmed by a live report -- the
-                        // widget then stays stuck/frozen right there
-                        // indefinitely: schedule_check()'s own reload
-                        // decision is keyed on the *layout id*
-                        // actually changing, but a purge changes only
-                        // the files underneath an *unchanged*
-                        // schedule, so nothing would otherwise ever
-                        // tell the GUI to recover. Forcing a real
-                        // reload once the fresh files are back (see
-                        // this flag's own check below, right after the
-                        // very next collect_once() completes) gives
-                        // every widget currently showing a clean
-                        // restart against the newly-redownloaded
-                        // content, rather than leaving anything
-                        // whatever purge managed to interrupt stuck.
+                        // purge() deletes every file on disk
+                        // immediately, including whatever a currently-
+                        // playing widget is actively streaming from the
+                        // embedded HTTP server -- schedule_check()'s
+                        // own reload decision is keyed on the layout id
+                        // changing, which a purge alone doesn't. Forces
+                        // a real reload once the fresh files are back
+                        // (see this flag's own check, after the next
+                        // collect_once()).
                         self.force_reload_after_collect = true;
                     }
                     Ok(xmr::Message::WebHook(code)) => {
@@ -1075,18 +1024,13 @@ impl Handler {
                     }
                     Ok(xmr::Message::DataUpdate(widget_id)) => {
                         // For a v7 data widget we're independently
-                        // polling via GetData (see refresh_data_widget),
-                        // refresh its own JSON *before* reloading the
-                        // resource below -- otherwise there's a real
-                        // race: the reloaded iframe's own JS fetches
+                        // polling via GetData, refresh its own JSON
+                        // before reloading the resource below --
+                        // otherwise the reloaded iframe's own JS fetches
                         // <widgetId>.json immediately, which might not
-                        // exist yet if our own independent polling
-                        // timer simply hasn't caught up (confirmed via
-                        // a real report: a transient 404 on every
-                        // XMR-pushed data update for a v7 widget, until
-                        // either our own timer or the widget's own
-                        // client-side freshnessTimer eventually
-                        // recovers on its own). Best-effort -- a
+                        // exist yet if our own polling timer hasn't
+                        // caught up (a transient 404, recovering once
+                        // either timer catches up). Best-effort -- a
                         // failure here doesn't block the resource
                         // reload below, which must proceed regardless.
                         if self.cache.is_tracked_data_widget(widget_id) {
@@ -1339,8 +1283,8 @@ impl Handler {
             return;
         }
         // A shellcommand widget's command string can also be a special
-        // http|url|contentType|jsonBody or rs232|params|message form
-        // (confirmed real convention), not just a shell line --
+        // http|url|contentType|jsonBody or rs232|params|message form,
+        // not just a shell line --
         // command.rs's Command::run() already implements both. Run
         // synchronously here (same as run_command does) rather than
         // the spawn-and-track-for-kill machinery below, which only
@@ -1470,26 +1414,21 @@ impl Handler {
                         again shortly");
             return Ok(());
         } else {
-            // BUG fix (found from a direct question asking to verify
-            // this exact scenario): a previously-authorized, normally-
-            // running display (pending_auth/pending_network both
-            // false) that gets deauthorized used to just `bail!()`
-            // here -- logged as an error once per collection cycle,
-            // but self.pending_auth was never set (so retries kept
-            // using the slow, normal collect_interval instead of the
-            // fast 30s one) and self.schedule/self.layouts were never
-            // cleared (so the GUI was never told to switch away --
-            // the display would keep cycling through its stale cached
-            // schedule indefinitely, never reverting to the splash
-            // screen the way a freshly-unauthorized display does).
-            // Now: transitions into the same pending_auth state a
-            // fresh, never-yet-authorized display starts in, and
+            // A previously-authorized, normally-running display
+            // (pending_auth/pending_network both false) that gets
+            // deauthorized used to just `bail!()` here -- logged as an
+            // error once per cycle, but self.pending_auth was never
+            // set (retries kept using the slow collect_interval
+            // instead of the fast 30s one) and self.schedule/layouts
+            // were never cleared (the GUI was never told to switch
+            // away -- the display kept cycling its stale cached
+            // schedule indefinitely). Now: transitions into the same
+            // pending_auth state a fresh display starts in, and
             // actively clears the schedule + calls schedule_check()
-            // immediately so schedule_check's own empty-schedule path
-            // (see its own doc comment) sends ToGui::Layouts(vec![]),
-            // which gui.rs's own Schedule::update() correctly resolves
-            // to the splash screen (layout 0) as a last resort -- not
-            // waiting for the next periodic schedule_check tick (60s).
+            // immediately so its own empty-schedule path sends
+            // ToGui::Layouts(vec![]), resolving to the splash screen
+            // as a last resort -- not waiting for the next periodic
+            // tick (60s).
             log::warn!("display was previously authorized but no longer is -- \
                         reverting to the splash screen and retrying periodically, \
                         same as a freshly-unauthorized display");
@@ -1539,8 +1478,7 @@ impl Handler {
         // is_exempt_as_currently_playing_layout's own doc comment for
         // why this, not the raw layout id, is the correct identity to
         // track across a publish (which changes the layout id but
-        // keeps the scheduleid the same -- confirmed via two real
-        // schedule.xml samples, before and after a real publish).
+        // keeps the scheduleid the same).
         let current_scheduleid = self.schedule.scheduleid_for(self.current_layout);
 
         let result = self.download_required_files(required, current_scheduleid, &schedule);
@@ -1662,22 +1600,13 @@ impl Handler {
             // report.
             let is_dependency = matches!(file, crate::resource::ReqFile::Dependency { .. });
             if self.cache.has(&file) {
-                // A real, confirmed bug found this way: a file already
-                // fully cached from an earlier collection cycle (e.g.
-                // this exact content was downloaded once, the schedule
-                // referencing it was then removed, and it's now simply
-                // being re-scheduled) used to be reported here *only*
-                // at the moment it was first downloaded, inside the
-                // branch further below -- never again on any later
-                // cycle where it's already cached, meaning it was
-                // never included in *this* collection's own
-                // MediaInventory submission at all. Confirmed real via
-                // a live report: "Playlist stays pending in CMS after
-                // re-scheduling already-downloaded content" -- the
-                // CMS's own Manage Display view kept showing it as
-                // pending/incomplete indefinitely, even though it was
-                // already playing correctly, since the CMS was simply
-                // never told again that this display actually has it.
+                // A file already fully cached from an earlier cycle
+                // (re-scheduled after being removed) used to be
+                // reported only at first download, never again once
+                // cached -- so it was never included in a later
+                // collection's own MediaInventory, leaving the CMS's
+                // Manage Display view showing it pending indefinitely
+                // even though it was already playing correctly.
                 if !is_dependency { result.push((inventory, true)); }
                 continue;
             }
@@ -1707,31 +1636,16 @@ impl Handler {
                 {
                     Ok(()) => {
                         if !is_dependency { result.push((inventory, true)); }
-                        // A real, severe bug found via a live report: a
-                        // media item changed in the CMS's own library,
-                        // *without* republishing the layout that uses
-                        // it, still made the CMS bump the layout's own
-                        // required version too (a real, observed CMS
-                        // behavior, not something this client controls)
-                        // -- both the layout and the new media
-                        // genuinely got redownloaded here, correctly,
-                        // onto disk. But if that layout is the one
-                        // *currently showing*, nothing told the GUI to
-                        // actually reload it: schedule_check()'s own
-                        // reload decision (see its own doc comment) is
-                        // keyed on the *layout id* changing, and here
-                        // the id is identical to before -- only the
-                        // *content* underneath it changed. Left
-                        // unfixed, the display would keep showing the
-                        // old, already-loaded page (with its own still-
-                        // cached reference to the old media) forever --
-                        // confirmed real: only a full process restart
-                        // or a `purgeAll` (which already forces a
-                        // reload via this same flag, see the `Purge`
-                        // XMR handler) ever actually picked up the
-                        // change. Reusing that same flag here forces
-                        // the same recovery once this cycle's
-                        // collect_once() completes.
+                        // A media item changed in the CMS's own library
+                        // without republishing the layout still bumps
+                        // the layout's own required version too -- both
+                        // get redownloaded here correctly, but if that
+                        // layout is currently showing, schedule_check()'s
+                        // own reload decision (keyed on layout id
+                        // changing) never notices -- only the content
+                        // underneath changed. Reusing the same
+                        // force-reload flag as `purgeAll` forces the
+                        // same recovery here.
                         self.note_layout_file_downloaded(layout_id_if_any);
                     },
                     Err(e) => {
@@ -2044,37 +1958,22 @@ impl Handler {
                     if let Some(sync_group) = &self.sync_group {
                         sync_group.set_current_sync_keys(vec![]);
                     }
-                    // (Follower only.) A real bug found this way: the
-                    // CMS swapped which layout a live Synchronised
-                    // Event points to (e.g. 1014 -> 1017, both sharing
-                    // the *same* sync_keys, being visually similar
-                    // templates) -- a Follower whose own schedule.xml
-                    // hadn't downloaded that change *yet* received the
-                    // Lead's own fresh Command (published as soon as
-                    // the Lead's own, already-updated schedule noticed
-                    // it) and, since its own still-stale schedule
-                    // still named the *old* layout as sync-gated with
-                    // the *same* sync_keys value, resolve_layout_for_
-                    // sync_keys matched it anyway -- resolving to the
-                    // wrong (superseded) layout instead of ever
-                    // downloading/rendering the new one. This exact
-                    // expiry check firing (id, the old layout, is no
-                    // longer sync-gated per this display's *own* now-
-                    // updated schedule) is the precise moment this
-                    // display's own view of the world has genuinely
-                    // caught up -- reconnecting the SyncGroup right
-                    // now, deliberately, re-triggers the Lead's own
-                    // `sync_peer_connected` reaction (already built for
-                    // the restart/reconnect case, and already
-                    // unconditional there for the same reason: no way
-                    // to tell a first connection from a reconnection
-                    // apart) -- which re-publishes its current
-                    // sync_keys fresh, letting this display resolve
-                    // correctly now that both sides are genuinely
-                    // caught up. Far simpler than a dedicated
-                    // Follower -> Lead "ready" signal (the existing
-                    // connection is one-way, PUB/SUB-style) -- confirmed
-                    // by the user as the intended fix.
+                    // (Follower only.) If the CMS swapped which layout
+                    // a live Synchronised Event points to (same
+                    // sync_keys, e.g. visually similar templates), a
+                    // Follower whose own schedule.xml hadn't downloaded
+                    // that change yet could match the Lead's fresh
+                    // Command against its own still-stale schedule,
+                    // resolving to the superseded layout. This expiry
+                    // check firing means this display's own view has
+                    // genuinely caught up -- reconnecting the SyncGroup
+                    // now re-triggers the Lead's own
+                    // `sync_peer_connected` reaction (already
+                    // unconditional there, no way to tell a first
+                    // connection from a reconnection apart), which
+                    // re-publishes its current sync_keys fresh. Simpler
+                    // than a dedicated Follower -> Lead "ready" signal
+                    // (the existing connection is one-way, PUB/SUB).
                     if let SyncRole::Follower { lead_addr } = &self.settings.sync_role {
                         let lead_addr = lead_addr.clone();
                         self.connect_as_follower(&lead_addr);
@@ -2111,19 +2010,12 @@ impl Handler {
             .filter(|&id| self.cache.get_layout(id).is_some())
             .collect();
         let new_layouts = if available.is_empty() && !new_layouts.is_empty() {
-            // BUG fix (found from a real crash report): this codebase's
-            // own Logger (logger.rs) formats record.args() TWICE --
-            // once for console output, once to build the string stored
-            // for later upload to the CMS (SubmitLog). Most Display
-            // impls are idempotent, so this is normally harmless, but
-            // itertools::Format is explicitly single-use -- formatting
-            // it a second time panics with "Format: was already
-            // formatted once". Converting to a String *before* handing
-            // it to log::warn! (matching the already-safe pattern just
-            // below, at the new_layouts.iter().format(", ").to_string()
-            // call) means the log macro only ever sees a plain,
-            // idempotent String, regardless of how many times any
-            // logger implementation formats its own arguments.
+            // This codebase's own Logger formats record.args() twice
+            // (once for console, once for the string stored for later
+            // SubmitLog upload) -- itertools::Format is single-use, so
+            // formatting it twice panics. Converting to a String first
+            // means the log macro only ever sees a plain, idempotent
+            // String.
             let listed = new_layouts.iter().format(", ").to_string();
             log::warn!("none of the newly-scheduled layout(s) ({listed}) are cached yet, \
                         keeping whatever's currently showing until they are");
@@ -2170,32 +2062,18 @@ impl Handler {
                         // sync_apply_timer actually fires.
                         //
                         // Compares the *layout id* (`first`), not the
-                        // sync_keys value -- a real, severe bug found
-                        // this way: successive layout swaps within the
-                        // same live Synchronised Event (1017 -> 1018
-                        // -> 1019 -> 1020, each confirmed via a real
-                        // schedule.xml/log capture) all shared the
-                        // exact same sync_keys text (["sync1"] --
-                        // structurally-similar templates). Comparing
-                        // pending_sync_keys by *value* alone meant
-                        // that, once any one of them was successfully
-                        // staged, this guard saw every *subsequent*,
-                        // genuinely different layout's own (identical-
-                        // looking) sync_keys as "already handled" and
-                        // silently did nothing -- confirmed real via a
-                        // live TEMP-DIAG capture: new_layouts=[1020]
-                        // differed correctly from self.layouts=[1019],
-                        // entered this branch, found 1020 in cache
-                        // with sync_keys=["sync1"], and then this
-                        // exact guard incorrectly skipped staging
-                        // because pending_sync_keys was *already*
-                        // Some(["sync1"]) from 1019's own earlier,
-                        // separate switch. A display could then never
-                        // advance to a new sync-gated layout again for
-                        // as long as its own sync_keys kept matching a
-                        // previous one -- exactly the "layout that's
-                        // no longer in my schedule" case this whole
-                        // mechanism exists to handle correctly.
+                        // sync_keys value -- successive layout swaps
+                        // within the same live Synchronised Event can
+                        // share the exact same sync_keys text
+                        // (structurally-similar templates). Comparing
+                        // pending_sync_keys by value alone meant that,
+                        // once one was staged, this guard saw every
+                        // subsequent, genuinely different layout's own
+                        // identical-looking sync_keys as "already
+                        // handled" and silently did nothing -- a
+                        // display could never advance to a new
+                        // sync-gated layout again for as long as its
+                        // sync_keys kept matching a previous one.
                         if self.pending_sync_layout_id != Some(first) {
                             log::info!("new sync-gated layout in schedule: {first} \
                                         (sync_keys {sync_keys:?}) -- staging a \
@@ -2205,41 +2083,21 @@ impl Handler {
                             self.stage_sync_switch(sync_keys);
                         }
                     }
-                    // A real, severe bug found this way: a newly
-                    // sync-gated layout (the user swapped which layout
-                    // a live Synchronised Event points to) whose own
-                    // required files hadn't finished downloading yet
-                    // this cycle (see resource_retry_queue's own doc
-                    // comment -- a transient download failure defers
-                    // some files to a *later* cycle, so not everything
-                    // named in a freshly-updated schedule is
-                    // necessarily in cache yet by the time this runs)
+                    // A newly sync-gated layout whose own required
+                    // files hadn't finished downloading yet this cycle
                     // used to still stage an empty Vec here (via
-                    // `.unwrap_or_default()`) -- not because the
-                    // layout genuinely has no sync_keys, but because
-                    // they weren't *knowable* yet. Combined with the
-                    // guard above (needed to fix a separate, real
-                    // infinite-loop bug: never re-staging an
-                    // already-tried value), that wrong, empty value
-                    // then stayed stuck in pending_sync_keys
-                    // *permanently* -- even once this same layout
-                    // finished downloading moments later and its real
-                    // sync_keys became known, the guard saw "already
-                    // tried this" and refused to ever re-stage with
-                    // the correct value. Confirmed real: the Lead
-                    // (whose own download finished fast enough)
-                    // rendered the new layout correctly, while a
-                    // Follower (racing its own, separate download of
-                    // the same files) downloaded the resource but
-                    // never actually rendered it.
+                    // `.unwrap_or_default()`) -- not because it
+                    // genuinely has no sync_keys, but because they
+                    // weren't knowable yet. Combined with the guard
+                    // above, that wrong, empty value stayed stuck in
+                    // pending_sync_keys permanently, even once the
+                    // real sync_keys became known moments later.
                     //
-                    // Fixed by staging *nothing at all* here instead --
-                    // pending_sync_keys is left exactly as it was, so a
-                    // later schedule_check (once this layout is
-                    // actually in cache) sees a *fresh* discovery and
-                    // stages the real sync_keys normally, rather than
-                    // ever recording a placeholder value that could
-                    // get permanently stuck.
+                    // Fixed by staging nothing at all here instead --
+                    // pending_sync_keys is left as-is, so a later
+                    // schedule_check (once actually in cache) sees a
+                    // fresh discovery and stages the real sync_keys
+                    // normally.
                     None => {
                         log::debug!("sync-gated layout {first} not yet in cache -- \
                                      will determine its own sync_keys and stage a \
@@ -2270,22 +2128,13 @@ impl Handler {
         // that could change what's active without going through the
         // check just above.
         //
-        // A real, severe bug found this way: a data widget living
-        // inside an *overlay* layout (tracked separately in
-        // self.schedule_overlays, never in self.layouts -- overlays
-        // and the "main" schedule are two entirely independent
-        // mechanisms) was discovered correctly on download, but then
-        // immediately pruned right back out on the very next
-        // schedule_check() (which runs frequently -- after every
-        // collection, plus every 60s tick) -- this check used to only
-        // ever consider self.layouts, so an overlay's own layout id
-        // was *never* considered "still active" no matter what,
-        // permanently preventing that widget from ever completing a
-        // single successful GetData refresh. Confirmed real: a live
-        // report of a data widget whose own `<widgetId>.json` was
-        // never written to disk at all, despite the widget itself
-        // being correctly parsed/tracked on discovery (confirmed via
-        // a direct, isolated test using the exact real widget markup).
+        // A data widget living inside an *overlay* layout (tracked
+        // separately in self.schedule_overlays, never in self.layouts)
+        // was discovered correctly on download, but then immediately
+        // pruned right back out on the very next schedule_check --
+        // this check used to only consider self.layouts, so an
+        // overlay's own layout id was never "still active", preventing
+        // that widget from ever completing a GetData refresh.
         let active_layouts: Vec<i64> = self.layouts.iter().copied()
             .chain(self.schedule_overlays.iter().map(|&(id, _)| id))
             .collect();
@@ -2310,15 +2159,14 @@ impl Handler {
     /// `/trigger` (see server::TriggerRequest). First checks for a
     /// matching Scheduled Action (schedule::ActionTarget -- a
     /// schedule-level "listen for this code, then Navigate to a Layout
-    /// or run a Command", confirmed real from a live CMS's own
-    /// `<actions>` section, reachable regardless of what's currently
+    /// or run a Command", reachable regardless of what's currently
     /// showing), falling back to the older, narrower mechanism (an
     /// in-page widget-embedded action, only reachable while its own
     /// layout/widget happens to already be on screen) if no Scheduled
-    /// Action matches -- found from a real report: a trigger doing
-    /// nothing at all because the *current* layout had no matching
-    /// widget-embedded action, when the actual configured action was a
-    /// Scheduled Action targeting a different layout entirely.
+    /// Action matches -- otherwise a trigger could do nothing at all
+    /// when the current layout had no matching widget-embedded action,
+    /// but the actual configured action was a Scheduled Action
+    /// targeting a different layout entirely.
     ///
     /// Returns true if the caller (run()'s own select! loop) should
     /// force an immediate collection -- the resolved target layout of a
@@ -2373,10 +2221,8 @@ impl Handler {
         // narrower in-page widget-embedded action mechanism
         // (window.arexibo.triggers[code], see layout.rs's own
         // write_action / TriggerRequest's own doc comment). Kept as a
-        // permanent debug-level log -- proved genuinely useful
-        // diagnosing a real report where nothing downstream (not even
-        // a console.warn) ever fired, letting this line alone confirm
-        // the Rust side was dispatching correctly.
+        // permanent debug-level log -- useful for confirming the Rust
+        // side dispatched correctly even when nothing downstream fires.
         log::debug!("Trigger {code:?}: no Scheduled Action matched -- forwarding to \
                     the GUI thread for the in-page widget-embedded mechanism");
         self.to_gui.send(ToGui::Trigger(code.to_string())).unwrap();
@@ -2644,39 +2490,17 @@ impl Handler {
     /// drive the whole (infinite, blocking) `run()` loop just to
     /// reach it.
     ///
-    /// A real, severe bug found via a live report: after a `purgeAll`
-    /// while a video widget was playing, the freeze this flag was
-    /// originally introduced to fix (see the `Purge` XMR handler's own
-    /// doc comment) was indeed gone -- but in its place, the display
-    /// got stuck on a raw browser 404 error page
-    /// (`http://localhost:9696/{id}.xlf.html`) that never recovered on
-    /// its own, only clearing once the user deleted the schedule
-    /// entirely. Root cause: this method's own doc comment used to
-    /// claim firing the reload "regardless of whether collect_once()
-    /// above actually succeeded" was harmless, "no worse off than not
-    /// reloading at all" -- that reasoning was simply wrong. If the
-    /// purge-triggered re-download of the current layout's own file
-    /// hasn't actually landed back on disk yet (a real possibility the
-    /// user's own report suggests may be more likely with an HTTP
-    /// direct-download setup -- e.g. Apache -- falling back to XMDS,
-    /// under the significant extra load a purge's own mass
-    /// re-download places on it), navigating to it produces an actual,
-    /// live browser error page -- categorically worse than simply
-    /// staying on the previous (stale, but at least *rendered*) page a
-    /// moment longer. Fixed with two checks, both needed: the current
-    /// layout's own translated HTML must actually be present on disk
-    /// (catches a translation failure even if the raw download itself
-    /// succeeded), *and* this cycle's own download_required_files() call
-    /// must have reported zero failures for any media/layout file (see
-    /// `last_collect_had_failures`'s own doc comment for why "resource"
-    /// failures specifically don't count here -- discussed directly
-    /// with the user, who explicitly chose this simpler, whole-cycle
-    /// check over a more surgical, per-layout-media alternative, at the
-    /// accepted cost of a persistently-failing *unrelated* file
-    /// blocking this reload indefinitely). If either check fails, the
-    /// flag is left set (not cleared) so this same check runs again
-    /// after the *next* collection cycle, rather than ever navigating
-    /// to a target that may still be missing pieces.
+    /// Only actually fires the reload once two things are confirmed:
+    /// the current layout's own translated HTML is present on disk
+    /// (catches a translation failure even if the raw download
+    /// succeeded), and this cycle's download_required_files() call
+    /// reported zero failures for any media/layout file (see
+    /// `last_collect_had_failures`'s own doc comment for why
+    /// "resource" failures don't count). Otherwise navigating could
+    /// hit a genuinely missing target (a live browser 404, stuck
+    /// until the schedule is deleted) -- worse than staying on the
+    /// current, stale-but-rendered page a moment longer. If either
+    /// check fails, the flag stays set for the next collection cycle.
     fn maybe_force_reload_after_purge(&mut self) {
         if self.force_reload_after_collect {
             let html_path = self.cache.dir().join(format!("{}.xlf.html", self.current_layout));
@@ -3060,11 +2884,10 @@ mod timezone_to_report_tests {
 /// schedule slot as what's currently on screen, so it can be exempted
 /// from re-download this cycle instead of interrupting playback.
 /// Uses scheduleid, not the raw layout id -- publishing a layout
-/// changes its id but keeps the same scheduleid (confirmed via real
-/// schedule.xml before/after a publish). `current_scheduleid` must
-/// come from the *previous* schedule (the old layout id may no longer
-/// exist in the fresh one); 0 means no real schedule entry, never
-/// exempt.
+/// changes its id but keeps the same scheduleid. `current_scheduleid`
+/// must come from the *previous* schedule (the old layout id may no
+/// longer exist in the fresh one); 0 means no real schedule entry,
+/// never exempt.
 fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64,
                                           fresh_schedule: &Schedule,
                                           expire_modified_layouts: bool) -> bool {
@@ -3481,15 +3304,15 @@ mod pending_network_tests {
 
     #[test]
     fn unreachable_cms_with_no_cache_constructs_pending_handler_instead_of_bailing() {
-        // Regression test for a real report: a totem's very first boot
-        // (no cached settings.json yet), with WiFi not yet having
-        // obtained an IP/working DNS -- register_display() genuinely
-        // fails (not just a "not yet authorized" answer, an actual
-        // connection failure) with --allow-offline set. This used to
-        // bail!() the whole process out, causing systemd's Restart= to
-        // redo the entire Xorg/D-Bus/arexibo startup sequence
-        // repeatedly until the network happened to come up in the
-        // brief window before the next attempt -- appearing "stuck".
+        // Regression test: a totem's very first boot (no cached
+        // settings.json yet), with WiFi not yet having obtained an
+        // IP/working DNS -- register_display() genuinely fails (an
+        // actual connection failure, not just "not yet authorized")
+        // with --allow-offline set. This used to bail!() the whole
+        // process out, causing systemd's Restart= to redo the entire
+        // Xorg/D-Bus/arexibo startup sequence repeatedly until the
+        // network happened to come up in the brief window before the
+        // next attempt -- appearing "stuck".
         //
         // A genuinely unreachable address (nothing listening on this
         // port at all) simulates the connection failure -- not a mock
@@ -3736,13 +3559,13 @@ mod sticky_ws_address_tests {
 mod port_change_forces_cache_purge_tests {
     use super::*;
 
-    // Found from a real report: switching the embedded webserver from
-    // the fixed EMBEDDED_SERVER_PORT to whatever the CMS's own
-    // embeddedServerPort setting says broke every widget on an
-    // existing installation, because cached layout HTML has the *old*
-    // port baked into its own absolute iframe src URLs (see
-    // layout.rs's own write_action/write_media) -- fixed with a
-    // --clear, but that shouldn't have to be done manually fleet-wide.
+    // Switching the embedded webserver from the fixed
+    // EMBEDDED_SERVER_PORT to whatever the CMS's own embeddedServerPort
+    // setting says breaks every widget on an existing installation,
+    // because cached layout HTML has the *old* port baked into its own
+    // absolute iframe src URLs (see layout.rs's own write_action/
+    // write_media) -- fixed with a --clear, but that shouldn't have to
+    // be done manually fleet-wide.
 
     fn start_mock_with_port(embedded_server_port: u16) -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -4102,7 +3925,7 @@ mod send_status_update_tests {
 
     #[test]
     fn layout_change_immediately_sends_a_status_update_not_just_at_next_collection() {
-        // Regression test for a real report: the CMS's own "Current
+        // Regression test: the CMS's own "Current
         // Layout" display only updated once per full collection cycle
         // (which can be minutes apart), even though arexibo's own
         // self.current_layout tracked the real, immediate layout
@@ -4170,11 +3993,9 @@ mod send_status_update_tests {
     #[test]
     fn status_update_includes_the_own_lan_ip_address() {
         // Xibo xibosignage/xibo#2863 ("Displays: add LAN IP address
-        // when available") -- confirmed real and meaningful from a
-        // real register.xml capture: a Sync Group Follower's own
-        // <syncGroup> element contains literally the Lead's own
-        // lanIpAddress value, relayed by the CMS. Never previously
-        // sent by arexibo at all.
+        // when available") -- a Sync Group Follower's own <syncGroup>
+        // element contains the Lead's own lanIpAddress, relayed by the
+        // CMS. Never previously sent by arexibo at all.
         let (port, captured) = start_mock_capturing_requests();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -4324,21 +4145,12 @@ mod sync_role_change_forces_restart_tests {
 
     #[test]
     fn update_sync_group_is_deferred_until_the_first_collection_completes() {
-        // Regression coverage for a real report: a Follower connecting
-        // to the Lead this early (during Handler::new, which calls
-        // update_settings -- and therefore update_sync_group -- twice
-        // while processing the very first RegisterDisplay response,
-        // well before any collection has ever downloaded/parsed this
-        // display's own schedule or files) could receive a Command (or
-        // catch-up Sync heartbeat) for sync_keys it couldn't yet
-        // resolve -- and worse, once it *did* finish downloading and
-        // discovered its own matching sync-gated layout independently,
-        // that discovery would stage a fresh, ordinarily-delayed switch
-        // as if this were a brand-new coordinated event, completely
-        // uncoordinated with whenever the Lead (or other, already-
-        // caught-up Followers) had actually applied theirs -- possibly
-        // hours earlier. See first_collection_done's own doc comment
-        // for the full story.
+        // Regression test: a Follower connecting to the Lead this
+        // early (during Handler::new's own two update_settings calls,
+        // well before any collection has downloaded/parsed this
+        // display's own schedule) could receive a Command for
+        // sync_keys it can't yet resolve. See first_collection_done's
+        // own doc comment for the full story.
         let port = start_mock_with_sync_group_sequence(vec!["lead"]);
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -4391,14 +4203,13 @@ mod sync_role_change_forces_restart_tests {
 mod handle_trigger_code_tests {
     use super::*;
 
-    // Regression coverage for a real report: a webhook trigger did
-    // nothing at all, because the only mechanism handled was an
-    // in-page widget-embedded action (only reachable while its own
-    // layout/widget happens to already be on screen) -- the actual
-    // configured action was a Scheduled Action (schedule::ActionTarget,
-    // confirmed real from a live CMS's own <actions> section),
-    // targeting a *different* layout entirely, reachable regardless of
-    // what's currently showing.
+    // Regression coverage: a webhook trigger did nothing at all,
+    // because the only mechanism handled was an in-page widget-
+    // embedded action (only reachable while its own layout/widget
+    // happens to already be on screen) -- the actual configured action
+    // was a Scheduled Action (schedule::ActionTarget), targeting a
+    // *different* layout entirely, reachable regardless of what's
+    // currently showing.
 
     fn start_mock_ready() -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -5203,15 +5014,13 @@ mod commit_cms_migration_tests {
 mod attempt_cms_migration_tests {
     use super::*;
 
-    // Confirms the fix for a real report: the success path of both
-    // attempt_https_upgrade and attempt_cms_migration used to call
-    // std::process::exit() directly, which (a) segfaulted when this
-    // ran from collect_once() with Qt's own event loop still fully
-    // active (see RestartRequired's own doc comment), and (b) made
-    // this exact path fundamentally untestable, since a stray
-    // process::exit() during a test run would kill the test runner
-    // itself. Now that it returns Result instead, this is directly
-    // testable for the first time.
+    // The success path of both attempt_https_upgrade and
+    // attempt_cms_migration used to call std::process::exit() directly,
+    // which (a) segfaulted when this ran from collect_once() with Qt's
+    // own event loop still active, and (b) made this path
+    // fundamentally untestable, since a stray process::exit() during a
+    // test run would kill the test runner itself. Now that it returns
+    // Result instead, this is directly testable.
 
     fn start_ready_mock() -> u16 {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -5429,21 +5238,13 @@ mod data_refresh_timer_tests {
 
     #[test]
     fn maybe_force_reload_after_purge_reloads_only_when_the_flag_is_set() {
-        // Regression test for a real, severe bug found via a live
-        // report: "purgeAll from CMS leaves a currently playing video
-        // widget stuck/frozen mid-playback." Root cause: purge()
-        // deletes every file on disk *immediately*, including whatever
-        // a currently-playing widget's own element is still actively
-        // streaming from arexibo's own embedded HTTP server (which
-        // reads each request straight from disk) -- a mid-stream
-        // request for a file that's just been deleted fails outright,
-        // and nothing ever told the GUI to recover: schedule_check()'s
-        // own reload decision is keyed on the *layout id* actually
-        // changing, but a purge changes only the files underneath an
-        // *unchanged* schedule. This method (called after every
-        // collect_once(), see its own call site) forces a real reload
-        // once the fresh, purge-triggered redownload is back --
-        // giving a stuck widget a clean restart.
+        // Regression test: purge() deletes every cached file
+        // immediately, including whatever a currently-playing widget
+        // is actively streaming from the embedded HTTP server --
+        // schedule_check()'s own reload decision is keyed on the
+        // layout id changing, which a purge alone doesn't. This method
+        // forces a real reload once the purge-triggered redownload is
+        // back.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -5463,13 +5264,10 @@ mod data_refresh_timer_tests {
                 "must not force a reload when the flag was never set");
 
         // With the flag set (as the `Purge` XMR handler does), the
-        // *current* layout must be force-reloaded, and the flag must be
-        // cleared afterward (so it doesn't keep reloading on every
-        // subsequent, unrelated collection) -- but only once the
-        // current layout's own translated HTML is actually confirmed
-        // present on disk (see this method's own doc comment for a
-        // real, severe bug found from skipping this check -- a
-        // separate test below covers that missing-file case directly).
+        // *current* layout must be force-reloaded, and the flag
+        // cleared afterward -- but only once the current layout's own
+        // translated HTML is confirmed present on disk (a separate
+        // test below covers the missing-file case).
         handler.current_layout = 4242;
         std::fs::create_dir_all(envdir.join("res")).unwrap();
         std::fs::write(envdir.join("res").join("4242.xlf.html"), b"<html></html>").unwrap();
@@ -5488,22 +5286,11 @@ mod data_refresh_timer_tests {
 
     #[test]
     fn maybe_force_reload_after_purge_waits_if_the_html_isnt_back_on_disk_yet() {
-        // Regression test for a real, severe bug found via a live
-        // report: after a `purgeAll` while a video widget was playing,
-        // the earlier freeze this flag was introduced to fix (see the
-        // test above) was indeed gone -- but in its place, the display
-        // got stuck on a raw browser 404 error page
-        // (http://localhost:9696/{id}.xlf.html) that never recovered
-        // on its own, only clearing once the user deleted the schedule
-        // entirely. Root cause: this method used to fire the reload
-        // "regardless of whether collect_once() actually succeeded" --
-        // if the purge-triggered re-download of the current layout's
-        // own file hadn't actually landed back on disk yet (plausible
-        // under an HTTP-direct-download setup falling back to XMDS,
-        // under the extra load a purge's own mass re-download places
-        // on it -- the user's own suspicion), navigating to it produced
-        // an actual, live browser error page -- worse than just staying
-        // on the previous, stale-but-rendered page a moment longer.
+        // Regression test: reloading unconditionally after a purge
+        // used to navigate straight to a live browser 404 if the
+        // current layout's own file hadn't actually landed back on
+        // disk yet -- worse than staying on the stale-but-rendered
+        // page a moment longer.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -5536,18 +5323,10 @@ mod data_refresh_timer_tests {
 
     #[test]
     fn any_non_resource_failure_ignores_resource_entries() {
-        // Regression test for a real design decision discussed directly
-        // with the user: expanding maybe_force_reload_after_purge's own
-        // check (see the test above) to also cover media referenced by
-        // the currently-showing layout, not just its own top-level
-        // translated HTML -- e.g. a video widget whose own file is
-        // still missing even though the layout's HTML itself downloaded
-        // fine. The user explicitly chose the simpler, whole-cycle
-        // check (over a more surgical, per-layout-media alternative)
-        // with one deliberate exception: "resource" failures (dataset/
-        // webpage-manual/bestfit widgets) should NOT block the reload,
-        // since those already have their own, separate recovery
-        // mechanism once they eventually download successfully.
+        // "resource" failures (dataset/webpage-manual/bestfit widgets)
+        // must NOT count -- those already self-heal via
+        // resource_retry_queue/note_layout_file_downloaded once they
+        // eventually succeed.
         assert!(!any_non_resource_failure(&[]),
                 "an empty result (e.g. nothing needed downloading) must not count as a \
                  failure");
@@ -5571,14 +5350,11 @@ mod data_refresh_timer_tests {
 
     #[test]
     fn maybe_force_reload_after_purge_waits_if_this_cycle_had_media_failures() {
-        // Regression test for the same design decision as the test
-        // above, covering the *consuming* side: even with the current
-        // layout's own translated HTML confirmed present on disk (the
-        // narrower check the previous fix already covers), a real,
-        // unrelated media file referenced by that same layout (e.g. a
-        // video) may still have failed to download this cycle --
+        // Regression test: even with the current layout's own HTML
+        // present on disk, an unrelated media file it references (e.g.
+        // a video) may still have failed to download this cycle --
         // reloading anyway would show the layout with that media
-        // broken/missing, alongside whatever else might be affected.
+        // broken/missing.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -5607,22 +5383,15 @@ mod data_refresh_timer_tests {
 
     #[test]
     fn note_layout_file_downloaded_forces_a_reload_only_for_the_currently_showing_layout() {
-        // Regression test for a real, severe bug found via a live
-        // report: a media item changed in the CMS's own library,
-        // *without* republishing the layout that uses it, still made
-        // the CMS bump the layout's own required version too (a real,
-        // observed CMS behavior) -- both the layout and the new media
-        // genuinely got redownloaded onto disk, correctly. But if that
-        // layout was the one *currently showing*, nothing told the GUI
-        // to actually reload it: schedule_check()'s own reload
-        // decision is keyed on the *layout id* changing, and here the
-        // id is identical to before -- only the *content* underneath
-        // it changed. Confirmed real: the display kept showing the
-        // old, already-loaded page (with its own still-cached
-        // reference to the old media) indefinitely -- on a single-
-        // layout kiosk with no natural rotation point, this could
-        // persist forever, until a full process restart or a
-        // `purgeAll`.
+        // Regression test: a media item changed in the CMS's own
+        // library without republishing the layout that uses it still
+        // bumps the layout's own required version too -- both get
+        // redownloaded correctly, but if that layout is currently
+        // showing, schedule_check()'s own reload decision (keyed on
+        // layout id changing) never notices, since only the content
+        // underneath changed. Left unfixed, the display kept showing
+        // the old page indefinitely -- on a single-layout kiosk with
+        // no natural rotation point, until a full restart or purgeAll.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -5797,21 +5566,15 @@ mod data_refresh_timer_tests {
 
     #[test]
     fn a_data_widget_inside_an_overlay_layout_survives_schedule_check() {
-        // Regression test for a real, severe bug: a data widget (v7
-        // GetData polling) living inside an *overlay* layout (tracked
-        // separately in self.schedule_overlays, never in self.layouts
-        // -- overlays and the "main" schedule are two entirely
-        // independent mechanisms) was discovered correctly on
-        // download, but then immediately pruned right back out on the
-        // very next schedule_check() (which runs frequently -- after
-        // every collection, plus every 60s tick) -- prune_data_widgets_
-        // not_in used to only ever consider self.layouts, so an
-        // overlay's own layout id was never considered "still active"
-        // no matter what, permanently preventing that widget from ever
-        // completing a single successful GetData refresh. Confirmed
-        // real: a live report of a data widget whose own
-        // `<widgetId>.json` was never written to disk at all, despite
-        // being correctly parsed/tracked on discovery.
+        // Regression test: a data widget (v7 GetData polling) living
+        // inside an *overlay* layout (tracked separately in
+        // self.schedule_overlays, never in self.layouts) was discovered
+        // correctly on download, but then immediately pruned right
+        // back out on the very next schedule_check --
+        // prune_data_widgets_not_in used to only consider self.layouts,
+        // so an overlay's own layout id was never "still active",
+        // permanently preventing that widget from completing a
+        // GetData refresh.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -5824,7 +5587,7 @@ mod data_refresh_timer_tests {
 
         // Real overlay XML shape (see schedule.rs's own
         // parses_real_overlays_xml_from_user test) -- overlay layout
-        // 1031, main layout 913 (matching the real report's own ids).
+        // 1031, main layout 913.
         let xml = r#"<schedule generated="2026-08-31 10:00:00" filterFrom="2026-08-31 10:00:00" filterTo="2026-08-31 12:00:00">
   <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="0" playCount="0" maxPlaysPerHour="0"/>
   <overlays>
@@ -6040,11 +5803,10 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn a_sync_gated_layout_is_staged_not_applied_immediately() {
-        // The core of Sync Group Phase 4: a real report/live capture
-        // confirmed a Synchronised Event's own <layout syncEvent="1">
-        // entry -- unlike an ordinary schedule entry, this must not be
-        // shown the moment schedule_check() would otherwise consider
-        // it "current". It should instead be staged the same way an
+        // A Synchronised Event's own <layout syncEvent="1"> entry --
+        // unlike an ordinary schedule entry, must not be shown the
+        // moment schedule_check() would otherwise consider it
+        // "current". It should instead be staged the same way an
         // incoming Follower Command already is, waiting for
         // sync_apply_timer to actually fire.
         let (mut handler, _togui_rx) = test_handler();
@@ -6164,16 +5926,15 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn re_synchronizing_an_already_showing_layout_still_forces_a_reload() {
-        // The specific bug this whole mechanism exists to fix: a
-        // real report confirmed the Lead applying a *genuinely new*
-        // layout id works (region timers naturally start fresh when a
-        // page loads for the first time) -- but re-synchronizing the
-        // *same*, already-active layout id (the actual re-connect
-        // scenario, via stage_sync_switch from sync_peer_connected)
-        // must ALSO force a real reload. Ordinary ToGui::Layouts is a
-        // silent no-op on an unchanged id (see gui.rs's own
-        // Schedule<T>::update) -- ForceReloadLayout must be
-        // sent regardless of whether self.layouts actually changes.
+        // The specific bug this whole mechanism exists to fix: the
+        // Lead applying a genuinely new layout id works (region timers
+        // naturally start fresh when a page loads for the first time)
+        // -- but re-synchronizing the same, already-active layout id
+        // (the actual re-connect scenario, via stage_sync_switch from
+        // sync_peer_connected) must ALSO force a real reload. Ordinary
+        // ToGui::Layouts is a silent no-op on an unchanged id (see
+        // gui.rs's own Schedule<T>::update) -- ForceReloadLayout must
+        // be sent regardless of whether self.layouts actually changes.
         let (mut handler, togui_rx) = test_handler();
         setup_always_active_sync_gated_layout(&mut handler, 1014, vec!["sync1".into()]);
         // Already showing this exact layout *before* the re-sync --
@@ -6239,26 +6000,20 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn expiry_reconnects_a_follower_to_re_trigger_the_leads_own_peer_connected() {
-        // Regression test for a real report: the CMS swapped which
-        // layout a live Synchronised Event points to (1014 -> 1017),
-        // both sharing the *same* sync_keys (visually similar
-        // templates). A Follower whose own schedule.xml hadn't yet
-        // downloaded that change received the Lead's fresh Command
-        // (sync_keys matching) but, since its own still-stale schedule
-        // still named the *old* layout (1014) as sync-gated with that
-        // *same* sync_keys value, resolved to the wrong, superseded
-        // layout instead of ever rendering the new one -- confirmed
-        // real: the Follower downloaded 1017's own resource but kept
-        // showing 1014 until manually restarted.
+        // Regression test: the CMS swapped which layout a live
+        // Synchronised Event points to (same sync_keys, visually
+        // similar templates). A Follower whose own schedule.xml hadn't
+        // yet downloaded that change resolved to the wrong, superseded
+        // layout against the Lead's fresh Command instead of ever
+        // rendering the new one -- kept showing the old layout until
+        // manually restarted.
         //
-        // Fix confirmed by the user directly: simply reconnecting the
-        // Follower's own SyncGroup connection at the exact moment its
-        // own schedule genuinely catches up (this same expiry check
-        // firing) re-triggers the Lead's own already-built
-        // sync_peer_connected reaction, which re-publishes its current
-        // sync_keys fresh -- letting this display resolve correctly
-        // now that both sides are genuinely caught up. Far simpler
-        // than a dedicated Follower -> Lead "ready" signal, which the
+        // Fix: simply reconnecting the Follower's own SyncGroup
+        // connection at the exact moment its own schedule genuinely
+        // catches up (this same expiry check firing) re-triggers the
+        // Lead's own already-built sync_peer_connected reaction, which
+        // re-publishes its current sync_keys fresh. Simpler than a
+        // dedicated Follower -> Lead "ready" signal, which the
         // existing one-way PUB/SUB connection can't carry at all.
         let port = {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6274,10 +6029,10 @@ mod sync_group_schedule_check_tests {
         handler.cache.insert_fake_layout_for_test(1014);
         handler.cache.insert_fake_layout_for_test(999);
         let now = OffsetDateTime::now_local().unwrap();
-        // The old layout's own window has ended (matching the real
-        // report: its own schedule entry was replaced, not merely
-        // time-expired, but is_sync_gated(1014) becoming false is the
-        // same observable condition either way).
+        // The old layout's own window has ended (its own schedule
+        // entry was replaced, not merely time-expired, but
+        // is_sync_gated(1014) becoming false is the same observable
+        // condition either way).
         handler.schedule = schedule_with_sync_layout(
             1014, now - time::Duration::hours(2), now - time::Duration::minutes(1));
         handler.override_layout = Some(1014);
@@ -6296,20 +6051,15 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn the_exact_real_sequence_eventually_stages_the_new_layout_once_cached() {
-        // Reproduces the *exact* sequence from a real report, step by
-        // step, matching real log timestamps: 1018 expires (schedule
-        // now shows 1019 instead) while 1019 isn't cached yet -- the
-        // expiry check fires and reconnects correctly (confirmed
-        // separately by the test above). Several more schedule_check()
-        // calls follow (matching the real periodic 60s tick timer, see
-        // that timer's own doc comment) while 1019 is *still* not
-        // cached -- each one should just re-warn, no state change.
-        // Finally 1019 finishes downloading -- the *next* schedule_check
-        // (matching either another 60s tick or the end of a full
-        // collection cycle) should discover it as newly sync-gated and
-        // stage it. In the real report, this final step never actually
-        // happened -- no such log line ever appeared, even many
-        // schedule_check cycles after 1019 was confirmed downloaded.
+        // Reproduces a real sequence step by step: 1018 expires
+        // (schedule now shows 1019 instead) while 1019 isn't cached
+        // yet -- the expiry check fires and reconnects correctly
+        // (confirmed separately by the test above). Several more
+        // schedule_check() calls follow while 1019 is still not
+        // cached -- each should just re-warn, no state change.
+        // Finally 1019 finishes downloading -- the next schedule_check
+        // should discover it as newly sync-gated and stage it (this
+        // final step never happened before the fix).
         let (mut handler, _togui_rx) = test_handler();
         handler.cache.insert_fake_layout_for_test(1018);
         let now = OffsetDateTime::now_local().unwrap();
@@ -6321,8 +6071,7 @@ mod sync_group_schedule_check_tests {
         handler.sync_layout_active = true;
         handler.layouts = vec![1018];
 
-        // Step 2: schedule now shows 1019 instead (not yet cached) --
-        // matches the 12:47:48 real cycle.
+        // Step 2: schedule now shows 1019 instead, not yet cached.
         handler.schedule = schedule_with_sync_layout(
             1019, now - time::Duration::hours(1), now + time::Duration::hours(1));
         handler.schedule_check();
@@ -6332,8 +6081,7 @@ mod sync_group_schedule_check_tests {
                    "sanity: falls back to what's already showing, 1019 isn't cached yet");
 
         // Step 3: several more schedule_check() calls while 1019 is
-        // STILL not cached -- matches the repeated 60s-tick WARN lines
-        // in the real log (12:47:59 through 12:51:59, five of them).
+        // still not cached.
         for _ in 0..5 {
             handler.schedule_check();
             assert_eq!(handler.layouts, vec![1018], "must keep showing 1018 while waiting");
@@ -6341,17 +6089,10 @@ mod sync_group_schedule_check_tests {
                        "must not stage anything while 1019 isn't cached yet");
         }
 
-        // Step 4: 1019 finally finishes downloading -- matches the
-        // 12:52:46 real "downloading required file 68/103: layout
-        // 1019.xlf" success, followed by schedule_check() at the end
-        // of that same collection cycle.
+        // Step 4: 1019 finally finishes downloading.
         handler.cache.insert_fake_layout_with_sync_keys_for_test(1019, vec!["sync1".into()]);
         handler.schedule_check();
 
-        // THE CRITICAL ASSERTION: matching the real bug report, where
-        // this never happened -- no "new sync-gated layout: 1019" log
-        // line ever appeared, even many cycles after 1019 was
-        // confirmed downloaded.
         assert_eq!(handler.pending_sync_keys, Some(vec!["sync1".to_string()]),
                    "once 1019 is actually in cache, the very next schedule_check must \
                     discover and stage it as newly sync-gated -- this is the exact step \
@@ -6360,24 +6101,15 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn a_new_sync_gated_layout_stages_even_when_its_sync_keys_match_a_previous_one() {
-        // Regression test for the real, root-cause bug (found only via
-        // a live TEMP-DIAG capture, after several earlier wrong
-        // hypotheses -- see this test's own sibling above): successive
-        // layout swaps within the same live Synchronised Event (a real
-        // sequence: 1017 -> 1018 -> 1019 -> 1020, each confirmed via a
-        // real schedule.xml/log capture) all shared the *exact same*
-        // sync_keys text (["sync1"] -- structurally-similar
-        // templates). The re-publish guard used to compare
-        // pending_sync_keys by *value* -- so once 1019 was
-        // successfully staged/applied, a *later* schedule swap to 1020
-        // (a genuinely different layout, but with the same-looking
-        // sync_keys) was silently ignored: the guard saw "already
-        // staged this sync_keys value" and never re-staged, even
-        // though new_layouts=[1020] correctly differed from
-        // self.layouts=[1019]. A display could then never advance past
-        // whichever layout it last successfully synced to, for as
-        // long as the CMS kept assigning layouts that happened to
-        // share that same sync_keys value.
+        // Regression test: successive layout swaps within the same
+        // live Synchronised Event can share the exact same sync_keys
+        // text (structurally-similar templates). The re-publish guard
+        // used to compare pending_sync_keys by value -- so once one
+        // was successfully staged/applied, a later swap to a
+        // genuinely different layout with the same-looking sync_keys
+        // was silently ignored. A display could then never advance
+        // past whichever layout it last synced to, for as long as the
+        // CMS kept assigning layouts sharing that sync_keys value.
         let (mut handler, _togui_rx) = test_handler();
         handler.cache.insert_fake_layout_with_sync_keys_for_test(1019, vec!["sync1".into()]);
         handler.cache.insert_fake_layout_with_sync_keys_for_test(1020, vec!["sync1".into()]);
@@ -6432,14 +6164,14 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn a_reconnecting_peer_re_stages_the_currently_active_synchronized_layout() {
-        // Regression coverage for a real report: a Follower restarted
-        // mid-way through an already-active Synchronised Event never
-        // got re-synchronized -- nothing changes from the Lead's own
-        // schedule_check perspective for an already-settled event, so
-        // the only way to notice and react is this dedicated
-        // sync_peer_connected signal (see its own field doc comment).
-        // Mirrors the real select! arm's own body exactly (see the
-        // main loop's `recv(self.sync_peer_connected)` handler).
+        // Regression test: a Follower restarted mid-way through an
+        // already-active Synchronised Event never got re-synchronized
+        // -- nothing changes from the Lead's own schedule_check
+        // perspective for an already-settled event, so the only way to
+        // notice and react is this dedicated sync_peer_connected
+        // signal (see its own field doc comment). Mirrors the real
+        // select! arm's own body (see the main loop's
+        // `recv(self.sync_peer_connected)` handler).
         let (mut handler, _togui_rx) = test_handler();
         handler.cache.insert_fake_layout_with_sync_keys_for_test(1014, vec!["sync1".into()]);
         handler.sync_layout_active = true;
@@ -6585,25 +6317,19 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn catching_up_on_our_own_reconnects_for_a_freshly_coordinated_sync() {
-        // The user's own follow-up insight: even once this display has
-        // successfully caught up on its own (via retry_and_download_
-        // layout), applying the switch *immediately* here would start
-        // this display's own region/playlist timers at whatever real-
-        // world moment its own download happened to finish -- not at
-        // the Lead's own originally-published target_time, which is
-        // already a real (if usually small) amount of time in the past
-        // by the time all this retrying/downloading finishes. Correct
-        // *content*, but drifted *timing* -- exactly the class of
-        // problem the reconnect-on-expiry mechanism already exists to
-        // avoid. Reconnecting here re-triggers the Lead's own
-        // sync_peer_connected reaction (already confirmed real,
-        // working correctly, via a live capture), which re-publishes a
-        // fresh target_time for this display to apply against
-        // instead. Tested by calling the extracted reaction directly
-        // (see its own doc comment for why) -- a full round trip
-        // through a real download success would need a mock capable
-        // of a whole RequiredFiles+GetFile exchange, which this
-        // module's own tests don't otherwise require.
+        // Even once this display has successfully caught up on its own
+        // (via retry_and_download_layout), applying the switch
+        // immediately here would start its own region/playlist timers
+        // at whatever moment the download finished -- not at the
+        // Lead's own originally-published target_time, already in the
+        // past by the time retrying/downloading finishes. Correct
+        // content, but drifted timing. Reconnecting here re-triggers
+        // the Lead's own sync_peer_connected reaction, which
+        // re-publishes a fresh target_time to apply against instead.
+        // Tested by calling the extracted reaction directly (see its
+        // own doc comment) -- a full round trip through a real
+        // download success would need a mock capable of a whole
+        // RequiredFiles+GetFile exchange, not otherwise needed here.
         let port = {
             let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             probe.local_addr().unwrap().port()
@@ -6743,33 +6469,16 @@ mod sync_group_schedule_check_tests {
 
     #[test]
     fn a_failed_resolution_does_not_loop_forever_on_the_next_schedule_check() {
-        // Regression test for a real, severe production bug: a
-        // Follower whose own sync_keys resolution kept failing (in
-        // the real report, because of an unrelated stale-cache bug --
-        // see TRANSLATOR_VERSION's own bump alongside this fix --
-        // but the *exact same* tight loop would happen for any
-        // genuinely non-matching Wall Sync display too) would
-        // re-stage and re-fail the *same* sync_keys every single
-        // schedule_check cycle, forever -- confirmed from a live log
-        // repeating roughly once a second, indefinitely, hammering
-        // both the log output and the Sync Group network channel.
-        //
-        // Root cause: the sync_apply_timer handler used to `.take()`
-        // pending_sync_keys, clearing it to None regardless of
-        // whether resolve_layout_for_sync_keys succeeded or failed --
-        // so schedule_check's own re-publish guard
-        // (`pending_sync_keys.as_ref() != Some(&sync_keys)`) could
-        // never recognize "I already tried this exact sync_keys set"
-        // once resolution had failed once. Fixed by reading (cloning)
-        // instead of taking -- pending_sync_keys now stays set to
-        // whatever was last processed (successfully or not) until a
-        // genuinely *different* sync_keys value is staged.
+        // Regression test: a Follower whose own sync_keys resolution
+        // kept failing would re-stage and re-fail the same sync_keys
+        // every schedule_check cycle, forever. See the sync_apply_timer
+        // handler's own doc comment (reading/cloning instead of
+        // `.take()`ing pending_sync_keys) for the root cause.
         let (mut handler, _togui_rx) = test_handler();
-        // Matches the real report's own exact shape: a sync-gated
-        // layout whose own cached sync_keys are empty (there, a stale
-        // pre-sync_keys-feature cache entry -- here, simulated
-        // directly, since the *effect* on this loop is identical
-        // regardless of *why* they're empty/non-matching).
+        // A sync-gated layout whose own cached sync_keys are empty
+        // (e.g. a stale pre-sync_keys-feature cache entry) -- simulated
+        // directly, since the effect on this loop is identical
+        // regardless of why they're empty/non-matching.
         setup_always_active_sync_gated_layout(&mut handler, 1014, vec![]);
         // A tiny real delay (not the CMS-configured default, ~750ms)
         // -- needed for the check below to reliably tell "never

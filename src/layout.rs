@@ -155,27 +155,14 @@ window.arexibo = {
   // /duration/set|extend|expire in server.rs, which relay here via
   // run_js after a Widget's own JS (running inside its own iframe) posts
   // to the player's embedded webserver. Only has an effect on the widget
-  // that is CURRENTLY showing in its region: a set/extend/expire
-  // targeting a widget that isn't presently the active one in its
-  // region is a no-op, since there's no live timer to adjust for it (a
-  // widget waiting its turn doesn't have a running countdown yet).
+  // that is CURRENTLY showing in its region: a no-op if it isn't
+  // presently the active one (no live timer to adjust).
   //
-  // A real, severe bug found via a live report: a PDF widget reached
-  // via a drawer-swap navigate action (see navWidgetFromDrawer's own
-  // doc comment) never had its own "duration per page" correction (see
-  // window.arexiboPdf's own doc comment) actually take effect, since
-  // this lookup only ever checked `region.media` -- a drawer-swapped
-  // widget isn't part of it at all (navWidgetFromDrawer manages its
-  // own, separate timeout entirely outside that array). Fixed by also
-  // checking `region.drawerWidgetId`/`region.drawerRevert` (set by
-  // navWidgetFromDrawer itself, right alongside the timeout this
-  // function needs to adjust) -- same state shape
-  // (timeoutid/timeoutDuration/timeoutStart) either way, just a
-  // different "go back to normal" action for 'expire' (revert() -- the
-  // widget's own real target region only ever has one item, so
-  // region_switch's own single-item short-circuit would otherwise
-  // silently no-op, same class of bug already documented on
-  // navWidgetFromDrawer's own onended handler).
+  // Also recognizes a widget reached via a drawer-swap navigate action
+  // (region.drawerWidgetId/drawerRevert, set by navWidgetFromDrawer) --
+  // those aren't part of region.media at all, so the lookup below
+  // checks both. 'expire' calls region.drawerRevert() in that case
+  // (region_switch would silently no-op on this region's single item).
   controlDuration: function(widgetId, action, durationSecs) {
     for (const ridStr in this.regions) {
       const rid = Number(ridStr);
@@ -275,29 +262,16 @@ window.arexibo = {
   // Rust-side drawer_widgets's own doc comment -- a widget that's
   // never part of any region's own normal item cycling) into a
   // *target* region in place of whatever it's currently showing,
-  // for the drawer widget's own configured duration, then reverts.
-  // Confirmed real behavior (Xibo's own developer docs): "it should
-  // run for its whole duration and on expiry the player should
-  // reload its previous state... If a Widget has been loaded its
-  // previous state would be the prior widget in that region" -- the
-  // real C# client's own equivalent is RegionChangeToWidget.
-  // Deliberately doesn't try to track/restore the interrupted
-  // widget's own *remaining* time on revert -- it just restarts that
-  // widget's own full duration fresh, a reasonable simplification
-  // (the official client's own docs only promise resuming the same
-  // widget, not preserving exact elapsed time).
+  // for the drawer widget's own configured duration, then reverts
+  // (Xibo's own documented behavior: reload previous state on expiry --
+  // real C# equivalent is RegionChangeToWidget). Doesn't try to
+  // preserve the interrupted widget's own remaining time on revert,
+  // just restarts it fresh.
   //
-  // Resizes to the *target* region rather than the drawer's own
-  // native size, confirmed real (Xibo issue #2429: "we need to see
-  // if the intended region has been configured and if so go and get
-  // the width/height of that region instead of the drawer") --
-  // implemented here by actually reparenting the widget's own DOM
-  // element into the target region's own wrapper (moved back to the
-  // drawer's own wrapper on revert) and overriding its own
-  // left/top/width/height to fill whichever wrapper currently
-  // contains it, rather than computing/duplicating each region's own
-  // geometry again here -- the wrapper's own real size (already
-  // correct, written once at translation time) does that for free.
+  // Resizes to the *target* region, not the drawer's own native size
+  // (Xibo issue #2429) -- reparents the widget's DOM element into the
+  // target wrapper (moved back on revert) and overrides its own
+  // left/top/width/height to fill it.
   navWidgetFromDrawer: function(rid, drawerWidgetId) {
     const region = this.regions[rid];
     if (!region) {
@@ -316,90 +290,22 @@ window.arexibo = {
     const el = document.getElementById('m' + drawerWidgetId);
     const targetWrapper = document.querySelector('.r' + rid);
     if (el && targetWrapper) {
-      // A real, severe bug found via a live report: "scaling problem
-      // inside swapped widgets if navigate widget points to pdf or
-      // countdown table or dataset." Unlike video/image (which scale
-      // their own rendered content naturally via CSS -- see
-      // object_fit -- regardless of their own box's actual size),
-      // these widget types bake *absolute pixel dimensions* into
-      // their own internal rendering at translation time: a PDF's own
-      // canvas is rendered at a specific pixel resolution
-      // (window.arexiboPdf.start's own w/h arguments, see write_media's
-      // own doc comment on the pdf arm), and a "shrink-to-fit"
-      // resource iframe (dataset/countdown/ticker/etc, `render="html"`)
-      // has its own w/h baked into its *URL's own query string*, for
-      // its own internal layout script (see gui/lib.cpp's own
-      // shrinkToFitScript) to size against. For a normal, non-drawer
-      // widget this is correct (its own w/h *is* its real region's own
-      // size) -- but a drawer widget's own w/h is always the
-      // *drawer's* own size (typically the whole screen), since which
-      // real target region it eventually gets swapped into is a
-      // runtime decision this function makes, unknowable at
-      // translation time.
-      //
-      // The first fix here (a CSS `transform: scale(...)` on this
-      // whole element, computed from its own *original* dimensions)
-      // correctly handles a PDF's own canvas -- a fixed-resolution
-      // bitmap with no competing internal scaling logic, so visually
-      // rescaling the entire rendered element as a unit works cleanly.
-      // It does *not* fully fix a resource iframe though (confirmed by
-      // a live screenshot comparison against the CMS's own correct
-      // rendering, still oversized after that first fix): its own
-      // internal shrinkToFitScript *also* tries to grow/shrink the
-      // content to fill its own (still wrong, drawer-sized) target --
-      // preserving the content's own aspect ratio while doing so, so
-      // it may only fill *one* of the two dimensions, not both --
-      // meaning this function's own *independent*, per-axis transform
-      // on top can't cleanly cancel that back out (the two scaling
-      // steps don't compose into "correctly fills the real target,
-      // undistorted" in general).
-      //
-      // Fixed properly for an iframe specifically: resize its own box
-      // directly to the real target size (exactly like a normal,
-      // non-drawer widget's own iframe always is), and tell its own
-      // shrinkToFitScript the *real* target dimensions via postMessage
-      // (see that script's own doc comment) -- letting it redo its own
-      // grow/shrink math against the truth, instead of trying to
-      // externally compensate for a wrong internal calculation.
-      // `'*'` as the target origin is safe here: this stays entirely
-      // within this display's own local loopback origins, with no
-      // externally-reachable window that could ever receive it.
+      // PDF/dataset/countdown/etc widgets bake absolute pixel
+      // dimensions into their own rendering at translation time (a
+      // PDF's own canvas resolution, a shrink-to-fit iframe's own w/h
+      // query params -- see gui/lib.cpp's shrinkToFitScript) -- always
+      // the *drawer's* own size for a drawer widget, since the real
+      // target region is only known at runtime. A CSS transform alone
+      // fixes a canvas/video/image, but not an iframe (its own
+      // internal shrink-to-fit logic fights it) -- for those, resize
+      // the box directly and rewrite the iframe's own src (see below)
+      // instead of just postMessage-ing the real size, since
+      // reparenting an <iframe> always triggers a full content reload
+      // anyway, discarding any in-page JS state a postMessage would
+      // reach.
       const origW = el.offsetWidth;
       const origH = el.offsetHeight;
       if (el.tagName === 'IFRAME') {
-        // A real, severe follow-up bug found via a live report,
-        // confirmed by a live log capture showing the swapped-in
-        // widget's own iframe fully re-fetching everything (its own
-        // HTML, bundle.min.js, fonts.css, pdf.worker.js, the raw PDF
-        // itself) a *second* time on touch, with the exact same
-        // (still wrong, drawer-sized) query string as its very first
-        // load: reparenting an <iframe> into a new DOM parent via
-        // `appendChild` (unlike a canvas, video, or image) is
-        // documented browser behavior that *always* triggers a full
-        // reload of its own content, discarding any JS state inside
-        // it -- including this same function's own postMessage below,
-        // sent to a content window that's about to be (or already
-        // has been) torn down and replaced by a freshly-loading one,
-        // which never receives it. The freshly-reloaded page reads
-        // its own w/h straight back from its *own, still-static* URL
-        // query string -- exactly the wrong, drawer-sized values --
-        // so the postMessage fix alone never actually took effect for
-        // an iframe specifically (it does for a canvas/video/image,
-        // none of which reload their own content on reparenting).
-        //
-        // Fixed by rewriting the iframe's own `src` (and therefore
-        // its own w/h, arexiboShrinkW, arexiboShrinkH query params)
-        // to the real target dimensions *before* the reparenting
-        // below -- since a reload is unavoidable either way, this
-        // makes sure the *correct* values are baked into the fresh
-        // load from the very start, rather than racing a postMessage
-        // against a reload that always wins. The postMessage further
-        // below is kept as a harmless fallback for the one case where
-        // no reload happens at all (this exact widget swapped into a
-        // same-sized target region twice in a row, where `src` never
-        // actually changes) -- there, the existing content is already
-        // correctly sized regardless, so this is a no-op safety net,
-        // not something load-bearing.
         try {
           const url = new URL(el.src, window.location.href);
           url.searchParams.set('w', targetWrapper.offsetWidth);
@@ -421,6 +327,8 @@ window.arexibo = {
         el.style.width = targetW + 'px';
         el.style.height = targetH + 'px';
         if (el.contentWindow) {
+          // Harmless fallback for the one case where src doesn't
+          // change (same-sized target twice in a row, no reload).
           el.contentWindow.postMessage(
             { arexiboResizeShrinkTarget: true, w: targetW, h: targetH }, '*');
         }
@@ -443,26 +351,9 @@ window.arexibo = {
 
     const [show, hide, duration] = drawerItem;
     show();
-    // A real, severe bug found via a live report: a "navigate widget"
-    // pointing at a native webpage (see write_media's own doc comment
-    // on the webpage/render=native arm) still opened it fullscreen --
-    // even with an earlier version of this exact fix already in place,
-    // confirmed still broken by inspecting a real translated layout's
-    // own generated JS directly: this correction was mistakenly placed
-    // *before* the `show()` call just above, rather than after it --
-    // `show()` is this widget's own generated show function, containing
-    // its own *static* add_start call (`jsNativeWebShow(mid, url,
-    // abs_x, abs_y, w, h)`, generated at translation time using the
-    // drawer's own, typically full-screen, position -- see write_media's
-    // own doc comment on the webpage/render=native arm for why). Placed
-    // before `show()`, this correction's own *right* call executed
-    // first, only to be immediately overwritten right back to the
-    // *wrong*, drawer-sized one the instant `show()` ran a moment
-    // later -- needs to run *after* it instead, so this correction is
-    // the one that's actually still in effect once this function
-    // returns. `el`/`targetWrapper` (from the resize block above)
-    // remain valid here: both were declared in this function's own
-    // outer scope, not scoped to that block alone.
+    // A native webpage's own jsNativeWebShow call is baked into show()
+    // with the drawer's own (wrong) position -- must correct it *after*
+    // show() runs, or show()'s own call overwrites this immediately.
     if (el && targetWrapper) {
       const nativeWebpageUrl = el.dataset.nativeWebpageUrl;
       if (nativeWebpageUrl && window.arexiboGui && window.arexiboGui.jsNativeWebShow) {
@@ -476,84 +367,41 @@ window.arexibo = {
     // net further down, so both paths behave identically.
     const revert = () => {
       // Clear this region's own drawer-swap bookkeeping (see
-      // controlDuration's own doc comment for why this exists) --
-      // right at the top, before anything else, so a stale reference
-      // never lingers once this specific swap has genuinely ended
-      // (whether via its own timeout below, an early expire from
-      // controlDuration, or a video/audio widget's own onended).
+      // controlDuration's own doc comment) before anything else, so no
+      // stale reference lingers once this swap has genuinely ended.
       region.drawerWidgetId = null;
       region.drawerRevert = null;
       hide();
       // Move the widget's own DOM element back to the drawer -- its
-      // own left/top/width/height stay overridden to the *previous*
-      // target region's own size until this same widget is swapped
-      // in again (harmless: it's hidden, and the next
-      // navWidgetFromDrawer call for it always re-applies the sizing
-      // above regardless of whatever it was set to before).
+      // own left/top/width/height stay overridden until swapped in
+      // again (harmless: it's hidden, and re-applied regardless).
       const drawerWrapper = document.querySelector('.drawer');
       if (el && drawerWrapper) {
         drawerWrapper.appendChild(el);
       }
-      // Resume the region's own normal cycling by re-showing
-      // whichever item was active before this temporary swap-in --
-      // `first: true` so this specific re-entry into index 0 (if
-      // that's what it was) isn't mistaken for a genuine full cycle
-      // completing again (see region_switch's own "region_done"
-      // check).
+      // `first: true` so this re-entry isn't mistaken for a full
+      // cycle completing (see region_switch's own "region_done" check).
       this.region_switch(rid, prevCur === null ? 0 : prevCur, true);
     };
-    // A real, related bug found via the same live report as the
-    // reparenting fix above: a video/audio widget's own `onended`
-    // handler (see the video/audio arms' own doc comment in
-    // Translator::write_media) is baked in at *translation* time with
-    // whatever region id it's *originally* written into -- for a
-    // drawer widget, that's always the synthetic DRAWER_RID (-1), the
-    // only one ever knowable at translation time, since which *real*
-    // target region a drawer widget eventually gets swapped into is
-    // entirely a runtime decision (this very function). Left as-is,
-    // the widget's own `show()` call above (which sets `onended` as
-    // part of its own add_start) would still point `onended` at
-    // `region_switch(-1, ...)` -- region -1 was never registered at
-    // all (see write_region's own `nitems == 0` handling -- the
-    // drawer's own synthetic id never goes through it), so
-    // `region_switch`'s own destructuring of `this.regions[-1]`
-    // (undefined) would throw the moment the video/audio actually
-    // finishes playing.
-    //
-    // A second, related bug found from the *same* live report, once
-    // the above was fixed: calling `region_switch(rid, -1, false)`
-    // directly here is *not* the same as actually reverting -- at
-    // this point `region.cur` still points at whatever was showing
-    // *before* the swap (navWidgetFromDrawer never touches it), and
-    // this region has only one normal item (this widget's own
-    // targetId), so `region_switch`'s own "only one item, nothing to
-    // actually switch to" short-circuit (`total <= 1`) fires and
-    // returns immediately -- *never* actually re-showing the
-    // original widget at all. Calling the same `revert` function the
-    // setTimeout safety net below already correctly uses avoids this
-    // entirely -- it explicitly passes `first: true` specifically to
-    // bypass that short-circuit.
+    // A video/audio widget's own `onended` is baked in at translation
+    // time pointing at the synthetic DRAWER_RID (-1, never registered
+    // as a real region) -- left as-is it would throw on playback end.
+    // Also: calling region_switch(rid, -1, false) directly here isn't
+    // the same as reverting -- this region's single real item makes
+    // its own short-circuit no-op. Using the same `revert` as the
+    // setTimeout safety net below avoids both issues.
     if (el) {
       el.onended = () => { window.clearTimeout(region.timeoutid); revert(); };
     }
     // `duration` is a `() => N` function, same shape as a normal
-    // region item's own media[cur][2] (see region_switch's own
-    // `media[next][2]()` call) -- not a raw number. Found from a real
-    // report: treating it as a plain value here made durationMs come
-    // out NaN (a function times 1000), which setTimeout then likely
-    // clamped to ~0 -- the widget swapped in and immediately back out
-    // again, faster than visibly perceptible, looking exactly like
-    // "nothing happened".
+    // region item's own media[cur][2] -- not a raw number (treating it
+    // as one makes durationMs come out NaN, clamped to ~0 by setTimeout).
     const durationMs = (duration() || 1) * 1000;
     region.timeoutDuration = durationMs;
     region.timeoutStart = Date.now();
-    // Registered here, not just implicitly via `region.cur`/`media`
-    // (which navWidgetFromDrawer never touches at all -- a
-    // drawer-swapped widget isn't part of `region.media`), so
-    // controlDuration (see its own doc comment) can recognize and
-    // correctly act on a "duration per page" PDF widget (or anything
-    // else using the same Interactive Control mechanism) currently
-    // swapped in from the drawer, not just an ordinary region item.
+    // Registered here (not just via region.cur/media, which a
+    // drawer-swapped widget isn't part of) so controlDuration can
+    // recognize and act on this widget while it's swapped in.
     region.drawerWidgetId = drawerWidgetId;
     region.drawerRevert = revert;
     region.timeoutid = window.setTimeout(revert, durationMs);
@@ -1506,101 +1354,42 @@ impl<'a> Translator<'a> {
             }
             (_, Some("webpage")) => {
                 let url = percent_decode(opts.find("uri").context("no web uri")?.text());
-                // A real, severe bug found via a live report: a
-                // "navigate widget" pointing at a webpage widget in
-                // "Best Fit" mode (modeid=3, see the CMS's own webpage
-                // widget documentation -- three embed modes: "Open
-                // Natively"/1, "Manual Position"/2, "Best Fit"/3) opened
-                // fullscreen/unscaled, even after fixing the
-                // drawer-swap positioning for the *true* native case
-                // (modeid=1) below. Root cause, confirmed by reading
-                // the real reference client's own source directly
-                // (xibo-dotnetclient's WebMedia.cs, IsNativeOpen()):
-                // *only* modeid=="1" is a genuine top-level/native
-                // open, in Xibo's own reference implementation --
-                // arexibo's own earlier `render == "native"` check
-                // alone was too broad, since the XLF's own render
-                // attribute is "native" for ALL THREE modes uniformly
-                // (confirmed via multiple real XLF samples, one per
-                // mode) -- it does *not* by itself distinguish "true
-                // native open" from "Manual"/"Best Fit". Those two
-                // other modes instead download and cache a CMS-
-                // generated *resource* HTML file (the exact same
-                // GetResource mechanism as text/ticker/embedded/
-                // datasetview above), which itself wraps the target
-                // URL in its own <iframe> with scaling/offset CSS the
-                // CMS computes server-side from
-                // scaling/offsetTop/offsetLeft/pageWidth/pageHeight --
-                // not a separate native browser view at all. Per the
-                // CMS's own documentation, this also means Manual/Best
-                // Fit -- unlike true native, a top-level open -- won't
-                // work against a site that sets its own
-                // X-Frame-Options header (embedding-only restriction);
-                // deliberately not worked around here.
+                // Xibo's webpage widget has 3 embed modes (modeid):
+                // "Open Natively"/1, "Manual Position"/2, "Best Fit"/3.
+                // The XLF's own render="native" attribute alone doesn't
+                // distinguish them -- it's "native" for all three
+                // uniformly. Only modeid=="1" is a true top-level open
+                // (confirmed via xibo-dotnetclient's WebMedia.cs,
+                // IsNativeOpen()); modes 2/3 instead download a CMS-
+                // generated resource HTML (same GetResource mechanism
+                // as text/ticker/embedded/datasetview), which wraps the
+                // target URL in its own <iframe> with scaling/offset
+                // CSS computed server-side. Per the CMS's own docs,
+                // this means Manual/Best Fit won't work against a site
+                // with its own X-Frame-Options header -- not worked
+                // around here.
                 let mode_id = opts.find("modeid").map(|e| e.text().trim().to_string());
                 let truly_native = media.get_attr("render") == Some("native")
                     && mode_id.as_deref() == Some("1");
                 if truly_native {
-                    // `render="native"` + modeid=="1" means a real
-                    // top-level browser view, not embedded via iframe --
-                    // unlike the resource-iframe paths above/below, this
-                    // isn't subject to `X-Frame-Options`/frame-busting
-                    // (those only block *embedding*, not top-level
-                    // navigation). Emit an empty placeholder here for
-                    // the show/hide cycling machinery every widget
-                    // already goes through (see region_switch in the
-                    // shared SCRIPT), and drive an actual, separate Qt
-                    // QWebEngineView overlay via the same add_start/
-                    // add_stop mechanism already used for pdf.js and
-                    // shellcommand below -- see jsNativeWebShow/Hide
-                    // in gui/view.cpp.
-                    // abs_x/abs_y here, NOT the (0,0)-relative x/y used
-                    // for the placeholder's CSS above -- jsNativeWebShow
-                    // drives a separate Qt QWebEngineView in native
-                    // window coordinates, with no wrapper div to be
-                    // relative to.
+                    // A real top-level browser view, not embedded via
+                    // iframe -- not subject to X-Frame-Options (which
+                    // only blocks embedding). Empty placeholder for the
+                    // show/hide cycling machinery every widget goes
+                    // through; the actual rendering is a separate Qt
+                    // QWebEngineView overlay driven via add_start/
+                    // add_stop -- see jsNativeWebShow/Hide in
+                    // gui/view.cpp. abs_x/abs_y (not the placeholder's
+                    // own (0,0)-relative x/y) since jsNativeWebShow
+                    // uses native window coordinates.
                     //
-                    // A real, severe bug found via a live report: a
-                    // "navigate widget" pointing at a native webpage
-                    // opened it fullscreen instead of within the
-                    // assigned drawer-swap target region. Root cause:
-                    // abs_x/abs_y/w/h above are baked into add_start's
-                    // own static string at *translation* time -- for a
-                    // drawer widget, that's always the drawer's own
-                    // position (see write_drawer's own call site,
-                    // which passes the drawer's own (x, y) as abs_x/
-                    // abs_y), since which real target region it
-                    // eventually gets swapped into is a runtime
-                    // decision (navWidgetFromDrawer). Unlike an iframe
-                    // or a canvas-based widget (pdf.js, countdown,
-                    // etc. -- all fixed for this same class of bug
-                    // already, see navWidgetFromDrawer's own doc
-                    // comment), there's no DOM element here to resize:
-                    // the actual rendering is a completely separate,
-                    // real Qt QWebEngineView overlay, positioned only
-                    // via this one jsNativeWebShow call's own
-                    // arguments -- resizing/reparenting the placeholder
-                    // <div> above (which navWidgetFromDrawer's own
-                    // generic per-widget-type logic still does
-                    // regardless) has zero effect on it. Fixed by
-                    // giving navWidgetFromDrawer the widget's own URL
-                    // via this data attribute, so it can recognize this
-                    // specific case and issue its own *corrected*
-                    // jsNativeWebShow call -- using the real target
-                    // region's own on-screen position/size (read
-                    // directly from the DOM at the moment of the swap,
-                    // via getBoundingClientRect) -- immediately after
-                    // this widget's own add_start already made its
-                    // (wrong) call. See jsNativeWebShowImpl's own doc
-                    // comment (gui/view.cpp): the x/y/w/h it expects
-                    // are the same *layout-space* units as an XLF
-                    // region's own raw geometry (Qt's own zoom/window
-                    // offset are applied separately, internally) --
-                    // exactly what getBoundingClientRect() reports here
-                    // too, since this whole page's own DOM is rendered
-                    // 1:1 against the layout's own coordinate system,
-                    // with Qt's zoom being a wholly separate, outer
-                    // transform the page's own JS never sees.
+                    // The data attribute carries the URL to
+                    // navWidgetFromDrawer, which re-issues a corrected
+                    // jsNativeWebShow call after a drawer swap (this
+                    // widget's own add_start bakes in the *drawer's*
+                    // position at translation time, since the real
+                    // target region is only known at runtime -- see
+                    // navWidgetFromDrawer's own doc comment).
                     writeln!(self.out, "<div class='media r{rid}' id='m{mid}' \
                                         data-native-webpage-url='{url}' \
                                         style='left: {x}px; top: {y}px; width: {w}px; \
@@ -1609,17 +1398,11 @@ impl<'a> Translator<'a> {
                         "window.arexiboGui.jsNativeWebShow({mid}, {url:?}, {abs_x}, {abs_y}, {w}, {h});");
                     add_stop = format!("window.arexiboGui.jsNativeWebHide({mid});");
                 } else if media.get_attr("render") == Some("native") {
-                    // modeid "2" (Manual Position) or "3" (Best Fit):
-                    // same resource-iframe path as text/ticker/
-                    // embedded/datasetview above -- the CMS's own
-                    // generated {mid}.html already embeds the target
-                    // URL with the right scaling/offset baked in
-                    // server-side, so this widget needs nothing
-                    // type-specific beyond that: no add_start/add_stop,
-                    // and the existing drawer-swap iframe-resize +
-                    // shrinkToFit machinery (navWidgetFromDrawer, gui/
-                    // lib.cpp) already applies to it unmodified, the
-                    // same as any other resource-backed widget.
+                    // modeid "2"/"3": same resource-iframe path as
+                    // text/ticker/embedded/datasetview above -- the
+                    // CMS's own generated {mid}.html already has the
+                    // right scaling/offset baked in, so nothing
+                    // type-specific is needed here.
                     let shard = 1 + (mid as u32 % crate::server::HTML_SHARD_COUNT);
                     let port = self.html_port;
                     writeln!(self.out, "<iframe class='media r{rid}' id='m{mid}' \
@@ -1695,57 +1478,18 @@ impl<'a> Translator<'a> {
                     // every ~1s. Use the native `ended` event instead,
                     // with an 86400s duration as a safety-net timeout only.
                     //
-                    // `.play()` right after element creation can fail
-                    // silently too -- a real, severe bug found this
-                    // way: navWidgetFromDrawer (see its own doc
-                    // comment) reparents a drawer widget's own element
-                    // into a *different* parent via `appendChild`
-                    // before calling this same add_start -- moving a
-                    // <video> element to a new DOM parent is a
-                    // documented browser behavior that resets/reloads
-                    // its own media resource. Calling `.play()`
-                    // immediately afterward, synchronously, can race
-                    // that reload and reject (an AbortError on the
-                    // returned Promise) -- silently, since nothing
-                    // here awaited or caught it, with no visible
-                    // console output in this project's own log
-                    // pipeline. Confirmed real: a live report of a
-                    // drawer-sourced video widget that never showed
-                    // any frame at all, despite the swap itself
-                    // (region lookup, DOM reparenting, `show()` call)
-                    // completing with no errors whatsoever. `.catch()`
-                    // silences the rejection; the `canplay` listener
-                    // is the actual fix -- retries once the element's
-                    // own reload (if any) has genuinely finished,
-                    // harmless (a no-op restart at the same position)
-                    // for the normal, non-reparented case where the
-                    // first `.play()` already succeeded.
-                    //
-                    // `{ once: true }` alone stops this from
-                    // *permanently* re-firing on every later canplay
-                    // (a real, severe follow-up bug, also confirmed by
-                    // live report: without it, this project's own
-                    // add_stop below resetting `currentTime` to 0 can
-                    // itself trigger a fresh canplay once the browser
-                    // re-buffers from the new position -- with the
-                    // listener still attached, that called `.play()`
-                    // again, restarting a video that had just legit-
-                    // imately ended and been sent back to the drawer,
-                    // which would hit `ended` again, calling onended
-                    // -> revert() -> hide() -> reset -> canplay ->
-                    // play() again: a genuine infinite loop). But
-                    // `{ once: true }` on its own still allows *one*
-                    // such extra, unwanted playthrough -- confirmed by
-                    // a live report ("does one loop in the background
-                    // then stops"): the reset-triggered canplay is
-                    // very likely to be the *next* one to fire after a
-                    // real ended event, consuming the listener's one
-                    // remaining shot. Stashing it as `_canplayRetry` so
-                    // add_stop can remove it *explicitly and
-                    // synchronously*, before its own `currentTime = 0`
-                    // line ever runs, closes this precisely -- no
-                    // stray canplay can trigger a call that no longer
-                    // has a listener to answer it.
+                    // `.play()` can fail silently right after element
+                    // creation -- reparenting a <video> (e.g.
+                    // navWidgetFromDrawer moving it into a new parent)
+                    // resets/reloads its media resource, and an
+                    // immediate synchronous `.play()` can race that and
+                    // reject with no visible error. The `canplay`
+                    // listener retries once any reload has actually
+                    // finished; `{ once: true }` alone isn't enough
+                    // since add_stop's own `currentTime = 0` can itself
+                    // trigger a fresh canplay -- stashed as
+                    // `_canplayRetry` so add_stop can remove it
+                    // explicitly before that happens.
                     add_start = format!(
                         "{{ let el = document.getElementById('m{mid}'); \
                            el.play().catch(() => {{}}); \
@@ -2733,29 +2477,13 @@ mod loop_tests {
 
     #[test]
     fn the_canplay_retry_listener_only_fires_once() {
-        // Regression test for a real, severe bug found via a live
-        // report, introduced by the `.play()` reparenting fix itself
-        // (see the video arm's own doc comment above): the `canplay`
-        // retry listener, added without `{ once: true }`, stayed
-        // attached for the widget's *entire* lifetime -- not just
-        // through its own first, possibly-reparent-disrupted play
-        // attempt. `canplay` can legitimately re-fire many times over
-        // a video's normal lifecycle, including from this project's
-        // own code: `hide()` (add_stop, called by navWidgetFromDrawer's
-        // own `revert()` once the video ends) does `el.currentTime =
-        // 0`, and resetting playback position can itself trigger a
-        // fresh `canplay` once the browser re-buffers from the new
-        // position. With the listener still attached, *that* `canplay`
-        // called `.play()` again -- restarting a video that had just
-        // legitimately ended and been sent back to the drawer,
-        // invisible but still playing, which would in turn hit `ended`
-        // again, calling `onended` -> `revert()` -> `hide()` -> reset
-        // -> `canplay` -> `.play()` again: a genuine infinite loop,
-        // confirmed real ("the video underneath stays looping" in a
-        // live report). `{ once: true }` limits the listener to firing
-        // for its own single, intended purpose -- retrying the first
-        // play attempt -- without interfering with anything the
-        // widget's own lifecycle legitimately does afterward.
+        // Regression test: without `{ once: true }`, the `canplay`
+        // retry listener stayed attached for the widget's entire
+        // lifetime -- add_stop's own `currentTime = 0` reset can
+        // itself trigger a fresh `canplay`, which called `.play()`
+        // again, restarting an already-ended video and looping
+        // onended -> revert() -> hide() -> reset -> canplay -> play()
+        // indefinitely.
         let xlf = r#"<layout width="720" height="1280">
             <region id="1" left="0" top="0" width="250" height="250">
                 <media id="5010" type="video" duration="10">
@@ -3381,19 +3109,10 @@ mod drawer_tests {
              rect.left, rect.top, rect.width, rect.height);"),
                 "must re-issue jsNativeWebShow using the real target's own rect, keyed by \
                  the widget's own id and URL -- got:\n{html}");
-        // Regression test for a real, severe *ordering* bug found via a
-        // live report: even with the fix above already in place, a
-        // native webpage still rendered fullscreen -- confirmed, by
-        // reading a real translated layout's own generated JS directly,
-        // that this correction had been placed *before* `show()`
-        // (this widget's own generated show function, itself containing
-        // a *static* jsNativeWebShow call baked in at translation time
-        // with the drawer's own, typically full-screen, position). The
-        // correction's own right call ran first, only to be immediately
-        // overwritten right back to the wrong one the instant `show()`
-        // ran a moment later. This correction must come *after* `show()`
-        // in the generated source, not merely be present somewhere in
-        // it, or this exact bug is free to reappear silently.
+        // Regression test: this correction must come *after* show()
+        // (which contains this widget's own static jsNativeWebShow
+        // call, baked in with the drawer's own wrong position) -- if
+        // placed before, show()'s own call overwrites it immediately.
         let show_pos = html.find("show();")
             .expect("must call the widget's own show() function -- got:\n{html}");
         let correction_pos = html.find("window.arexiboGui.jsNativeWebShow(\n          \
@@ -3594,33 +3313,15 @@ mod drawer_tests {
 
     #[test]
     fn navwidgetfromdrawer_overrides_onended_with_the_real_target_region() {
-        // Regression test for a real, related bug found via the same
-        // live report as the video/audio `.play()` reparenting fix
-        // (see write_media's own doc comment on the video arm): a
-        // video/audio widget's own `onended` handler is baked in at
-        // *translation* time with whatever region id it's originally
-        // written into -- for a drawer widget, that's always the
-        // synthetic DRAWER_RID (-1), the only one ever knowable at
-        // translation time (which *real* target region it eventually
-        // gets swapped into is a runtime decision). Left uncorrected,
-        // once the video/audio genuinely finished playing, `onended`
-        // would call `region_switch(-1, ...)` -- region -1 was never
-        // registered (drawer widgets never go through write_region's
-        // own `nitems == 0` handling), so region_switch's own
-        // destructuring of `this.regions[-1]` (undefined) would throw.
-        //
-        // A second, related bug found from a live report once the
-        // first fix above was live: calling `region_switch(rid, -1,
-        // false)` directly from `onended` isn't the same as actually
-        // reverting -- `region.cur` still points at whatever was
-        // showing *before* the swap, and a region with only one
-        // normal item hits region_switch's own "nothing to actually
-        // switch to" short-circuit (`total <= 1`), returning
-        // immediately *without ever re-showing the original widget at
-        // all*. `onended` must instead trigger the same `revert`
-        // function the setTimeout safety net already correctly uses
-        // (which explicitly passes `first: true` to bypass that
-        // short-circuit).
+        // Regression test: a video/audio widget's own `onended`
+        // handler is baked in at translation time pointing at the
+        // synthetic DRAWER_RID (-1, never registered) -- would throw
+        // once playback genuinely finished. Also: calling
+        // region_switch(rid, -1, false) directly isn't the same as
+        // reverting -- a single-item region hits its own short-circuit
+        // and never re-shows the original widget. `onended` must
+        // instead trigger the same `revert` the setTimeout safety net
+        // uses (passing `first: true` to bypass that short-circuit).
         //
         // Like the duration() check above, this can only be verified
         // against the *shared* runtime JS text.
@@ -3760,34 +3461,13 @@ mod control_duration_drawer_swap_tests {
         html
     }
 
-    // Regression test for a real bug found via a live report: a PDF
-    // widget configured with "duration per page", reached via a
-    // "navigate widget" action from the drawer, showed only its first
-    // page then vanished -- while the *same* setting on an *ordinary*
-    // (non-drawer) region widget already worked correctly (confirmed
-    // directly by the user, comparing a minimal test layout with the
-    // exact same two settings both ways). That comparison also
-    // revealed something this fix's own first version got wrong: a
-    // real PDF widget's own `render="html"` attribute means it's
-    // actually rendered via the generic resource-iframe path (same as
-    // text/ticker/embedded/datasetview, see write_media's own first
-    // match arm) -- fetching a CMS-generated HTML resource that
-    // already correctly implements "duration per page" itself (via
-    // xibo-interactive-control's own setWidgetDuration API) -- *not*
-    // via this player's own separate PDF_SCRIPT/canvas rendering path
-    // (reachable only for a PDF widget with some other `render` value,
-    // never actually observed in any real XLF sample throughout this
-    // whole investigation) -- an earlier, now-reverted version of this
-    // fix modified that unreachable code instead of the real cause.
-    // The real cause: controlDuration's own lookup only ever checked
-    // `region.media`, which a drawer-swapped widget is never part of
-    // (navWidgetFromDrawer manages its own, entirely separate timeout)
-    // -- so the CMS's own correctly-behaving resource HTML's own
-    // setWidgetDuration call (relayed here via /duration/set in
-    // server.rs) silently found no match and did nothing, for *any*
-    // widget reached via a drawer swap, regardless of its own type --
-    // not a PDF-specific bug at all, despite that being how it first
-    // surfaced.
+    // Regression test: a widget reached via a drawer-swap navigate
+    // action never had controlDuration act on it -- its lookup only
+    // checked region.media, which a drawer-swapped widget isn't part
+    // of (navWidgetFromDrawer manages its own separate timeout). Not
+    // type-specific -- surfaced via a PDF "duration per page" report,
+    // but applies to any widget using the Interactive Control
+    // mechanism (/duration/set in server.rs) from a drawer swap.
     #[test]
     fn controldur_recognizes_a_widget_reached_via_drawer_swap() {
         let xlf = r##"<?xml version="1.0"?>
