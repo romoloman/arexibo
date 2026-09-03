@@ -227,15 +227,12 @@ window.arexibo = {
       window.arexiboGui.jsLayoutJump(window.arexibo.id, layoutid);
     } else if (action == 'previous' || action == 'next') {
       // "screen" is a synonym for "layout" here (whole-layout level
-      // next/previous, as opposed to a specific region) -- confirmed
-      // real from two independent XLF actions: both used
-      // target="screen", and in both cases targetId matched the
-      // *layout's own* id (not any real region id in that layout at
-      // all) -- calling region_switch(layoutId, ...) on that (the
-      // previous, "screen" falls into the else/region branch below)
-      // would look up a nonexistent this.regions[layoutId], throwing
-      // when region_switch tries to destructure it -- matching a real
-      // report of these actions "not working" at all.
+      // next/previous, as opposed to a specific region) -- real XLF
+      // actions use target="screen" with targetId matching the
+      // layout's own id, not any real region id. Without this,
+      // "screen" would fall into the else/region branch below and
+      // look up a nonexistent this.regions[layoutId], throwing when
+      // region_switch tries to destructure it.
       if (target == 'layout' || target == 'screen') {
         if (action == 'next')
           window.arexiboGui.jsLayoutDone(window.arexibo.id);
@@ -496,40 +493,30 @@ pub struct Translator<'a> {
     /// actions, which reference a target widget id directly rather
     /// than a region + relative-index like `next`/`previous` do.
     widget_regions: HashMap<i32, (i32, usize)>,
-    /// Widget ids that live in the layout's own `<drawer>` (a "hidden
-    /// reservoir" -- confirmed, Xibo's own developer docs: "a
-    /// collection of Widgets with a similar structure to a normal
-    /// Region... not shown directly... referenced by Actions elsewhere
-    /// in the Layout") rather than any real, directly-shown region --
-    /// checked by `write_action`'s own navWidget resolution as a
-    /// fallback when a target widget id isn't found in
-    /// `widget_regions` at all (a normal region widget). Populated by
-    /// `write_drawer`. A plain set, not carrying each widget's own
-    /// duration/etc: the generated `navWidgetFromDrawer` JS call looks
-    /// that up at runtime instead, from `window.arexibo.drawerWidgets`
-    /// (itself populated by `write_drawer` too) -- this field only
-    /// needs to answer "is this id a known drawer widget at all".
+    /// Widget ids that live in the layout's own `<drawer>` (Xibo's own
+    /// developer docs: "a collection of Widgets... not shown directly
+    /// ... referenced by Actions elsewhere in the Layout") rather than
+    /// any real, directly-shown region -- checked by `write_action`'s
+    /// own navWidget resolution as a fallback when a target widget id
+    /// isn't found in `widget_regions`. Populated by `write_drawer`. A
+    /// plain set, not carrying each widget's own duration/etc: the
+    /// generated `navWidgetFromDrawer` JS call looks that up at
+    /// runtime instead, from `window.arexibo.drawerWidgets` -- this
+    /// field only needs to answer "is this id a known drawer widget".
     drawer_widgets: std::collections::HashSet<i32>,
     /// Region ids that are the `targetId` of some `navWidget` action
-    /// pointing at a drawer widget (a real, live-report-confirmed bug
-    /// found this way: a region containing exactly one *normal* item
-    /// -- like a persistent "interactive-button" -- got `always_hide:
-    /// false` passed to its own show/stop function pair (see
-    /// write_show_stop_functions's own `nitems > 1` check), since
-    /// there's normally nothing else in that region to hide *for* with
-    /// only one item. But `navWidgetFromDrawer` (see its own doc
-    /// comment) explicitly needs that single item's own stop function
-    /// to actually hide it, to make room for the drawer widget being
-    /// swapped in -- with `always_hide: false`, that stop function is
-    /// a no-op, so the original item (and any drawer widget swapped in
-    /// underneath it, since DOM order alone doesn't guarantee visible
-    /// stacking) never actually disappears. Populated by a pre-scan of
-    /// every collected `<action>` (see `translate`'s own doc comment
-    /// for why the full list is already available before any region is
-    /// written) -- resolving to a genuine drawer widget id (not just
-    /// any `navWidget`, which can also target a normal region item)
-    /// requires knowing `drawer_widgets` first, which write_drawer
-    /// already populates earlier in `translate`.
+    /// pointing at a drawer widget -- a region with exactly one normal
+    /// item (e.g. a persistent "interactive-button") normally gets
+    /// `always_hide: false` (see write_show_stop_functions's own
+    /// `nitems > 1` check), since there's nothing else in it to hide
+    /// for. But `navWidgetFromDrawer` needs that single item's own
+    /// stop function to actually hide it, to make room for the drawer
+    /// widget being swapped in -- with `always_hide: false`, that stop
+    /// function is a no-op, so the original item never disappears.
+    /// Populated by a pre-scan of every collected `<action>` --
+    /// resolving to a genuine drawer widget id requires knowing
+    /// `drawer_widgets` first, which write_drawer already populates
+    /// earlier in `translate`.
     swap_target_regions: std::collections::HashSet<i32>,
     /// Maps a region's `id` to its (x, y, w, h) geometry -- needed for
     /// touch actions, which get an invisible click-catching overlay
@@ -561,17 +548,14 @@ pub struct Translator<'a> {
     /// `write_media`.
     html_port: u16,
     /// Every distinct, non-empty `syncKey` found on any real region (or
-    /// the drawer, which carries the same attribute in real XLF) while
-    /// translating -- confirmed real from a live capture:
-    /// `<region ... syncKey="sync1">` on a region containing a
-    /// synchronized image playlist, `syncKey=""` (omitted here) on
-    /// ordinary/global ones. Tracks *all* of them (not just the
-    /// first), by explicit choice: Sync Group only reloads whole
-    /// layouts today, but every syncKey this layout carries is
-    /// recorded now specifically so a future move to reloading
-    /// individual *widgets* (Sync Group's own eventual per-item drift
-    /// correction, not yet implemented) doesn't need this same
-    /// scanning work redone from scratch.
+    /// the drawer, which carries the same attribute) while translating
+    /// -- `<region ... syncKey="sync1">` on a region containing a
+    /// synchronized playlist, `syncKey=""` (omitted here) on ordinary/
+    /// global ones. Tracks all of them, not just the first: Sync Group
+    /// only reloads whole layouts today, but recording every syncKey
+    /// now means a future move to per-widget reload (Sync Group's own
+    /// eventual per-item drift correction) won't need this scanning
+    /// work redone.
     sync_keys: std::collections::HashSet<String>,
 }
 
@@ -698,17 +682,14 @@ impl<'a> Translator<'a> {
             if let Some((rid, index)) = self.widget_regions.get(&widget_id).copied() {
                 format!("window.arexibo.navWidget({rid}, {index})")
             } else if self.drawer_widgets.contains(&widget_id) {
-                // A drawer widget (see drawer_widgets's own doc
-                // comment) -- not part of any region's own item
-                // cycling, so the normal (region id, index)
-                // resolution above doesn't apply. Confirmed real from
-                // a live layout: this kind of action also carries its
-                // own targetId, naming the region to temporarily
-                // swap this widget into (see navWidgetFromDrawer's
-                // own doc comment in the runtime JS) -- unlike the
+                // A drawer widget -- not part of any region's own item
+                // cycling, so the normal (region id, index) resolution
+                // above doesn't apply. This kind of action also
+                // carries its own targetId, naming the region to
+                // temporarily swap this widget into -- unlike the
                 // generic target/targetId handling in the `else`
-                // branch just below, which doesn't apply here either
-                // (this whole branch is navWidget-specific).
+                // branch below, which doesn't apply here (this whole
+                // branch is navWidget-specific).
                 let targetid: i32 = el.parse_attr("targetId")
                     .context("navWidget targeting a drawer widget needs a targetId \
                               (the region to temporarily show it in)")?;
@@ -777,22 +758,16 @@ impl<'a> Translator<'a> {
             // action, with triggerCode carrying a keyboard key name
             // (KeyboardEvent.code) as an alternative to touch/click.
             //
-            // A real, severe bug found via a live report: an empty
-            // triggerCode="" (a genuinely common, valid CMS
-            // configuration -- a touch action simply doesn't require a
-            // keyboard shortcut) used to still generate this listener,
-            // comparing against an empty string -- "safe to always
-            // add: a non-matching triggerCode simply never fires" was
-            // a false assumption. Confirmed real: on this specific
-            // kiosk's own touch hardware, a genuine touch is translated
-            // (at some lower level, before ever reaching this page's
-            // own JS) into a synthetic keydown event whose own `.code`
-            // property is itself an empty string -- meaning *any*
-            // touch *anywhere* on the entire screen matched this
-            // listener and fired this action, regardless of where its
-            // own overlay div actually was. An empty/unset triggerCode
-            // means "no keyboard shortcut configured" -- it must never
-            // be treated as "matches an empty code string".
+            // An empty triggerCode="" (a valid CMS configuration -- a
+            // touch action simply doesn't require a keyboard shortcut)
+            // used to still generate this listener, comparing against
+            // an empty string. On real touch hardware, a genuine touch
+            // is translated into a synthetic keydown event whose own
+            // `.code` is itself empty -- meaning any touch anywhere
+            // matched this listener and fired the action, regardless
+            // of where its own overlay div actually was. An empty/
+            // unset triggerCode means "no keyboard shortcut
+            // configured" -- must never match an empty code string.
             if !code.is_empty() && code != "<not set>" {
                 writeln!(self.out, "document.addEventListener('keydown', function(e) {{ \
                                     if (e.code === {code:?}) {{ {call}; }} }});")?;
@@ -893,14 +868,14 @@ impl<'a> Translator<'a> {
 
         // A region's own <options> can carry <transitionType>
         // (fadeIn/fadeOut/fly), <transitionDuration> (ms), and
-        // <transitionDirection> (compass, fly only) -- but a real CMS
-        // XLF showed this region-level trio almost always empty, while
+        // <transitionDirection> (compass, fly only) -- but real CMS
+        // XLF shows this region-level trio almost always empty, while
         // every widget carries its own transIn/transInDuration/
         // transInDirection and transOut equivalents in its own
-        // <options> -- a different, per-widget mechanism, previously
-        // unparsed. Both are supported now: the region-level trio is
-        // only a fallback default for widgets without their own
-        // transIn/transOut (see write_media).
+        // <options>, a different, per-widget mechanism. Both are
+        // supported: the region-level trio is only a fallback default
+        // for widgets without their own transIn/transOut (see
+        // write_media).
         // Region-level fallback: (in, out), each (Trans, u32). Unlike
         // widget-level transIn/transOut (independent fields), the
         // region has ONE <transitionType> -- "fadeIn"/"fadeOut" apply
@@ -976,17 +951,14 @@ impl<'a> Translator<'a> {
 
         // for each media, write functions to start/stop displaying it
         //
-        // `nitems > 1` alone used to be the whole story here -- a real,
-        // severe bug found this way: a region containing exactly one
-        // *normal* item (e.g. a persistent "interactive-button")
-        // otherwise got `always_hide: false` (nothing else in the
-        // region to hide *for*), silently no-opping its own stop
-        // function -- but navWidgetFromDrawer (see swap_target_regions's
-        // own doc comment) explicitly needs that stop function to work,
-        // to make room for a drawer widget being swapped in on top of
-        // it. `swap_target_regions` (populated by a pre-scan in
-        // `translate`) names every region that's the actual target of
-        // such a swap, regardless of how many items it normally has.
+        // `nitems > 1` alone used to be the whole story here -- a
+        // region with exactly one normal item (e.g. a persistent
+        // "interactive-button") otherwise got `always_hide: false`,
+        // silently no-opping its own stop function -- but
+        // navWidgetFromDrawer explicitly needs that stop function to
+        // work, to make room for a drawer widget being swapped in on
+        // top. `swap_target_regions` names every region that's the
+        // actual target of such a swap, regardless of item count.
         let always_hide = nitems > 1 || self.swap_target_regions.contains(&rid);
         for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in sequence {
             writeln!(self.out, "    [")?;
@@ -1005,42 +977,31 @@ impl<'a> Translator<'a> {
 
     /// Writes the `function() {{ ...show... }}, function() {{ ...hide...
     /// }}` pair (comma-separated, no trailing comma/bracket -- the
-    /// caller wraps this appropriately for its own context: a region's
-    /// own `media` array entry gets `, {duration}, {mid}]` appended
-    /// after this, while a drawer widget's own standalone entry (see
-    /// write_drawer) does not) shared between a region's own normal
-    /// item cycling (write_region) and a drawer widget's own temporary
-    /// swap-in (write_drawer) -- factored out so the two can never
-    /// silently drift apart on the actual show/hide behavior (fades,
-    /// flies, z-index handling) for what is, from the widget's own
-    /// point of view, an identical "become visible" / "become hidden"
-    /// pair either way.
+    /// caller wraps this for its own context) shared between a
+    /// region's own normal item cycling (write_region) and a drawer
+    /// widget's own temporary swap-in (write_drawer) -- factored out
+    /// so the two can never silently drift apart on show/hide
+    /// behavior (fades, flies, z-index).
     ///
     /// `always_hide` mirrors the region-cycling case's own `nitems > 1`
     /// check (a single-item, non-looping region skips its own hide
-    /// logic since nothing else will ever show in its place) -- a
-    /// drawer widget always needs real hide logic, since it always
-    /// gets swapped back out again later (see navWidgetFromDrawer's
-    /// own doc comment), so callers writing a drawer widget's own
-    /// functions should always pass `true` here regardless of the
-    /// target region's own item count.
+    /// logic) -- a drawer widget always needs real hide logic, since
+    /// it always gets swapped back out later, so callers writing a
+    /// drawer widget's own functions should always pass `true` here.
     fn write_show_stop_functions(&mut self, mid: i32, add_start: &str, add_stop: &str,
                                   transitions: Transitions, always_hide: bool) -> Result<()> {
         let Transitions { in_kind: trans_in, in_ms: ms_in, out_kind: trans_out, out_ms: ms_out }
             = transitions;
         writeln!(self.out, "      function() {{")?;
-        // Diagnostic log (found genuinely useful investigating a
-        // real "content renders correctly inside its own iframe but
-        // is never visible" report): confirms whether region_switch
-        // actually calls this widget's own show function at all.
-        // Gated behind --web-debug (see `window.arexiboDebug`,
-        // injected profile-wide in gui/lib.cpp's `setup()`) -- on
-        // request, so this doesn't add permanent noise to every
-        // normal run; combined with LoggingPage (which already
-        // captures every frame's own console output including this
-        // one when that flag is on), gives a simple way to check
-        // "is this specific widget's own show() ever running"
-        // without needing network-reachable remote debugging.
+        // Diagnostic log: confirms whether region_switch actually
+        // calls this widget's own show function at all. Gated behind
+        // --web-debug (see `window.arexiboDebug`, injected profile-
+        // wide in gui/lib.cpp's `setup()`) so it doesn't add permanent
+        // noise to every normal run -- combined with LoggingPage
+        // (which already captures every frame's own console output
+        // when that flag is on), gives a simple way to check "is this
+        // specific widget's own show() ever running" without needing
+        // network-reachable remote debugging.
         writeln!(self.out, "        if (window.arexiboDebug) console.log(\
                                     'arexibo-show: widget {mid}');")?;
         let el = format!("document.getElementById('m{mid}')");
@@ -1135,31 +1096,21 @@ impl<'a> Translator<'a> {
         Ok(())
     }
 
-    /// Writes the layout's own `<drawer>` -- "a hidden reservoir" of
-    /// widgets (see `drawer_widgets`'s own doc comment), each one
-    /// meant to be temporarily swapped into a *target region* by a
-    /// `navWidget` action rather than ever shown in place. Modeled
-    /// closely on write_region's own geometry/wrapper handling (a
-    /// `<drawer>` element carries the same width/height/top/left
-    /// attributes a `<region>` does, confirmed from a real XLF), but:
+    /// Writes the layout's own `<drawer>` -- widgets meant to be
+    /// temporarily swapped into a target region by a `navWidget`
+    /// action, never shown in place. Modeled on write_region's own
+    /// geometry/wrapper handling, but:
     ///
-    /// - the wrapper stays `display: none` unconditionally (the
-    ///   drawer itself is never shown, only individual widgets pulled
-    ///   out of it into some *other* region -- see
-    ///   navWidgetFromDrawer's own doc comment in the runtime JS);
+    /// - the wrapper stays `display: none` unconditionally (only
+    ///   individual widgets get pulled out into another region);
     /// - widgets are NOT attached to any `window.arexibo.regions[rid]`
-    ///   cycling structure (they don't belong to a real, directly-
-    ///   shown region at all) -- instead each one's own show/hide
-    ///   functions and duration go into `window.arexibo.
-    ///   drawerWidgets[mid]`, a flat, standalone entry.
+    ///   cycling structure -- each one's own show/hide functions and
+    ///   duration go into `window.arexibo.drawerWidgets[mid]` instead.
     ///
-    /// Dynamic resizing to the target region (confirmed real, Xibo
-    /// issue #2429 -- see navWidgetFromDrawer's own doc comment) is
-    /// handled entirely at runtime, in JS -- this function only ever
-    /// writes each widget once, at the drawer's own native geometry;
-    /// navWidgetFromDrawer overrides that at the moment of swapping a
-    /// widget in, rather than this function needing to know in
-    /// advance which region(s) might eventually reference it.
+    /// Dynamic resizing to the target region (Xibo issue #2429) is
+    /// handled entirely at runtime, in JS -- this function only writes
+    /// each widget once, at the drawer's own native geometry;
+    /// navWidgetFromDrawer overrides that at swap time.
     fn write_drawer(&mut self, drawer: &Element) -> Result<()> {
         let x = drawer.parse_attr("left")?;
         let y = drawer.parse_attr("top")?;
@@ -1183,45 +1134,29 @@ impl<'a> Translator<'a> {
         const DRAWER_RID: i32 = -1;
 
         writeln!(self.out, "<!-- drawer -->")?;
-        // Deliberately no `display: none` here (a real bug found this
-        // way: an ancestor's display:none hides everything inside it
-        // regardless of each child's own visibility -- so toggling a
-        // drawer widget's own visibility, as navWidgetFromDrawer
-        // already correctly did, could never actually make anything
-        // appear on screen at all). Every `.media` element already
-        // starts `visibility: hidden` by default (see the shared CSS
-        // in write_footer) -- the same mechanism that already governs
-        // every normal region widget's own show/hide -- so this
-        // wrapper needs no visibility handling of its own at all.
+        // Deliberately no `display: none` here -- an ancestor's
+        // display:none hides everything inside it regardless of each
+        // child's own visibility, so toggling a drawer widget's own
+        // visibility (navWidgetFromDrawer) could never make it appear.
+        // Every `.media` element already starts `visibility: hidden`
+        // by default (see write_footer), the same mechanism already
+        // governing every normal region widget.
         //
-        // z-index: 9999 is essential, not cosmetic -- a second real
-        // bug found this way: every real region gets its own explicit
-        // z-index (see write_region), but this wrapper previously had
-        // none at all, meaning it stacked at the implicit/auto level
-        // -- *below* any region with an explicit z-index (which is
-        // all of them). A drawer widget could become genuinely
-        // visible (the display:none fix above) and still never
-        // actually be seen, sitting behind every normal region
-        // (including a full-screen "global" one) the whole time.
-        // Matches the same "temporarily bump above everything" z-index
-        // already used for a fade-out transition elsewhere in this
-        // file.
+        // z-index: 9999 is essential -- every real region gets its own
+        // explicit z-index (see write_region); without one here, this
+        // wrapper stacked below any region with an explicit z-index
+        // (all of them), so a drawer widget could become visible and
+        // still never be seen.
         //
-        // pointer-events: none is essential too -- a third real bug
-        // found this way: `visibility: hidden` on each *child* widget
-        // (the default, see the .media CSS rule) only stops that
-        // child from being clickable/visible -- it does nothing to
-        // stop the *wrapper* itself from being a solid, event-
-        // catching layer. Combined with z-index: 9999 covering the
-        // full layout, every touch/click across the entire screen was
-        // being silently swallowed by this otherwise-invisible
-        // wrapper, disabling every interactive control on the layout.
-        // A widget reparented into a target region by
+        // pointer-events: none is essential too -- `visibility: hidden`
+        // on each child only stops that child from being clickable, not
+        // the wrapper itself from being a solid, event-catching layer.
+        // Combined with z-index: 9999 covering the full layout, every
+        // touch/click across the entire screen would be silently
+        // swallowed. A widget reparented into a target region by
         // navWidgetFromDrawer automatically escapes this (CSS
-        // inheritance follows the DOM tree -- once moved to a
-        // different parent, it's no longer a descendant of this
-        // wrapper at all), so no extra per-widget override is needed
-        // for it to remain interactive once actually shown.
+        // inheritance follows the DOM tree), so no per-widget override
+        // is needed once actually shown.
         writeln!(self.out, "<div class='drawer' style='position: absolute; \
                             left: {x}px; top: {y}px; width: {w}px; height: {h}px; \
                             overflow: hidden; z-index: 9999; pointer-events: none;'>")?;
@@ -1679,15 +1614,15 @@ mod transition_tests {
 
     #[test]
     fn region_gets_a_fixed_overflow_hidden_wrapper_with_widgets_positioned_relatively() {
-        // Regression test for a real report: during a "fly" transition,
-        // the incoming widget rendered outside its own region's visual
-        // area, then jumped into position, instead of sliding in
-        // smoothly clipped to the region -- because each widget used to
-        // be its own absolutely-positioned element (matching the
-        // region's real geometry directly), so a transform-translate
-        // moved the whole box with nothing clipping where it travelled
-        // through. Confirms the fix: a real geometry + overflow:hidden
-        // wrapper div exists, and the widget inside it uses relative
+        // Regression test: during a "fly" transition, the incoming
+        // widget rendered outside its own region's visual area, then
+        // jumped into position, instead of sliding in smoothly clipped
+        // to the region -- because each widget used to be its own
+        // absolutely-positioned element (matching the region's real
+        // geometry directly), so a transform-translate moved the whole
+        // box with nothing clipping where it travelled through.
+        // Confirms the fix: a real geometry + overflow:hidden wrapper
+        // div exists, and the widget inside it uses relative
         // (0,0,100%,100%) coordinates instead of the absolute region
         // position.
         let xlf = r#"<layout width="1920" height="1080">
@@ -1936,17 +1871,15 @@ mod native_webpage_tests {
 
     #[test]
     fn native_webpage_js_call_uses_the_regions_real_absolute_position() {
-        // Regression test for a real report: after the fly-transition
-        // fix introduced a (0,0)-relative wrapper div (see
-        // transition_tests's own region_gets_a_fixed_overflow_hidden_
-        // wrapper test), the region-relative (0,0) geometry meant for
-        // that wrapper's CSS was mistakenly also reused for this
-        // widget's own jsNativeWebShow() call -- which drives a
-        // completely separate, real Qt QWebEngineView positioned in
-        // native window coordinates (gui/view.cpp), with no wrapper div
+        // Regression test: after the fly-transition fix introduced a
+        // (0,0)-relative wrapper div, the region-relative (0,0)
+        // geometry meant for that wrapper's CSS was mistakenly also
+        // reused for this widget's own jsNativeWebShow() call -- which
+        // drives a completely separate, real Qt QWebEngineView
+        // positioned in native window coordinates, with no wrapper div
         // to be relative to at all. That made every native webpage
-        // widget land at the same spot (the base view's own top-left
-        // corner) regardless of its own region's actual position.
+        // widget land at the base view's own top-left corner
+        // regardless of its own region's actual position.
         let xlf = r#"<layout width="1920" height="1080">
             <region id="7" left="150" top="250" width="400" height="300">
                 <media id="9001" type="webpage" render="native" duration="10">
@@ -1969,22 +1902,17 @@ mod native_webpage_tests {
 
     #[test]
     fn webpage_modeid_2_and_3_use_the_resource_iframe_path_not_native() {
-        // Regression test for a real, severe bug found via a live
-        // report: a webpage widget in "Best Fit" mode (modeid=3)
-        // rendered fullscreen/unscaled, even after the drawer-swap
-        // position fix for the *true* native case (modeid=1, see the
-        // test above). Root cause, confirmed by reading the real
-        // reference client's own source directly (xibo-dotnetclient's
-        // WebMedia.cs, IsNativeOpen()): only modeid=="1" is a genuine
-        // native/top-level open -- modes "2" (Manual Position) and "3"
-        // (Best Fit) instead download and cache a CMS-generated
-        // resource HTML file (the same GetResource mechanism as text/
-        // ticker/embedded/datasetview), which itself embeds the target
-        // URL in its own <iframe> with scaling/offset CSS computed
-        // server-side. The XLF's own render="native" attribute alone
-        // does *not* distinguish these -- it's "native" for all three
-        // modes uniformly (confirmed via multiple real XLF samples,
-        // one per mode) -- so modeid must be checked too.
+        // Regression test: a webpage widget in "Best Fit" mode
+        // (modeid=3) rendered fullscreen/unscaled, even after the
+        // drawer-swap position fix for the true native case (modeid=1,
+        // see the test above). Only modeid=="1" is a genuine native
+        // open (confirmed via xibo-dotnetclient's WebMedia.cs,
+        // IsNativeOpen()) -- modes "2"/"3" instead download a
+        // CMS-generated resource HTML (same GetResource mechanism as
+        // text/ticker/embedded/datasetview), embedding the target URL
+        // in its own <iframe>. The XLF's own render="native" attribute
+        // alone doesn't distinguish these -- it's "native" for all
+        // three modes uniformly -- so modeid must be checked too.
         for (modeid, mid) in [("2", 9002), ("3", 9003)] {
             let xlf = format!(r#"<layout width="1920" height="1080">
                 <region id="7" left="150" top="250" width="400" height="300">
@@ -2295,17 +2223,16 @@ mod loop_tests {
 
     #[test]
     fn audio_uses_ended_event_and_pauses_resets_on_stop_same_as_video() {
-        // Regression test for a real question asked directly, right
-        // after fixing the exact same two issues for the video widget:
-        // audio was modeled on an *earlier* version of that video arm,
-        // before either fix existed there. Same two bugs, same fixes:
+        // Regression test: audio was modeled on an earlier version of
+        // the video arm, before either fix existed there. Same two
+        // bugs, same fixes:
         // 1. Synchronous `.duration` read right after `.play()` is
         //    unreliable (metadata loads asynchronously) -- must use the
         //    native `ended` event instead, with an 86400s safety-net
         //    duration, not a live `.duration` read.
         // 2. Missing add_stop -- audio kept playing invisibly when sent
         //    to background instead of actually stopping; must pause
-        //    *and* reset playback position.
+        //    and reset playback position.
         let xlf = r#"<layout width="720" height="1280">
             <region id="1" left="0" top="0" width="250" height="250">
                 <media id="5005" type="audio" duration="0"><options><uri>a.mp3</uri></options></media>
@@ -2502,19 +2429,14 @@ mod loop_tests {
 
     #[test]
     fn add_stop_explicitly_removes_the_canplay_retry_listener() {
-        // Regression test for a real, follow-up bug found via a live
-        // report, even with the `{ once: true }` fix above already
-        // live: "now it disappears, does one more loop in the
-        // background, then stops." `{ once: true }` alone still
-        // allows *one* extra, unwanted playthrough -- add_stop's own
-        // `currentTime = 0` reset is very likely to be the *very next*
-        // canplay to fire after a genuine `ended` event, consuming the
-        // listener's one remaining shot before the widget is actually
-        // done. Explicitly removing `_canplayRetry` as the *first*
-        // thing add_stop does -- synchronously, before its own
-        // `currentTime = 0` line ever runs -- closes this precisely:
-        // no stray canplay (from this reset or otherwise) can trigger
-        // a call that no longer has a listener left to answer it.
+        // Regression test: even with `{ once: true }` above already in
+        // place, one extra, unwanted playthrough still occurred --
+        // add_stop's own `currentTime = 0` reset is very likely to be
+        // the very next canplay to fire after a genuine `ended` event,
+        // consuming the listener's one remaining shot before the
+        // widget is actually done. Explicitly removing `_canplayRetry`
+        // as the first thing add_stop does, synchronously, before its
+        // own `currentTime = 0` line runs, closes this precisely.
         let xlf = r#"<layout width="720" height="1280">
             <region id="1" left="0" top="0" width="250" height="250">
                 <media id="5011" type="video" duration="10">
@@ -2579,23 +2501,16 @@ mod action_tests {
 
     #[test]
     fn touch_action_also_binds_a_keydown_listener_for_triggercode() {
-        // Regression test for a real bug report: "Interactive layout
-        // button... did not recognize keyboard space key press... but
-        // touch is recognized." Confirmed via a real XLF sample from
-        // the CMS that Xibo's "Key Press" trigger (4.4+) reuses
+        // Regression test: Xibo's "Key Press" trigger (4.4+) reuses
         // triggerType="touch" with triggerCode carrying a keyboard key
-        // name (e.g. "Space") as an *alternative* way to fire the same
-        // action -- this was previously never implemented, triggerCode
-        // was read only for the (unrelated) webhook action type.
+        // name (e.g. "Space") as an alternative way to fire the same
+        // action -- previously never implemented, triggerCode was read
+        // only for the unrelated webhook action type.
         //
         // Uses a populated code_map (matching "test1") rather than an
         // empty one -- this test is about the keydown listener
-        // specifically, unrelated to how the target layout id itself
-        // gets resolved; a layoutCode that fails to resolve would bail
-        // out of the whole action (via the `?` on the code_map lookup)
-        // before either the click or keydown listener ever gets
-        // written, which would fail this test for a completely
-        // unrelated reason.
+        // specifically; a layoutCode that fails to resolve would bail
+        // out of the whole action before either listener gets written.
         let xlf = r#"<layout width="1080" height="1920" code="defaultxibomultimedia">
             <action layoutCode="test1" target="screen" source="layout"
                     actionType="navLayout" triggerType="touch" triggerCode="Space"
@@ -2626,25 +2541,18 @@ mod action_tests {
 
     #[test]
     fn an_empty_triggercode_does_not_bind_a_keydown_listener_at_all() {
-        // Regression test for a real, severe bug found via a live
-        // report: a drawer-swap button (navWidgetFromDrawer, targeting
-        // a PDF widget) kept firing on *every* touch *anywhere* on the
-        // entire screen, regardless of where its own overlay div
-        // actually was. Root cause: `triggerCode=""` is a genuinely
-        // common, valid CMS configuration (a touch action simply
-        // doesn't require a keyboard shortcut) -- but this used to
-        // still generate `document.addEventListener('keydown', e =>
-        // e.code === "" && ...)` regardless, on the (false) assumption
-        // that "a non-matching triggerCode simply never fires". On
-        // this specific kiosk's own touch hardware, a genuine touch is
-        // translated (at some lower level, before ever reaching this
-        // page's own JS) into a synthetic keydown event whose own
-        // `.code` property is itself an empty string -- matching this
-        // listener for *any* touch, anywhere, confirmed by a live,
-        // global click-listener diagnostic capturing zero real `click`
-        // events despite the swap visibly happening on every touch.
-        // An empty/unset triggerCode must mean "no keyboard shortcut
-        // configured", never "matches an empty code string".
+        // Regression test: a drawer-swap button kept firing on every
+        // touch anywhere on the screen, regardless of where its own
+        // overlay div actually was. Root cause: `triggerCode=""` is a
+        // valid CMS configuration (a touch action doesn't require a
+        // keyboard shortcut) -- but this used to still generate
+        // `document.addEventListener('keydown', e => e.code === "" &&
+        // ...)` regardless. On real touch hardware, a genuine touch is
+        // translated into a synthetic keydown event whose own `.code`
+        // is itself an empty string -- matching this listener for any
+        // touch anywhere. An empty/unset triggerCode must mean "no
+        // keyboard shortcut configured", never "matches an empty code
+        // string".
         let xlf = r#"<layout width="1080" height="1920">
             <region id="1" left="0" top="0" width="430" height="516">
                 <media id="200" type="interactive-button" render="html" duration="30">
@@ -2708,22 +2616,19 @@ mod action_tests {
 
     #[test]
     fn real_next_action_from_user_report_routes_to_layout_level_advance() {
-        // Regression test for a real report: "next"/"previous" touch
-        // actions "don't seem to work" -- confirmed real from two
-        // independent XLF actions the user shared (1006.xlf, 1008.xlf):
-        // both used target="screen", with targetId matching the
-        // *layout's own* id (1006/1008), not any real region id in
-        // that layout at all.
+        // Regression test: "next"/"previous" touch actions "don't seem
+        // to work" -- both real XLF samples used target="screen", with
+        // targetId matching the layout's own id, not any real region
+        // id in that layout at all.
         //
         // The generated call itself (checked here) was never the
         // problem -- write_action already correctly passed "screen"
-        // and the targetId through unconditionally, regardless of
-        // their meaning. The actual bug was entirely inside the
-        // *shared runtime* performAction function's own handling of
+        // and the targetId through. The actual bug was entirely inside
+        // the shared runtime performAction function's own handling of
         // target=="screen" (see
-        // performAction_treats_screen_as_a_synonym_for_layout below)
-        // -- this test only confirms the call-generation side stayed
-        // correct throughout.
+        // performAction_treats_screen_as_a_synonym_for_layout below) --
+        // this test only confirms the call-generation side stayed
+        // correct.
         let xlf = r#"<layout width="1080" height="1920">
             <action layoutCode="numeriutilitest" target="screen" source="widget"
                     actionType="next" triggerType="touch" triggerCode="apri_home"
@@ -2747,18 +2652,15 @@ mod action_tests {
 
     #[test]
     fn performaction_treats_screen_as_a_synonym_for_layout() {
-        // The actual bug and its fix, verified directly against the
-        // *shared runtime* JS source (not per-layout generated output,
-        // which never repeats this function's own body) -- any
-        // minimal layout produces the same shared runtime JS, so this
-        // doesn't need the real 1006/1008.xlf specifically. Before the
-        // fix, only target=='layout' routed to jsLayoutDone/
-        // jsLayoutPrev (whole-layout advance) -- any other value,
-        // including the real "screen" confirmed above, fell into the
-        // region_switch(targetid, ...) branch instead, looking up
-        // this.regions[targetid] where targetid is actually the
-        // *layout's own* id -- a lookup that finds nothing, and
-        // region_switch destructuring `undefined` throws.
+        // Verified directly against the shared runtime JS source (not
+        // per-layout generated output) -- any minimal layout produces
+        // the same shared runtime JS, so this doesn't need the real
+        // 1006/1008.xlf specifically. Before the fix, only
+        // target=='layout' routed to jsLayoutDone/jsLayoutPrev --
+        // "screen" fell into the region_switch(targetid, ...) branch
+        // instead, looking up this.regions[targetid] where targetid is
+        // actually the layout's own id -- a lookup that finds nothing,
+        // and region_switch destructuring `undefined` throws.
         let xlf = r#"<layout width="1080" height="1920">
             <region id="1" left="0" top="0" width="1080" height="1920">
                 <media id="100" type="image" duration="5"><options><uri>a.png</uri></options></media>
@@ -2882,17 +2784,13 @@ mod drawer_tests {
         html
     }
 
-    // Real XLF shared directly by the user (layout 983) -- the exact
-    // report this whole feature addresses: a webhook trigger
-    // ("apri_home") on an interactive-button widget did nothing at
-    // all, because its own navWidget action targets widgetId="4670",
-    // a widget that lives in the <drawer>, not any real region --
-    // previously never processed at all (confirmed: zero occurrences
-    // of "drawer" anywhere in this file before this feature), so
+    // Real XLF -- the exact case this whole feature addresses: a
+    // webhook trigger ("apri_home") on an interactive-button widget
+    // did nothing, because its own navWidget action targets
+    // widgetId="4670", a widget that lives in the <drawer>, not any
+    // real region -- previously never processed at all, so
     // write_action's own widget_regions-only lookup always failed,
-    // silently dropping the whole action (write_action's own errors
-    // are caught and logged, not propagated -- see translate()) and
-    // therefore never actually registering
+    // silently dropping the whole action and never registering
     // window.arexibo.triggers["apri_home"] at all.
     const REAL_LAYOUT_983_XLF: &str = r##"<?xml version="1.0"?>
 <layout width="1080" height="1920" bgcolor="#ffffff" schemaVersion="4" enableStat="1"><region id="4654" width="1080" height="1920" top="0" left="0" syncKey="" zindex="2"><options/><media id="4666" schemaVersion="1" type="global" render="html" duration="10" useDuration="1" fromDt="1970-01-01 01:00:00" toDt="2038-01-19 04:14:07" enableStat="1"><options><updateInterval>43200</updateInterval></options><raw/></media></region><region id="4657" width="240" height="255" top="1616" left="40" syncKey="" zindex="5"><options><loop>0</loop><transitionDirection/><transitionDuration/><transitionType/></options><media id="4669" schemaVersion="2" type="interactive-button" render="html" duration="60" useDuration="0" fromDt="1970-01-01 01:00:00" toDt="2038-01-19 04:14:07" enableStat="1"><action layoutCode="" target="region" source="widget" actionType="navWidget" triggerType="webhook" triggerCode="apri_home" id="809" widgetId="4670" targetId="4657" sourceId="4669"/><options><updateInterval>43200</updateInterval></options><raw/></media></region><drawer id="4658" width="1080" height="1920" top="0" left="0" syncKey=""><options/><media id="4670" schemaVersion="1" type="image" render="native" duration="10" useDuration="0" fromDt="1970-01-01 01:00:00" toDt="2038-01-19 04:14:07" enableStat="0" fileId="154"><options><uri>154.jpg</uri><scaleType>center</scaleType><alignId>center</alignId><valignId>middle</valignId></options><raw/></media></drawer><tags/></layout>"##;
@@ -2911,16 +2809,14 @@ mod drawer_tests {
     #[test]
     fn real_layout_983_drawer_widget_gets_written_hidden() {
         let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_983_hidden");
-        // Regression test for a real bug: the drawer wrapper must NOT
-        // have `display: none` -- an ancestor's display:none hides
+        // Regression test: the drawer wrapper must NOT have
+        // `display: none` -- an ancestor's display:none hides
         // everything inside it regardless of each child's own
         // visibility, so toggling a drawer widget's own visibility
-        // (navWidgetFromDrawer) could never make anything actually
-        // appear on screen at all. Every `.media` element already
-        // starts hidden via the shared `.media { visibility: hidden }`
-        // CSS rule (see write_footer) -- the same mechanism every
-        // normal region widget's own show/hide already relies on --
-        // so the wrapper itself needs no visibility handling at all.
+        // could never make anything appear. Every `.media` element
+        // already starts hidden via the shared `.media { visibility:
+        // hidden }` CSS rule -- the same mechanism every normal region
+        // widget's own show/hide already relies on.
         assert!(html.contains("class='drawer'"), "the drawer wrapper must exist");
         assert!(!html.contains("class='drawer' style='position: absolute; \
                                 left: 0px; top: 0px; width: 1080px; height: 1920px; \
@@ -2969,27 +2865,16 @@ mod drawer_tests {
 
     #[test]
     fn drawer_script_block_contains_no_html_markup() {
-        // Regression test for the real, root-cause bug behind every
-        // previous "trigger does nothing" report on this feature: an
-        // earlier version wrote each widget's own <img>/<iframe>
-        // markup *inside* the same already-open <script> block as its
-        // own drawerWidgets[...] = [...] registration. Once a
-        // browser's HTML parser enters <script>, everything up to the
-        // next </script> is raw JS source text, not HTML to keep
-        // parsing -- an embedded <img ...> tag is invalid JS syntax
-        // (confirmed via a real browser console: "SyntaxError:
-        // Unexpected token '<'"), and a syntax error anywhere in a
-        // <script> block means *none* of it runs, not just that one
-        // line -- so drawerWidgets was silently never populated at
-        // all, on every layout, regardless of the display/z-index/
-        // duration fixes that came before this one. None of those
-        // earlier fixes could ever have been *observed* working,
-        // because this bug prevented the registration script from
-        // running in the first place. Only actually parsing the
+        // Regression test: an earlier version wrote each widget's own
+        // <img>/<iframe> markup inside the same already-open <script>
+        // block as its own drawerWidgets[...] registration. Once a
+        // browser's HTML parser enters <script>, everything up to
+        // </script> is raw JS source, not HTML -- an embedded <img>
+        // tag is invalid JS syntax, and a syntax error anywhere in a
+        // <script> block means none of it runs, so drawerWidgets was
+        // silently never populated at all. Only actually parsing the
         // generated HTML's own structure (not just checking for
-        // substrings, which every earlier test in this file did, and
-        // which is exactly why this one slipped through repeatedly)
-        // can catch this class of bug.
+        // substrings) can catch this class of bug.
         let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_no_html_in_script");
         let script_start = html.find("<script type='text/javascript'>\nwindow.arexibo.drawerWidgets")
             .expect("the drawer's own registration script must exist");
@@ -3011,17 +2896,13 @@ mod drawer_tests {
     fn every_script_block_in_the_generated_html_is_syntactically_valid_js() {
         // A much stronger, general version of the substring-based
         // check above -- rather than looking for specific HTML tags
-        // that happen to break JS parsing (the exact class of real
-        // bug found on this feature), this actually extracts *every*
-        // <script> block from a real, full layout's own generated
-        // HTML and validates each with `node --check`, a real JS
-        // parser -- catching this whole class of bug regardless of
-        // what causes it, not just the one specific tag that
-        // triggered the real report. Skips gracefully (rather than
-        // failing) if `node` isn't available in this environment,
-        // since this is a genuinely stronger *additional* check, not
-        // the only test covering this -- CI/dev environments without
-        // node shouldn't lose an otherwise-unrelated test run over it.
+        // that happen to break JS parsing, this extracts every
+        // <script> block from a real, full layout's own generated HTML
+        // and validates each with `node --check`, a real JS parser --
+        // catching this whole class of bug regardless of what causes
+        // it. Skips gracefully if `node` isn't available in this
+        // environment, since this is a stronger additional check, not
+        // the only test covering this.
         if std::process::Command::new("node").arg("--version").output().is_err() {
             eprintln!("skipping: node not available in this environment");
             return;
@@ -3055,20 +2936,16 @@ mod drawer_tests {
 
     #[test]
     fn a_native_webpage_placeholder_carries_its_own_url_for_the_drawer_swap_fix() {
-        // Regression test for a real, severe bug found via a live
-        // report: a "navigate widget" pointing at a native webpage
-        // (see write_media's own doc comment on the webpage/
-        // render=native arm) opened it fullscreen instead of within
-        // the assigned drawer-swap target region. Root cause: a
-        // native webpage isn't rendered by any DOM element at all --
-        // it's a separate Qt QWebEngineView overlay, positioned only
-        // via a jsNativeWebShow(...) call baked in at *translation*
-        // time using the *drawer's* own position (since which real
-        // target region it eventually gets swapped into is a runtime
-        // decision). navWidgetFromDrawer needs the widget's own URL,
-        // separately from that already-wrong baked-in call, to be
-        // able to issue its own corrected one -- carried here via a
-        // data attribute on the otherwise-empty placeholder div.
+        // Regression test: a "navigate widget" pointing at a native
+        // webpage opened it fullscreen instead of within the assigned
+        // drawer-swap target region. A native webpage isn't rendered
+        // by any DOM element -- it's a separate Qt QWebEngineView
+        // overlay, positioned only via a jsNativeWebShow(...) call
+        // baked in at translation time using the drawer's own
+        // position. navWidgetFromDrawer needs the widget's own URL,
+        // separately from that already-wrong call, to issue a
+        // corrected one -- carried here via a data attribute on the
+        // otherwise-empty placeholder div.
         let xlf = r##"<?xml version="1.0"?>
 <layout width="1080" height="1920" bgcolor="#ffffff" schemaVersion="4" enableStat="1">
 <region id="4657" width="240" height="255" top="1616" left="40" syncKey="" zindex="5">
@@ -3127,25 +3004,19 @@ mod drawer_tests {
 
     #[test]
     fn navwidgetfromdrawer_calls_duration_as_a_function_not_a_raw_value() {
-        // Regression test for a real report: the trigger fired
-        // correctly (window.arexibo.triggers[...] was registered and
-        // called navWidgetFromDrawer with the right arguments -- the
-        // earlier bug this whole feature already fixed), yet still
-        // visibly did nothing. Root cause: drawerWidgets[mid]'s own
-        // third element is a `() => N` function (same shape as a
-        // normal region item's own media[cur][2], see region_switch's
-        // own `media[next][2]()` call) -- the shared runtime JS's own
-        // navWidgetFromDrawer treated it as a raw number instead,
-        // making its own computed setTimeout delay come out NaN
-        // (a function times 1000) -- clamped by the browser to ~0, so
-        // the widget swapped in and back out again within
-        // milliseconds, imperceptibly fast.
+        // Regression test: the trigger fired correctly (the earlier
+        // bug this feature already fixed), yet still visibly did
+        // nothing. Root cause: drawerWidgets[mid]'s own third element
+        // is a `() => N` function (same shape as a normal region
+        // item's own media[cur][2]) -- navWidgetFromDrawer treated it
+        // as a raw number instead, making its own setTimeout delay
+        // come out NaN, clamped to ~0 -- the widget swapped in and
+        // back out again imperceptibly fast.
         //
-        // This can only be checked at the level of the *shared*
-        // runtime JS text itself (not per-layout translated output,
-        // which never repeats this function's own body) -- confirms
-        // duration is actually *invoked* (parenthesized call), not
-        // just referenced as a bare identifier.
+        // Can only be checked against the shared runtime JS text
+        // itself -- confirms duration is actually invoked
+        // (parenthesized call), not just referenced as a bare
+        // identifier.
         let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_duration_call");
         assert!(html.contains("duration() || 1"),
                 "navWidgetFromDrawer must call duration() as a function -- it's a \
@@ -3155,47 +3026,22 @@ mod drawer_tests {
 
     #[test]
     fn navwidgetfromdrawer_scales_via_transform_instead_of_resizing_content() {
-        // Regression test for a real, severe bug found via a live
-        // report: "scaling problem inside swapped widgets if navigate
-        // widget points to pdf or countdown table or dataset." Unlike
-        // video/image (which scale their own rendered content
-        // naturally via CSS regardless of their own box's actual
-        // size), these widget types bake *absolute pixel dimensions*
-        // into their own internal rendering at translation time (a
-        // PDF's own canvas resolution via window.arexiboPdf.start's
-        // own w/h arguments; a "shrink-to-fit" resource iframe's own
-        // w/h baked into its URL's own query string) -- always the
-        // *drawer's* own size for a drawer widget, never the real
-        // target region's (unknowable at translation time). The
-        // previous fix (resizing the wrapper to `width: 100%; height:
-        // 100%`) only resized the *outer* element -- meaningless for
-        // content that renders itself at a fixed internal resolution,
-        // leaving it absurdly oversized or clipped once swapped into a
-        // real (typically much smaller) target region.
-        //
-        // A CSS `transform: scale(...)` on the whole element (this
-        // test's own subject) correctly handles a canvas (PDF) --
-        // a fixed-resolution bitmap with no competing internal scaling
-        // logic. It does *not* fully fix an iframe though (confirmed
-        // by a live screenshot comparison against the CMS's own
-        // correct rendering, still oversized with this fix alone):
-        // its own internal shrinkToFitScript (gui/lib.cpp) *also*
-        // tries to grow/shrink its own content to fill its own (still
-        // wrong, drawer-sized) target, preserving aspect ratio while
-        // doing so -- meaning this function's own independent,
-        // per-axis transform on top can't cleanly cancel that back
-        // out. See navwidgetfromdrawer_resizes_iframes_directly_and_
-        // notifies_shrink_to_fit below for the iframe-specific fix.
+        // Regression test: a PDF/countdown/dataset widget swapped from
+        // the drawer bakes absolute pixel dimensions into its own
+        // rendering at translation time (a PDF's own canvas
+        // resolution, a shrink-to-fit iframe's own w/h in its URL
+        // query string) -- always the drawer's own size, never the
+        // real target region's. Resizing the outer wrapper alone is
+        // meaningless for content rendering at a fixed internal
+        // resolution. A CSS `transform: scale(...)` on the whole
+        // element correctly handles a canvas (PDF); an iframe needs
+        // its own separate fix (see
+        // navwidgetfromdrawer_resizes_iframes_directly_and_notifies_
+        // shrink_to_fit below), since its internal shrinkToFitScript
+        // also tries to grow/shrink against the wrong target.
         //
         // Like the duration() check above, this can only be verified
-        // against the *shared* runtime JS text -- confirms
-        // navWidgetFromDrawer computes a scale factor from the
-        // widget's own *original* dimensions (read before anything
-        // changes them) against the target wrapper's own real size,
-        // and applies it via `transform: scale(...)` for the non-
-        // iframe (canvas/video/image) case -- agnostic to whatever's
-        // actually rendered inside the element, unlike trying to
-        // resize the content itself.
+        // against the shared runtime JS text.
         let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_transform_scale");
         assert!(html.contains("const origW = el.offsetWidth;"),
                 "must read the widget's own original width before changing anything");
@@ -3217,34 +3063,18 @@ mod drawer_tests {
 
     #[test]
     fn navwidgetfromdrawer_resizes_iframes_directly_and_notifies_shrink_to_fit() {
-        // Regression test for a real, severe follow-up bug found via a
-        // live screenshot comparison against the CMS's own correct
-        // rendering, even with the CSS-transform fix (see the test
-        // above) already live: a countdown/dataset table swapped in
-        // from the drawer still rendered enormously oversized,
-        // unlike a PDF (a canvas), which the transform fix already
-        // correctly handled. Root cause: unlike a canvas, a resource
-        // iframe (dataset/countdown/ticker/etc, `render="html"`) has
-        // its own competing internal scaling logic --
-        // gui/lib.cpp's own shrinkToFitScript, injected into every
-        // frame, reads its own target size from its own URL's static
-        // `arexiboShrinkW`/`arexiboShrinkH` query params (always the
-        // *drawer's* own, typically full-screen, size for a drawer
-        // widget) and grows/shrinks its own content to fill *that*
-        // target, preserving its own aspect ratio. This function's
-        // own independent, per-axis CSS transform on top of an
-        // already-wrongly-scaled iframe can't cleanly cancel that back
-        // out in general (the content may only fill *one* of the two
-        // dimensions after the internal grow, not both).
+        // Regression test: a countdown/dataset table swapped in from
+        // the drawer still rendered oversized even with the CSS-
+        // transform fix above -- unlike a canvas, a resource iframe
+        // has its own competing internal scaling logic
+        // (gui/lib.cpp's shrinkToFitScript reads its own target size
+        // from static URL query params, always the drawer's own size)
+        // -- an independent, per-axis CSS transform on top of an
+        // already-wrongly-scaled iframe can't cleanly cancel that out.
         //
         // Fixed by treating an iframe differently: resize its own box
-        // directly to the *real* target size (exactly like a normal,
-        // non-drawer widget's own iframe always is) and tell its own
-        // shrinkToFitScript the real target dimensions via
-        // `postMessage` -- letting that script redo its own grow/
-        // shrink math against the truth, instead of trying to
-        // externally compensate for an already-wrong internal
-        // calculation.
+        // directly to the real target size and tell its own
+        // shrinkToFitScript the real dimensions via `postMessage`.
         let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_iframe_resize");
         assert!(html.contains("if (el.tagName === 'IFRAME') {"),
                 "must branch specifically for iframes -- they have their own competing \
@@ -3263,31 +3093,19 @@ mod drawer_tests {
 
     #[test]
     fn navwidgetfromdrawer_rewrites_iframe_src_before_reparenting() {
-        // Regression test for a real, severe follow-up bug found via a
-        // live log capture: the swapped-in widget's own iframe was
-        // seen fully re-fetching everything (its own HTML,
-        // bundle.min.js, fonts.css, pdf.worker.js, the raw PDF itself)
-        // a *second* time on touch, with the exact same (still wrong,
-        // drawer-sized) query string as its very first load -- meaning
-        // the postMessage fix above (see that test's own doc comment)
-        // never actually took effect for an iframe specifically.
-        // Root cause: reparenting an <iframe> into a new DOM parent via
-        // `appendChild` (unlike a canvas, video, or image) is
-        // documented browser behavior that *always* triggers a full
-        // reload of its own content -- discarding any JS state inside
-        // it, including a postMessage sent to a content window that's
-        // about to be (or already has been) torn down and replaced.
-        // The freshly-reloaded page reads its own w/h straight back
-        // from its own, still-static URL query string -- exactly the
-        // wrong, drawer-sized values it had before.
+        // Regression test: the swapped-in widget's own iframe fully
+        // re-fetched everything a second time on touch, with the same
+        // still-wrong, drawer-sized query string as its first load --
+        // reparenting an <iframe> via `appendChild` (unlike a canvas,
+        // video, or image) always triggers a full content reload,
+        // discarding any JS state a postMessage would reach.
         //
-        // Fixed by rewriting the iframe's own `src` (and therefore its
-        // own w/h, arexiboShrinkW, arexiboShrinkH query params) to the
-        // real target dimensions *before* the reparenting -- since a
-        // reload is unavoidable either way, this makes sure the
-        // correct values are baked into the fresh load from the very
-        // start, rather than racing a postMessage against a reload
-        // that always wins.
+        // Fixed by rewriting the iframe's own `src` (and its
+        // w/h/arexiboShrinkW/H query params) to the real target
+        // dimensions before reparenting -- since a reload is
+        // unavoidable either way, this bakes the correct values into
+        // the fresh load from the start instead of racing a
+        // postMessage against a reload that always wins.
         let html = translate_xlf(REAL_LAYOUT_983_XLF, &HashMap::new(), "drawer_iframe_src_rewrite");
         let src_rewrite_pos = html.find("const url = new URL(el.src, window.location.href);")
             .expect("must rewrite the iframe's own src using its real URL, not a bare \
@@ -3375,21 +3193,15 @@ mod drawer_tests {
 
     #[test]
     fn a_single_item_region_targeted_by_a_drawer_swap_still_gets_a_working_hide_function() {
-        // Regression test for a real, severe bug found via a live
-        // report: "navWidget shows a video from the drawer in place of
-        // a button, but the button never disappears and the video
-        // renders underneath it." Root cause: a region with exactly
-        // one *normal* item (here, and in the real report, a
+        // Regression test: a region with exactly one normal item (a
         // persistent "interactive-button") got `always_hide: false`
         // (see write_show_stop_functions's own `nitems > 1` check --
         // reasonable on its own: with only one item, there's normally
-        // nothing else in the region to hide *for*) -- but
-        // navWidgetFromDrawer explicitly calls that same item's own
-        // stop function to hide it, to make room for the drawer
-        // widget being swapped in on top of it. With `always_hide:
-        // false`, that stop function was a silent no-op -- the button
-        // never actually disappeared, regardless of the separate
-        // video `.play()`/`onended` fixes elsewhere.
+        // nothing else to hide for) -- but navWidgetFromDrawer
+        // explicitly calls that item's own stop function to hide it,
+        // to make room for the drawer widget being swapped in on top.
+        // With `always_hide: false`, that stop function was a silent
+        // no-op -- the button never actually disappeared.
         let xlf = r#"<layout width="1080" height="1920">
             <region id="1" left="0" top="0" width="240" height="255">
                 <media id="200" type="image" duration="30">
