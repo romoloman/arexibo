@@ -1997,7 +1997,7 @@ mod native_webpage_tests {
             assert!(!html.contains(&format!("jsNativeWebShow({mid},")),
                     "modeid={modeid} must NOT use the native Qt WebEngineView path for its \
                      own add_start call -- got:\n{html}");
-            assert!(html.contains(&format!("src='http://127.0.0.")) &&
+            assert!(html.contains("src='http://127.0.0.") &&
                     html.contains(&format!("/{mid}.html?w=400&h=300")),
                     "modeid={modeid} must use the same resource-iframe path as text/ticker/\
                      embedded/datasetview widgets, fetching the CMS's own generated \
