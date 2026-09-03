@@ -86,25 +86,16 @@ pub enum ToGui {
     /// whichever page actually has a matching triggerType="webhook"
     /// action).
     Trigger(String),
-    /// Force a real page reload of `layout_id`, even if the GUI's own
-    /// Schedule<T> already believes it's current -- ordinary
-    /// Layouts(same id again) is a silent no-op there
-    /// (Schedule::update only navigates on an actual *change*). Needed
-    /// specifically for Sync Group: when a Follower (re)connects
-    /// mid-way through an already-active Synchronised Event, this
-    /// Lead's own already-running region/playlist timers need to
-    /// actually restart in lockstep with the (re)synchronized group,
-    /// not just have the same layout id silently confirmed as already
-    /// correct. See mainloop.rs's own sync_peer_connected handling.
+    /// Forces a real reload of `layout_id`, bypassing the GUI
+    /// `Schedule<T>` change-detection that would otherwise make
+    /// repeating the same id a no-op. Needed for Sync Groups when a
+    /// Follower (re)connects mid-event: the Lead's own active
+    /// region/playlist timers must restart in lockstep rather than
+    /// being ignored as "already current" (see sync_peer_connected).
     ///
-    /// Carries the id explicitly -- an earlier version derived it from
-    /// the GUI's own Schedule<T>::current() instead, but that reflects
-    /// whatever the *last actual* ToGui::Layouts call set it to, which
-    /// this message is specifically sent *instead of* for a Sync Group
-    /// switch. The very first synchronized switch of a session
-    /// force-reloaded layout 0 (the startup splash/default, still the
-    /// GUI's own stale "current") instead of the actual synchronized
-    /// layout.
+    /// `layout_id` is passed explicitly because deriving it from
+    /// `Schedule<T>::current()` yields stale data on the initial
+    /// session switch.
     ForceReloadLayout(i64),
 }
 
@@ -190,30 +181,22 @@ pub struct Handler {
     /// The `sync_role` that `sync_group` (if any) was actually built
     /// from -- compared against `settings.sync_role` in
     /// `update_sync_group` to avoid tearing down and rebuilding a
-    /// perfectly good connection (losing a Follower's own tracked
-    /// clock offset, and briefly missing any Command published during
-    /// the gap) on every unrelated settings change. A role *kind*
-    /// change (None/Lead/Follower switching) is already caught earlier
-    /// in `collect_once`, forcing a full process restart before this
-    /// is ever reached with a different kind -- so in practice, this
-    /// only actually differs (and triggers a real rebuild) when a
-    /// Follower's own `lead_addr` changes while staying a Follower.
+    /// perfectly good connection on every unrelated settings change. A
+    /// role *kind* change (None/Lead/Follower) already forces a full
+    /// restart earlier in `collect_once` -- so this only differs (and
+    /// triggers a rebuild) when a Follower's own `lead_addr` changes
+    /// while staying a Follower.
     sync_group_role: SyncRole,
-    /// Whether the very first collection cycle (schedule.xml
-    /// downloaded and parsed, every required file successfully
-    /// downloaded/translated) has completed at least once. Gates
-    /// `update_sync_group` (see its own doc comment): deliberately
-    /// false at construction, so the two `update_settings` calls
-    /// `Handler::new` itself makes (processing the initial
-    /// RegisterDisplay response) don't connect to/announce readiness
-    /// to a Sync Group Lead while this display's own cache is still
-    /// empty -- a Follower connecting this early could receive a
-    /// Command/Sync for sync_keys it can't yet resolve, and once it
-    /// later discovers a matching layout independently, that would
-    /// stage an uncoordinated fresh switch, possibly hours out of
-    /// step with the Lead. Set true (and `update_sync_group` invoked
-    /// once) at the end of the first genuinely successful
-    /// `collect_once`.
+    /// Whether the very first collection cycle has completed at least
+    /// once. Gates `update_sync_group`: deliberately false at
+    /// construction, so `Handler::new`'s own two `update_settings`
+    /// calls (processing the initial RegisterDisplay response) don't
+    /// connect to/announce readiness to a Sync Group Lead while this
+    /// display's own cache is still empty -- a Follower connecting
+    /// this early could receive a Command for sync_keys it can't yet
+    /// resolve, and later stage an uncoordinated switch out of step
+    /// with the Lead. Set true (and `update_sync_group` invoked once)
+    /// at the end of the first genuinely successful `collect_once`.
     first_collection_done: bool,
     /// A Follower's own incoming, already offset-corrected SyncCommands
     /// -- `never()` whenever this display isn't currently a Sync Group
@@ -229,22 +212,17 @@ pub struct Handler {
     /// comment for why trusting the Lead's own layout id directly
     /// would be unsafe for anything other than Mirror Sync).
     pending_sync_keys: Option<Vec<String>>,
-    /// Which layout id (this display's *own* schedule-discovered
-    /// candidate, from schedule_check's own local discovery -- never
-    /// set from an incoming network Command, which only ever carries
-    /// sync_keys) most recently triggered `pending_sync_keys` being
-    /// staged, purely for that discovery's own re-publish guard --
-    /// see its own call site's doc comment for why comparing
-    /// `pending_sync_keys` by *value* alone is a real, distinct bug:
-    /// two structurally-similar layouts (e.g. successive swaps within
-    /// the same live Synchronised Event) can genuinely share the exact
-    /// same sync_keys text, and comparing sync_keys values alone would
-    /// then wrongly treat a genuinely new layout as "already handled"
-    /// just because its own sync_keys happen to match a previous,
-    /// different layout's own. `resolve_layout_for_sync_keys` itself
-    /// is correctly unaffected by this field -- it only ever resolves
-    /// by sync_keys content, as it must (an id is never trusted
-    /// across the network at all).
+    /// Which layout id (this display's own schedule-discovered
+    /// candidate, never set from an incoming network Command, which
+    /// only ever carries sync_keys) most recently triggered
+    /// `pending_sync_keys` being staged, purely for that discovery's
+    /// own re-publish guard -- two structurally-similar layouts (e.g.
+    /// successive swaps within the same live Synchronised Event) can
+    /// share the exact same sync_keys text, so comparing sync_keys
+    /// values alone would wrongly treat a genuinely new layout as
+    /// "already handled". `resolve_layout_for_sync_keys` itself is
+    /// unaffected by this field -- it only ever resolves by sync_keys
+    /// content, as it must.
     pending_sync_layout_id: Option<i64>,
     /// Set (to the layout id, alongside the `Instant` it was set at)
     /// right after `reconnect_after_catching_up_on_own` triggers a
@@ -269,20 +247,15 @@ pub struct Handler {
     /// otherwise directly show up as a visible desync).
     sync_apply_timer: Receiver<std::time::Instant>,
     /// Whether `override_layout` (if currently Some) was set by a Sync
-    /// Group Command application (the sync_apply_timer firing, below)
-    /// rather than by a Scheduled Action's own navLayout (which uses
-    /// `override_expiry`/`override_revert_on_completion` instead --
-    /// entirely separate fields, so the two mechanisms never interfere
-    /// with each other). Needed because, unlike a Scheduled Action's
-    /// own override, a Sync Group override has no fixed duration or
-    /// "natural completion" signal of its own to revert on -- a real
-    /// gap found while wiring this up for the first genuine end-to-end
-    /// use: without *some* expiry check, a display that ever applied a
-    /// synchronized layout switch would stay stuck showing that one
-    /// layout forever, never resuming its own normal schedule once the
-    /// underlying Synchronised Event's own scheduled window naturally
-    /// ends. See `schedule_check`'s own expiry check, driven by
-    /// `Schedule::is_sync_gated`.
+    /// Group Command application rather than by a Scheduled Action's
+    /// own navLayout (which uses `override_expiry`/
+    /// `override_revert_on_completion` instead -- entirely separate
+    /// fields). Needed because, unlike a Scheduled Action's own
+    /// override, a Sync Group override has no fixed duration or
+    /// "natural completion" signal to revert on -- without some expiry
+    /// check, a display that applied a synchronized switch would stay
+    /// stuck showing that layout forever. See `schedule_check`'s own
+    /// expiry check, driven by `Schedule::is_sync_gated`.
     sync_layout_active: bool,
     /// (Lead only.) Fires once per Follower connection accept_loop
     /// accepts -- `never()` for a Follower's own SyncGroup, or when
@@ -1695,18 +1668,14 @@ impl Handler {
     }
 
     /// Send a NotifyStatus update to the CMS with the current layout
-    /// id and other status fields. Previously only ever called once
-    /// per full collection cycle (which can be minutes apart) -- the
-    /// CMS's own "Current Layout" display would lag behind actual
-    /// layout switches by however long a collection cycle takes.
-    /// Called immediately on every real layout change (FromGui::Showing,
-    /// see `run()`'s own select! loop) *if*
-    /// settings.send_current_layout_as_status_update allows it (a real
-    /// CMS-controlled setting -- see that field's own doc comment),
-    /// in addition to still being called unconditionally once per
-    /// collection. Logs (not propagates) any error -- a failed status
-    /// update shouldn't be fatal, especially when called from a
-    /// context (a real-time layout switch) that isn't itself inside a
+    /// id and other status fields. Previously only called once per
+    /// full collection cycle (minutes apart) -- the CMS's own "Current
+    /// Layout" display would lag behind actual switches. Called
+    /// immediately on every real layout change (FromGui::Showing) if
+    /// settings.send_current_layout_as_status_update allows it, in
+    /// addition to still being called once per collection. Logs (not
+    /// propagates) any error -- a failed status update shouldn't be
+    /// fatal, especially from a context that isn't itself inside a
     /// `Result`-returning function.
     fn send_status_update(&mut self) {
         let (avail, total) = match util::space_info(self.cache.dir()) {
@@ -1761,24 +1730,16 @@ impl Handler {
     /// Flush any accumulated player fault reports to the CMS. Same
     /// batching/requeue-on-failure approach as `flush_stats` above.
     /// Skipped entirely if the endpoint version doesn't support it --
-    /// ReportFaults is v6/v7-only (see faults.rs's own doc comment),
-    /// and this call used to run completely unguarded: every attempt
-    /// against a v5 endpoint (arexibo's own default for a long time)
-    /// would fail with a "not present" SOAP fault every single cycle,
-    /// forever, without ever successfully reporting anything -- a
-    /// wasted network round-trip each cycle, and faults requeued
-    /// indefinitely until FaultCollector's own MAX_PENDING cap started
-    /// silently dropping the oldest ones.
+    /// ReportFaults is v6/v7-only (see faults.rs's own doc comment);
+    /// running it unguarded against a v5 endpoint would fail every
+    /// cycle forever, wasting a round-trip and requeuing faults
+    /// indefinitely.
     ///
-    /// Unlike GetWeather (which also gates on this same version check,
-    /// but *additionally* learns "unsupported" at runtime, since a
-    /// v6/v7-capable endpoint can still fail for an entirely separate,
-    /// only-discoverable-by-trying reason: no weather provider
-    /// configured on the CMS side), there's no second, independent
-    /// failure mode here to learn about -- ReportFaults's own
-    /// availability is fully determined by the endpoint version alone,
-    /// which we already know statically. A runtime-learned flag would
-    /// add complexity without covering any real scenario.
+    /// Unlike GetWeather (which also gates on this version check, but
+    /// additionally learns "unsupported" at runtime for a separate,
+    /// only-discoverable-by-trying reason), ReportFaults's own
+    /// availability is fully determined by the endpoint version alone
+    /// -- no runtime-learned flag needed.
     fn flush_faults(&mut self) {
         if self.faults.is_empty() || !xmds::xmds_supports_v6_v7_methods() {
             return;
@@ -1804,17 +1765,13 @@ impl Handler {
 
     /// Publishes `sync_keys` to every connected Follower (a no-op for
     /// a Follower's own SyncGroup, or when self.sync_group is None)
-    /// and stages it locally exactly the same way an incoming
-    /// Follower Command does (see sync_apply_timer's own doc comment)
-    /// -- using the same switch_delay this Lead just told every
-    /// Follower to expect, so this display converges on
-    /// (approximately) the same real-world target instant as the rest
-    /// of the group, rather than switching immediately while
-    /// Followers are still catching up. Shared by schedule_check
-    /// (a genuinely new sync-gated layout) and the sync_peer_connected
-    /// handler (re-synchronizing everyone once a new/reconnecting
-    /// Follower shows up, even for an *already*-active layout it
-    /// needs its own timers restarted for).
+    /// and stages it locally the same way an incoming Follower Command
+    /// does -- using the same switch_delay this Lead just told every
+    /// Follower to expect, so this display converges on approximately
+    /// the same real-world target instant. Shared by schedule_check (a
+    /// genuinely new sync-gated layout) and the sync_peer_connected
+    /// handler (re-synchronizing everyone for an already-active layout
+    /// too).
     fn stage_sync_switch(&mut self, sync_keys: Vec<String>) {
         if let Some(sync_group) = &self.sync_group {
             sync_group.publish_sync_keys(sync_keys.clone());
@@ -1824,23 +1781,19 @@ impl Handler {
         self.sync_apply_timer = after(delay);
     }
 
-    /// Resolves a received sync_keys set (from a Sync Group Command,
-    /// whether this display's own or the Lead's) against *this
-    /// display's own* schedule and cache -- returns the layout id to
-    /// actually apply, or None if this display isn't part of this
-    /// particular synchronized grouping at all right now.
+    /// Resolves a received sync_keys set against this display's own
+    /// schedule and cache -- returns the layout id to apply, or None
+    /// if this display isn't part of this synchronized grouping right
+    /// now.
     ///
     /// Deliberately never trusts a layout id carried over the network
-    /// (there isn't one in the wire protocol at all -- see
+    /// (there isn't one in the wire protocol -- see
     /// syncgroup::Message::Command's own doc comment): for Mirror
-    /// Sync, every display's own schedule names the same layout
-    /// anyway, so this naturally resolves to it independently on each
-    /// one; for Wall Sync (each display shows a *different* layout of
-    /// a shared composition -- not yet exercised with real data, but
-    /// the whole reason this function exists rather than just using
-    /// the Lead's own id directly), this is what lets each display
-    /// find *its own* correct layout instead of blindly showing
-    /// whichever one the Lead happens to have.
+    /// Sync, every display's own schedule names the same layout, so
+    /// this resolves independently on each; for Wall Sync (each
+    /// display shows a different layout of a shared composition), this
+    /// is what lets each display find its own correct layout instead
+    /// of blindly using the Lead's own id.
     fn resolve_layout_for_sync_keys(&mut self, sync_keys: &[String]) -> Option<i64> {
         let candidate = self.schedule.active_sync_gated_layout(&self.criteria)?;
         if self.cache.get_layout(candidate).is_none() {
@@ -1881,28 +1834,16 @@ impl Handler {
         info.sync_keys.iter().any(|k| sync_keys.contains(k)).then_some(candidate)
     }
 
-    /// Called once `retry_and_download_layout` has just successfully
-    /// caught this display's own cache up on `candidate` -- this
-    /// display's own region/playlist timers would otherwise start
-    /// "now" (whenever this download just finished) rather than at
-    /// the Lead's own originally-published target_time, which could
-    /// already be a real, if small, amount of time in the past by now
-    /// (the Lead published it, this display noticed it was missing
-    /// the layout, retried RequiredFiles, downloaded, and translated
-    /// it -- all real elapsed time). Applying immediately would show
-    /// the *correct content*, but drifted in time from the rest of
-    /// the group -- the same class of problem the reconnect-on-expiry
-    /// mechanism exists to avoid. Reconnecting here (Follower only --
-    /// a Lead has nothing to reconnect *to* for its own locally-
-    /// discovered switches) re-triggers the Lead's own
-    /// `sync_peer_connected` reaction, which re-publishes a *fresh*
-    /// target_time -- this display then applies via that normal,
-    /// freshly-coordinated Command instead of right here, so it
-    /// converges on the same real-world instant as everyone else
-    /// rather than one of its own making. A separate method
-    /// specifically so this reaction is directly testable without
-    /// needing a mock capable of a full RequiredFiles+GetFile round
-    /// trip just to reach it.
+    /// Called once `retry_and_download_layout` has just caught this
+    /// display up on `candidate`. Applying the switch immediately
+    /// would start region/playlist timers "now" instead of at the
+    /// Lead's own originally-published target_time (already somewhat
+    /// in the past) -- correct content, but drifted timing.
+    /// Reconnecting (Follower only) re-triggers the Lead's own
+    /// `sync_peer_connected` reaction, publishing a fresh target_time
+    /// to converge on instead. A separate method so this is directly
+    /// testable without a mock capable of a full RequiredFiles+GetFile
+    /// round trip.
     fn reconnect_after_catching_up_on_own(&mut self, candidate: i64) {
         log::info!("Sync Group: layout {candidate} now downloaded -- reconnecting to \
                     get a freshly-coordinated sync from the Lead instead of applying \
@@ -2154,23 +2095,17 @@ impl Handler {
         }
     }
 
-    /// Handles an incoming webhook trigger code -- from either XMR's own
-    /// pushed `triggerWebhook` action, or a direct HTTP POST to
-    /// `/trigger` (see server::TriggerRequest). First checks for a
-    /// matching Scheduled Action (schedule::ActionTarget -- a
-    /// schedule-level "listen for this code, then Navigate to a Layout
-    /// or run a Command", reachable regardless of what's currently
-    /// showing), falling back to the older, narrower mechanism (an
-    /// in-page widget-embedded action, only reachable while its own
-    /// layout/widget happens to already be on screen) if no Scheduled
-    /// Action matches -- otherwise a trigger could do nothing at all
-    /// when the current layout had no matching widget-embedded action,
-    /// but the actual configured action was a Scheduled Action
-    /// targeting a different layout entirely.
+    /// Handles an incoming webhook trigger code -- from either XMR's
+    /// own pushed `triggerWebhook` action, or a direct HTTP POST to
+    /// `/trigger`. First checks for a matching Scheduled Action
+    /// (schedule-level, reachable regardless of what's on screen),
+    /// falling back to the older in-page widget-embedded mechanism
+    /// (only reachable while its own layout is showing) if none
+    /// matches.
     ///
-    /// Returns true if the caller (run()'s own select! loop) should
-    /// force an immediate collection -- the resolved target layout of a
-    /// matched navLayout action isn't cached yet.
+    /// Returns true if the caller should force an immediate collection
+    /// -- the resolved target layout of a matched navLayout action
+    /// isn't cached yet.
     fn handle_trigger_code(&mut self, code: &str) -> bool {
         let now = OffsetDateTime::now_local().unwrap();
         // Cloned immediately to release the borrow on self.schedule --
@@ -2483,24 +2418,19 @@ impl Handler {
         };
     }
 
-    /// Checks and clears `force_reload_after_collect` (see its own
-    /// doc comment) -- called right after every `collect_once()`
-    /// completes, regardless of success or failure. A separate method
-    /// specifically so this is directly testable without needing to
-    /// drive the whole (infinite, blocking) `run()` loop just to
-    /// reach it.
+    /// Checks and clears `force_reload_after_collect` -- called right
+    /// after every `collect_once()` completes. A separate method so
+    /// this is directly testable without driving the whole `run()`
+    /// loop.
     ///
-    /// Only actually fires the reload once two things are confirmed:
-    /// the current layout's own translated HTML is present on disk
-    /// (catches a translation failure even if the raw download
-    /// succeeded), and this cycle's download_required_files() call
-    /// reported zero failures for any media/layout file (see
-    /// `last_collect_had_failures`'s own doc comment for why
-    /// "resource" failures don't count). Otherwise navigating could
-    /// hit a genuinely missing target (a live browser 404, stuck
-    /// until the schedule is deleted) -- worse than staying on the
-    /// current, stale-but-rendered page a moment longer. If either
-    /// check fails, the flag stays set for the next collection cycle.
+    /// Only fires once two things are confirmed: the current layout's
+    /// own translated HTML is on disk (catches a translation failure
+    /// even if the raw download succeeded), and this cycle reported
+    /// zero media/layout failures (see `last_collect_had_failures`'s
+    /// own doc comment for why "resource" failures don't count).
+    /// Otherwise navigating could hit a missing target (a live browser
+    /// 404) -- worse than staying on the current page a moment longer.
+    /// If either check fails, the flag stays set for the next cycle.
     fn maybe_force_reload_after_purge(&mut self) {
         if self.force_reload_after_collect {
             let html_path = self.cache.dir().join(format!("{}.xlf.html", self.current_layout));
