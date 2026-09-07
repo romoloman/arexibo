@@ -243,6 +243,43 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
             var h = parseFloat(params.get('arexiboShrinkH'));
             if (!(w > 0) || !(h > 0)) return;
 
+            // BUG in the CMS's own bundle.min.js: xiboIframeScaler's
+            // modeid==3 (Best Fit) branch guards its own scaleOverride
+            // handling with `0 !== e.scaleOverride` -- true whenever
+            // scaleOverride is simply absent from a widget's own
+            // properties (undefined, not 0), which is the normal case
+            // for a Best Fit widget with no scaling override entered in
+            // the CMS UI. That wrongly recomputes the scale as
+            // `previewWidth/scaleOverride` and `previewHeight/
+            // scaleOverride` -- both undefined here too -- producing
+            // `scale(NaN)`, invalid CSS the browser silently drops,
+            // leaving the iframe at its own unscaled native size
+            // instead of fit to the real region.
+            //
+            // Worked around here by forcing scaleOverride to a real 0
+            // on every onRender_<mid> call's own properties argument
+            // before letting the original run, whenever the widget
+            // hasn't set one itself -- matching the value the CMS's own
+            // loose check was clearly meant to require.
+            var patchedOnRender = {};
+            var onRenderPatchInterval = setInterval(function() {
+                for (var key in window) {
+                    if (patchedOnRender[key]) continue;
+                    if (!/^onRender_\d+$/.test(key)) continue;
+                    if (typeof window[key] !== 'function') continue;
+                    patchedOnRender[key] = true;
+                    var original = window[key];
+                    window[key] = function() {
+                        var props = arguments[3];
+                        if (props && typeof props.scaleOverride !== 'number') {
+                            props.scaleOverride = 0;
+                        }
+                        return original.apply(this, arguments);
+                    };
+                }
+            }, 20);
+            setTimeout(function() { clearInterval(onRenderPatchInterval); }, 10000);
+
             // A drawer-swapped widget's own inline script sets
             // `window.globalOptions = { originalWidth, originalHeight,
             // ... }` baked in at translation time to match the
@@ -281,6 +318,29 @@ void setup(const char *base_uri, const char *screen, int inspect, int debug,
             function tryShrink() {
                 var body = document.body;
                 if (!body) return;
+                // The native PDF widget (canvas#the-canvas) already
+                // computes its own correct, aspect-ratio-preserving fit
+                // inside its own onInitialize_<id> script (comparing
+                // $(window).width/height against the PDF's own native
+                // page size) -- shrinking body on top of that distorts
+                // an already-correct, intentionally letterboxed result.
+                if (document.getElementById('the-canvas')) return;
+                // Generic version of the same check: some widget types
+                // (webpage Best Fit/Manual Position, navigate) already
+                // had xiboIframeScaler apply a transform of its own to
+                // some element (not necessarily #iframe) -- shrinking
+                // body on top of that would compound the two transforms
+                // multiplicatively, squashing the content far smaller
+                // than intended.
+                var alreadyScaledByCms = false;
+                var candidates = body.querySelectorAll('*');
+                for (var ci = 0; ci < candidates.length; ci++) {
+                    if (candidates[ci].style && candidates[ci].style.transform) {
+                        alreadyScaledByCms = true;
+                        break;
+                    }
+                }
+                if (alreadyScaledByCms) return;
                 body.style.transform = '';
                 // Constrain available width to the real target first,
                 // so responsive content can reflow/wrap at its own
