@@ -146,10 +146,14 @@ fn main_inner() -> anyhow::Result<()> {
     // Control webhook triggers (/trigger, see server.rs's own
     // TriggerRequest).
     let (trigger_tx, trigger_rx) = crossbeam_channel::bounded(20);
+    // Same reasoning as duration_tx/duration_rx, for Interactive
+    // Control fault reports (/fault, see server.rs's own
+    // FaultRequest).
+    let (fault_tx, fault_rx) = crossbeam_channel::bounded(20);
 
     let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
                                               args.allow_offline, args.debug,
-                                              togui_tx, fromgui_rx, duration_rx, trigger_rx)
+                                              togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx)
         .context("creating backend handler")?;
     let mut settings = handler.player_settings();
 
@@ -186,7 +190,7 @@ fn main_inner() -> anyhow::Result<()> {
     let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
     let port = server::effective_port(settings.embedded_server_port);
     let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
-                                         duration_tx.clone(), trigger_tx.clone(), local_data.clone())
+                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
     let shard_port = webserver.port();
@@ -213,7 +217,7 @@ fn main_inner() -> anyhow::Result<()> {
         for shard in 2..=server::HTML_SHARD_COUNT {
             let addr = format!("127.0.0.{shard}");
             let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
-                                                     duration_tx.clone(), trigger_tx.clone(), local_data.clone())
+                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone())
                 .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
             shard_server.start_pool();
         }

@@ -56,6 +56,21 @@ pub struct TriggerRequest {
     pub code: String,
 }
 
+/// A fault reported by a Widget's own JS via `xiboIC.reportFault({code,
+/// reason}, ...)`, POSTing JSON to `/fault` on this embedded server --
+/// confirmed from a real `bundle.min.js`: `{ code, key, reason, ttl }`
+/// (`key`/`ttl` are for the JS library's own local dedup and aren't
+/// part of the XMDS `ReportFaults` payload the CMS actually expects,
+/// see faults.rs's own doc comment -- deliberately not modeled here).
+/// Relayed to the mainloop (see mainloop.rs's `Handler::run` select!
+/// loop), which owns the `FaultCollector`/XMDS connection this
+/// worker thread has no direct access to.
+#[derive(Debug, Clone)]
+pub struct FaultRequest {
+    pub code: i32,
+    pub reason: String,
+}
+
 /// How many distinct loopback origins (`127.0.0.1` through
 /// `127.0.0.{HTML_SHARD_COUNT}`) the embedded server is bound to (see
 /// main.rs) -- `layout.rs::write_media` picks one per `render="html"`
@@ -111,6 +126,7 @@ pub struct Server {
     server: tiny_http::Server,
     duration_tx: Sender<DurationRequest>,
     trigger_tx: Sender<TriggerRequest>,
+    fault_tx: Sender<FaultRequest>,
     local_data: LocalDataStore,
 }
 
@@ -121,11 +137,12 @@ impl Server {
     /// same `dir`, to different loopback addresses.
     pub fn new(dir: PathBuf, bind_addr: &str, port: u16,
                duration_tx: Sender<DurationRequest>, trigger_tx: Sender<TriggerRequest>,
+               fault_tx: Sender<FaultRequest>,
                local_data: LocalDataStore) -> Result<Self> {
         let server = tiny_http::Server::http((bind_addr, port))
             .map_err(|e| anyhow!(e))?;
         let dir = dir.canonicalize().context("getting canonical server dir name")?;
-        Ok(Self { dir, server, duration_tx, trigger_tx, local_data })
+        Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, local_data })
     }
 
     pub fn port(&self) -> u16 {
@@ -139,11 +156,12 @@ impl Server {
             let dir = self.dir.clone();
             let duration_tx = self.duration_tx.clone();
             let trigger_tx = self.trigger_tx.clone();
+            let fault_tx = self.fault_tx.clone();
             let local_data = self.local_data.clone();
             thread::spawn(move || {
                 loop {
                     let mut req = server.recv().unwrap();
-                    match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &local_data) {
+                    match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx, &local_data) {
                         Ok(resp) => {  let _ = req.respond(resp); }
                         Err(e) => {
                             log::warn!("processing HTTP req {}: {:#}", req.url(), e);
@@ -200,7 +218,31 @@ impl Server {
             .boxed())
     }
 
-    /// Serve a single HTTP request. Thin wrapper around `serve_inner`
+    /// Handle an Interactive Control fault report (`POST /fault` --
+    /// see FaultRequest's own doc comment for the confirmed payload
+    /// shape). Same ACK convention as handle_duration/handle_trigger
+    /// (200 `{}`, not 204) for the same real-compatibility reason.
+    fn handle_fault(req: &mut Request, fault_tx: &Sender<FaultRequest>) -> Result<ResponseBox> {
+        let mut body = String::new();
+        req.as_reader().read_to_string(&mut body).context("reading fault request body")?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("parsing fault request body: {body:?}"))?;
+        // Lenient on `code`'s own type (a widget author could plausibly
+        // pass a string) -- default to 0 rather than rejecting the
+        // whole report over a malformed/missing code, same spirit as
+        // handle_duration's own handling of an absent `duration`.
+        let code = json.get("code")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0) as i32;
+        let reason = json.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // Best-effort, same reasoning as handle_duration's own send.
+        let _ = fault_tx.send(FaultRequest { code, reason });
+        Ok(Response::from_data(b"{}".as_slice())
+            .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            .boxed())
+    }
+
+
     /// (which keeps all of its existing early-return branches
     /// unchanged) purely to apply `Cache-Control: no-store` uniformly
     /// to every successful response, regardless of which of
@@ -212,13 +254,15 @@ impl Server {
     /// the same iframe src. Every response here can legitimately change
     /// over time -- no-store is the strongest, least ambiguous fix.
     fn serve(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
-             trigger_tx: &Sender<TriggerRequest>, local_data: &LocalDataStore) -> Result<ResponseBox> {
-        let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, local_data)?;
+             trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
+             local_data: &LocalDataStore) -> Result<ResponseBox> {
+        let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, local_data)?;
         Ok(resp.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()))
     }
 
     fn serve_inner(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
-                    trigger_tx: &Sender<TriggerRequest>, local_data: &LocalDataStore) -> Result<ResponseBox> {
+                    trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
+                    local_data: &LocalDataStore) -> Result<ResponseBox> {
         log::debug!("HTTP request: {}", req.url());
         let url = req.url();
         let (path_only, query) = url.split_once('?').unwrap_or((url, ""));
@@ -246,6 +290,11 @@ impl Server {
             // `req.url()` includes the query regardless of method, and
             // nothing here branches on method at all).
             "/trigger" => return Self::handle_trigger(query, trigger_tx),
+
+            // Interactive Control fault report (see FaultRequest's own
+            // doc comment) -- xiboIC.reportFault() in a widget's own
+            // JS.
+            "/fault" => return Self::handle_fault(req, fault_tx),
 
             // Real-time DataSet data lookup -- confirmed from a real
             // `bundle.min.js` the user shared: `xiboIC.getData(dataKey,
@@ -461,8 +510,9 @@ mod realtime_tests {
         fs::write(dir.join("testfile.txt"), "static file content\n").unwrap();
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, local_data.clone()).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data.clone()).unwrap();
         let port = server.port();
         server.start_pool();
         (port, local_data)
@@ -501,8 +551,9 @@ mod realtime_tests {
         fs::create_dir_all(&dir).unwrap();
         let (duration_tx, _duration_rx) = unbounded();
         let (trigger_tx, trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -522,8 +573,9 @@ mod realtime_tests {
         fs::create_dir_all(&dir).unwrap();
         let (duration_tx, _duration_rx) = unbounded();
         let (trigger_tx, trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -544,8 +596,9 @@ mod realtime_tests {
         fs::create_dir_all(&dir).unwrap();
         let (duration_tx, _duration_rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -596,8 +649,9 @@ mod stable_port_tests {
         fs::create_dir_all(&dir).unwrap();
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
         assert_eq!(server.port(), EMBEDDED_SERVER_PORT,
                    "the embedded server must use the fixed, stable port constant, \
                     not a randomly OS-assigned one -- otherwise cached widget iframe \
@@ -620,8 +674,9 @@ mod no_cache_header_tests {
         fs::write(dir.join("testfile.txt"), "hello").unwrap();
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -699,8 +754,9 @@ mod json_content_type_tests {
         fs::write(dir.join("4543.json"), r#"{"data":[]}"#).unwrap();
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
         let port = server.port();
         server.start_pool();
 

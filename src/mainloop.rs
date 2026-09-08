@@ -293,6 +293,10 @@ pub struct Handler {
     /// Same reasoning as duration_rx, for Interactive Control webhook
     /// triggers (see server.rs's TriggerRequest).
     trigger_rx: Receiver<server::TriggerRequest>,
+    /// Same reasoning as duration_rx, for Interactive Control fault
+    /// reports (see server.rs's FaultRequest) -- recorded into `faults`
+    /// above, then flushed to the CMS the same way as any other fault.
+    fault_rx: Receiver<server::FaultRequest>,
     /// Whether `--debug` was passed on the command line -- if so, the
     /// CMS's own `logLevel` Display Profile setting (see
     /// `PlayerSettings::log_level_filter`) is never applied, so the
@@ -447,7 +451,8 @@ impl Handler {
                no_verify: bool, allow_offline: bool, debug_override: bool,
                to_gui: Sender<ToGui>, from_gui: Receiver<FromGui>,
                duration_rx: Receiver<server::DurationRequest>,
-               trigger_rx: Receiver<server::TriggerRequest>) -> Result<Self> {
+               trigger_rx: Receiver<server::TriggerRequest>,
+               fault_rx: Receiver<server::FaultRequest>) -> Result<Self> {
         let (privkey, pubkey) = load_or_create_keypair(envdir)?;
         let mut cache = Cache::new(cms, envdir.join("res"), clear_cache, no_verify)
             .context("creating cache")?;
@@ -609,7 +614,7 @@ impl Handler {
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(),
                                  shell_process: None, last_command_success: None,
-                                 duration_rx, trigger_rx, overlay_expiry: never(),
+                                 duration_rx, trigger_rx, fault_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
                                  sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None, suppress_local_discovery_of: None,
@@ -656,7 +661,7 @@ impl Handler {
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(),
                                  shell_process: None, last_command_success: None,
-                                 duration_rx, trigger_rx, overlay_expiry: never(),
+                                 duration_rx, trigger_rx, fault_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
                                  sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None, suppress_local_discovery_of: None,
@@ -1199,6 +1204,15 @@ impl Handler {
                     if self.handle_trigger_code(&req.code) {
                         collect = after(Duration::from_secs(0));
                     }
+                },
+                // Same reasoning as duration_rx just above, for
+                // Interactive Control fault reports -- record into the
+                // same FaultCollector used internally (see faults.rs),
+                // flushed the next time flush_faults runs (end of the
+                // current/next collection cycle, same as any other
+                // recorded fault).
+                recv(self.fault_rx) -> req => if let Ok(req) = req {
+                    self.faults.record(faults::Fault::new(req.code, req.reason));
                 }
             }
         }
@@ -3056,9 +3070,10 @@ mod pending_auth_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx)
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx)
             .expect("must construct successfully, not error out, while pending authorization");
         assert!(handler.pending_auth, "must be marked as pending authorization");
         assert_eq!(handler.player_settings(), PlayerSettings::default(),
@@ -3079,10 +3094,11 @@ mod pending_auth_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         // Call 1 (inside Handler::new itself).
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx)
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx)
             .expect("must construct successfully while pending");
         assert!(handler.pending_auth);
         assert_eq!(mock.call_count(), 1);
@@ -3178,10 +3194,11 @@ mod deauthorization_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         // Call 1 (Handler::new, "READY"): normal, authorized startup.
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert!(!handler.pending_auth);
         // Simulate "already running, showing some real content" --
         // schedule_check() only ever populates this from a real,
@@ -3269,9 +3286,10 @@ mod pending_network_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx)
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx)
             .expect("must construct successfully, not bail out, when the network/CMS \
                      is unreachable and no cache exists yet");
         assert!(handler.pending_network, "must be marked as pending network specifically");
@@ -3363,10 +3381,11 @@ mod sticky_ws_address_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         // Call 1 (inside Handler::new): gets the real address.
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         // Call 2 (collect_once): CMS now says zmq/empty -- must NOT
@@ -3392,9 +3411,10 @@ mod sticky_ws_address_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
@@ -3418,9 +3438,10 @@ mod sticky_ws_address_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "");
 
         let _ = handler.collect_once();
@@ -3443,9 +3464,10 @@ mod sticky_ws_address_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
@@ -3472,9 +3494,10 @@ mod sticky_ws_address_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:8080");
 
         let _ = handler.collect_once();
@@ -3566,9 +3589,10 @@ mod port_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         assert!(!envdir.join("res").join("leftover.html").exists(),
                 "a changed embedded server port must force a full cache purge -- \
@@ -3594,9 +3618,10 @@ mod port_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         assert!(envdir.join("res").join("leftover.html").exists(),
                 "an unchanged effective port must not purge the cache");
@@ -3617,9 +3642,10 @@ mod port_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.embedded_server_port, 9696);
 
         let err = handler.collect_once().expect_err(
@@ -3641,9 +3667,10 @@ mod port_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert!(!handler.settings.embedded_server_allow_wan);
 
         let err = handler.collect_once().expect_err(
@@ -3663,9 +3690,10 @@ mod port_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // May still error further down (e.g. RequiredFiles against
         // this minimal mock) -- what matters is it's not RestartRequired.
@@ -3735,9 +3763,10 @@ mod version_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         assert!(!envdir.join("res").join("leftover.html").exists(),
                 "a changed Arexibo version must force a full cache purge -- cached \
@@ -3764,9 +3793,10 @@ mod version_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         assert!(envdir.join("res").join("leftover.html").exists(),
                 "an unchanged version must not purge the cache");
@@ -3785,9 +3815,10 @@ mod version_change_forces_cache_purge_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         assert!(envdir.join("res").join("preexisting.html").exists(),
                 "a first-ever run (no prior arexibo.json) must not purge -- nothing \
@@ -3870,9 +3901,10 @@ mod send_status_update_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // Simulate exactly what FromGui::Showing(layout) does in run()'s
         // own select! loop -- without needing to drive that full,
@@ -3903,9 +3935,10 @@ mod send_status_update_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         handler.settings.send_current_layout_as_status_update = false;
 
         handler.current_layout = 4242;
@@ -3933,9 +3966,10 @@ mod send_status_update_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         handler.send_status_update();
 
         let requests = captured.lock().unwrap();
@@ -3993,9 +4027,10 @@ mod sync_role_change_forces_restart_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.sync_role, SyncRole::None);
 
         let err = handler.collect_once().expect_err(
@@ -4012,9 +4047,10 @@ mod sync_role_change_forces_restart_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.sync_role, SyncRole::Lead);
 
         let err = handler.collect_once().expect_err(
@@ -4038,9 +4074,10 @@ mod sync_role_change_forces_restart_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         assert_eq!(handler.settings.sync_role,
                    SyncRole::Follower { lead_addr: "192.168.1.235".into() });
 
@@ -4063,9 +4100,10 @@ mod sync_role_change_forces_restart_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         if let Err(e) = handler.collect_once() {
             assert!(e.root_cause().downcast_ref::<RestartRequired>().is_none(),
@@ -4088,9 +4126,10 @@ mod sync_role_change_forces_restart_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // Handler::new's own initial registration already resolved
         // sync_role to Lead (confirmed by the mock's own "lead" value
@@ -4176,8 +4215,9 @@ mod handle_trigger_code_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         Handler::new(&cms, false, &envdir, true, true, false,
-                     togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap()
+                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap()
     }
 
     /// A minimal <actions> Schedule, matching the real capture's own
@@ -4427,9 +4467,10 @@ mod xmr_disconnected_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // Sanity check: clear whatever xmr_retry_key ended up as from
         // construction (e.g. if the mock's bare "READY" response, with
@@ -4537,9 +4578,10 @@ mod sticky_address_applies_to_first_connection_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // The in-memory settings must reflect the corrected address...
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, good_address);
@@ -4820,9 +4862,10 @@ mod screenshot_requested_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         let _ = count_screenshot_messages(&togui_rx);
 
         handler.settings.screen_shot_requested = true;
@@ -4985,9 +5028,10 @@ mod attempt_cms_migration_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // A second, independent CMS to "migrate" to -- also validates
         // successfully.
@@ -5018,9 +5062,10 @@ mod attempt_cms_migration_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // new_cms_address/new_cms_key left empty (the default, no
         // migration requested) -- must not error at all.
@@ -5138,8 +5183,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         handler.rearm_data_refresh_timer();
 
@@ -5157,8 +5203,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // Must not panic, and must leave the timer disarmed afterward
         // (re-confirms rearm gets called even with nothing to do).
@@ -5182,8 +5229,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
 
         // With the flag unset (the ordinary case, every other
@@ -5228,8 +5276,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
 
         // The flag is set, but 4242.xlf.html was never actually
@@ -5292,8 +5341,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
 
         handler.current_layout = 4242;
@@ -5329,8 +5379,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
         handler.current_layout = 4242;
 
@@ -5389,8 +5440,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // Already fully cached (matching md5, an empty Vec here) --
         // simulating this exact layout having been downloaded in an
@@ -5423,8 +5475,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // Not cached at all -- and start_mock_ready's own GetResource/
         // GetFile-equivalent endpoints aren't wired up to serve real
@@ -5473,8 +5526,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         // Drain whatever update_settings() sent during construction
         // (a ToGui::Settings) so it doesn't get mistaken for the
         // ReloadWidget message this test is actually checking for.
@@ -5512,8 +5566,9 @@ mod data_refresh_timer_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         // Real overlay XML shape (see schedule.rs's own
         // parses_real_overlays_xml_from_user test) -- overlay layout
@@ -5622,8 +5677,9 @@ mod flush_faults_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         handler.faults.record(faults::Fault::new(9001, "test fault"));
         handler.flush_faults();
@@ -5642,8 +5698,9 @@ mod flush_faults_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
 
         handler.flush_faults();
 
@@ -5692,8 +5749,9 @@ mod sync_group_schedule_check_tests {
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx).unwrap();
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
         (handler, togui_rx)
     }
 
