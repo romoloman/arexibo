@@ -1304,6 +1304,22 @@ impl Handler {
     fn collect_once(&mut self) -> Result<()> {
         log::info!("doing collection");
 
+        // A placeholder CmsSettings (see main.rs's own "awaiting_code"
+        // doc comment, for Register via Code / manual entry) has a
+        // genuinely empty address -- register_display() below would
+        // only ever fail on that (an invalid URI, not a real network/
+        // auth problem), and run()'s own caller logs any such failure
+        // at ERROR level (see "during collect: ..."), spamming one
+        // every single collection interval for something completely
+        // expected while waiting for either flow to resolve. Nothing
+        // else in this function has anything useful to do with a blank
+        // address either, so skip the whole cycle quietly instead.
+        if self.cms.address.is_empty() {
+            log::debug!("no CMS address configured yet (Register via Code/manual entry \
+                         pending) -- skipping this collection cycle");
+            return Ok(());
+        }
+
         // call register to get updated player settings
         if let Some(mut settings) = self.xmds.register_display()? {
             // See the matching debug log + doc comment in `Handler::new`
@@ -3140,6 +3156,34 @@ mod pending_auth_tests {
         let _ = handler.collect_once();
         assert!(!handler.pending_auth,
                 "must have transitioned out of pending authorization once the CMS said READY");
+    }
+
+    #[test]
+    fn collect_once_skips_quietly_with_a_blank_placeholder_address() {
+        // Regression test for a real report: main.rs's own placeholder
+        // CmsSettings (address/key both empty, used while awaiting
+        // either Register via Code or manual entry -- see its own
+        // "awaiting_code" doc comment) made collect_once() call
+        // register_display() every single collection interval anyway,
+        // which can only ever fail on the blank address (an invalid
+        // URI, not a real network/auth problem) -- logged by run()'s
+        // own caller as a scary "during collect: ... bad uri: ...
+        // missing scheme" ERROR on every single retry the whole time a
+        // display sat waiting to be registered.
+        let cms = CmsSettings { address: String::new(), key: String::new(),
+                                 display_id: "test-display".into(),
+                                 display_name: None, proxy: None };
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx)
+            .expect("must construct successfully with a blank placeholder address");
+        handler.collect_once().expect(
+            "must not error on a blank placeholder address, just skip the cycle quietly");
     }
 }
 
