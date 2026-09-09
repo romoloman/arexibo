@@ -1597,8 +1597,13 @@ impl Handler {
                 if !is_dependency { result.push((inventory, true)); }
                 continue;
             }
+            let still_present_on_disk = match &file {
+                ReqFile::File { typ: "layout", id, .. } => self.cache.layout_file_exists_on_disk(*id),
+                _ => false,
+            };
             if is_exempt_as_currently_playing_layout(&file, current_scheduleid, schedule,
-                                                      self.settings.expire_modified_layouts) {
+                                                      self.settings.expire_modified_layouts,
+                                                      still_present_on_disk) {
                 // Deliberately deferred (a *different*/modified version
                 // is needed, but this exact layout is currently
                 // playing) -- correctly left unreported either way this
@@ -2832,10 +2837,23 @@ mod timezone_to_report_tests {
 /// must come from the *previous* schedule (the old layout id may no
 /// longer exist in the fresh one); 0 means no real schedule entry,
 /// never exempt.
+///
+/// `still_present_on_disk` (see Cache::layout_file_exists_on_disk's own
+/// doc comment): this whole exemption assumes an older-but-playable
+/// copy is what's keeping the display going while a newer version
+/// waits -- never true once something (e.g. the CMS's own `purgeAll`)
+/// has already deleted the file. Without this guard, a purged
+/// currently-playing layout could never be redownloaded at all: this
+/// same exemption re-fires identically every single cycle afterward
+/// (nothing else about the situation changes), permanently blocking
+/// the one download that would fix it (confirmed from a real report --
+/// the display got stuck on "purge-triggered reload: ... not found on
+/// disk yet" forever).
 fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64,
                                           fresh_schedule: &Schedule,
-                                          expire_modified_layouts: bool) -> bool {
-    if expire_modified_layouts || current_scheduleid == 0 {
+                                          expire_modified_layouts: bool,
+                                          still_present_on_disk: bool) -> bool {
+    if expire_modified_layouts || current_scheduleid == 0 || !still_present_on_disk {
         return false;
     }
     match file {
@@ -4764,7 +4782,7 @@ mod is_exempt_as_currently_playing_layout_tests {
         let current_scheduleid = old_schedule.scheduleid_for(925);
         assert_eq!(current_scheduleid, 224);
         assert!(is_exempt_as_currently_playing_layout(&layout_file(927), current_scheduleid,
-                                                        &fresh_schedule, false),
+                                                        &fresh_schedule, false, true),
                 "a republished layout occupying the same schedule slot must be exempted");
     }
 
@@ -4774,7 +4792,7 @@ mod is_exempt_as_currently_playing_layout_tests {
         let fresh_schedule = schedule_with(913, 225);
         let current_scheduleid = old_schedule.scheduleid_for(925);
         assert!(!is_exempt_as_currently_playing_layout(&layout_file(913), current_scheduleid,
-                                                         &fresh_schedule, false));
+                                                         &fresh_schedule, false, true));
     }
 
     #[test]
@@ -4783,7 +4801,7 @@ mod is_exempt_as_currently_playing_layout_tests {
         let fresh_schedule = schedule_with(927, 224);
         let current_scheduleid = old_schedule.scheduleid_for(925);
         assert!(!is_exempt_as_currently_playing_layout(&layout_file(927), current_scheduleid,
-                                                         &fresh_schedule, true));
+                                                         &fresh_schedule, true, true));
     }
 
     #[test]
@@ -4794,14 +4812,35 @@ mod is_exempt_as_currently_playing_layout_tests {
         let media = ReqFile::File { id: 927, typ: "media", size: 0, md5: vec![], http: false,
                                      path: String::new(), name: String::new(), code: None };
         assert!(!is_exempt_as_currently_playing_layout(&media, current_scheduleid,
-                                                         &fresh_schedule, false));
+                                                         &fresh_schedule, false, true));
     }
 
     #[test]
     fn a_zero_current_scheduleid_never_exempts_anything() {
         let fresh_schedule = schedule_with(927, 224);
         assert!(!is_exempt_as_currently_playing_layout(&layout_file(927), 0,
-                                                         &fresh_schedule, false));
+                                                         &fresh_schedule, false, true));
+    }
+
+    #[test]
+    fn does_not_exempt_a_layout_already_deleted_from_disk() {
+        // Regression test for a real report: `purgeAll` deleted the
+        // currently-playing layout's own file from disk, but this
+        // exemption (meant only to defer redownloading an
+        // *older-but-still-present* copy) kept firing anyway every
+        // cycle afterward -- same scheduleid, nothing about the
+        // situation ever changes on its own -- permanently blocking
+        // the one download that would have recovered the display.
+        // Same setup as `exempts_a_republished_layout_occupying_the_
+        // same_schedule_slot` (which WOULD normally be exempted), but
+        // with `still_present_on_disk: false`.
+        let old_schedule = schedule_with(925, 224);
+        let fresh_schedule = schedule_with(927, 224);
+        let current_scheduleid = old_schedule.scheduleid_for(925);
+        assert!(!is_exempt_as_currently_playing_layout(&layout_file(927), current_scheduleid,
+                                                         &fresh_schedule, false, false),
+                "must not exempt a layout whose file was already deleted from disk, \
+                 regardless of it still matching the currently-playing schedule slot");
     }
 }
 

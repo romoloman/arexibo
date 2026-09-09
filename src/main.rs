@@ -20,6 +20,7 @@ pub mod criteria;
 pub mod faults;
 pub mod adspace;
 pub mod syncgroup;
+pub mod authcode;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -119,20 +120,52 @@ fn main_inner() -> anyhow::Result<()> {
             args.envdir.display());
     let cmscfg = args.envdir.join("cms.json");
 
+    // See the long comment further down (right before this same
+    // variable was previously declared, next to the mainloop thread
+    // spawn) for why this exists at all -- moved up here so the new
+    // "Register via Code" polling thread below can share it with that
+    // same mainloop thread, both ultimately deciding this one process's
+    // own exit code.
+    let exit_code = Arc::new(Mutex::new(1));
+
     // check if we have a CMS config either stored, or given with arguments
-    let cms = if let Some((address, key)) = args.host.zip(args.key) {
+    // `awaiting_code`: true only for the newly-added third case (no
+    // config at all, nothing given on the command line either) -- a
+    // placeholder CmsSettings good enough to let Handler::new/the
+    // embedded webserver start normally (showing the splash screen,
+    // see server.rs's own RegistrationCodeStore) while a background
+    // thread further down actually resolves real settings via
+    // authcode.rs's "Register via Code" exchange, matching the official
+    // Windows/Android players' own "Use Code" button. Never written to
+    // cms.json as-is (see the `if !awaiting_code` guard just below) --
+    // doing so would permanently "brick" a fresh totem into thinking
+    // it's configured with a blank address/key on every future boot.
+    let (cms, awaiting_code) = if let Some((address, key)) = args.host.zip(args.key) {
         let display_id = args.display_id.unwrap_or_else(util::get_display_id);
-        config::CmsSettings { address, key, display_id,
-                              display_name: args.display_name,
-                              proxy: args.proxy }
+        (config::CmsSettings { address, key, display_id,
+                               display_name: args.display_name,
+                               proxy: args.proxy }, false)
     } else if let Ok(from_json) = config::CmsSettings::from_file(&cmscfg) {
-        from_json
+        (from_json, false)
     } else {
-        anyhow::bail!("cms.json not found or invalid, run with the --host and --key \
-                       options to reconfigure");
+        let display_id = args.display_id.clone().unwrap_or_else(util::get_display_id);
+        (config::CmsSettings { address: String::new(), key: String::new(), display_id,
+                                display_name: args.display_name.clone(),
+                                proxy: args.proxy.clone() }, true)
     };
 
-    cms.to_file(&cmscfg).context("writing new CMS config")?;
+    if !awaiting_code {
+        cms.to_file(&cmscfg).context("writing new CMS config")?;
+    }
+    // A placeholder CmsSettings means `register_display()` inside
+    // Handler::new is certain to fail (blank address/key) -- forcing
+    // allow_offline here (regardless of what was actually passed on the
+    // command line) is what makes Handler::new take its own existing
+    // "CMS unreachable, no cache either, show the splash and retry
+    // quietly" path (pending_network, see mainloop.rs) instead of
+    // bailing the whole process out over a failure that is, in this
+    // one specific case, entirely expected.
+    let allow_offline = args.allow_offline || awaiting_code;
 
     // create the backend handler and required channels
     let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
@@ -152,7 +185,7 @@ fn main_inner() -> anyhow::Result<()> {
     let (fault_tx, fault_rx) = crossbeam_channel::bounded(20);
 
     let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
-                                              args.allow_offline, args.debug,
+                                              allow_offline, args.debug,
                                               togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx)
         .context("creating backend handler")?;
     let mut settings = handler.player_settings();
@@ -170,6 +203,12 @@ fn main_inner() -> anyhow::Result<()> {
     // shared store, not one per shard.
     let local_data: server::LocalDataStore = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashMap::new()));
+    // Same sharing reasoning as local_data, for the "Register via Code"
+    // splash-screen code (see server::RegistrationCodeStore's own doc
+    // comment) -- starts empty even when awaiting_code, populated by
+    // the background thread below once authcode::generate_code actually
+    // returns one.
+    let registration_code: server::RegistrationCodeStore = std::sync::Arc::new(std::sync::Mutex::new(None));
     // Only the main server's own bind address is affected by
     // embedded_server_allow_wan (for /trigger reachability from
     // outside the display, see Interactive Control's own webhook
@@ -190,7 +229,7 @@ fn main_inner() -> anyhow::Result<()> {
     let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
     let port = server::effective_port(settings.embedded_server_port);
     let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
-                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone())
+                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone(), registration_code.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
     let shard_port = webserver.port();
@@ -217,10 +256,71 @@ fn main_inner() -> anyhow::Result<()> {
         for shard in 2..=server::HTML_SHARD_COUNT {
             let addr = format!("127.0.0.{shard}");
             let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
-                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone())
+                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone(), registration_code.clone())
                 .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
             shard_server.start_pool();
         }
+    }
+
+    // "Register via Code": generate a code, show it on the splash
+    // screen (via registration_code, read by server.rs's splash_html on
+    // every request), and poll for its claim in the background -- see
+    // authcode.rs's own doc comment for the full, confirmed protocol.
+    // Once claimed, this writes the REAL cms.json and asks for a clean
+    // process restart (same exit-code-3 idiom as mainloop::
+    // RestartRequired below, reusing exactly the same systemd
+    // Restart=always recovery already relied on there) -- the next run
+    // finds a real cms.json on disk and proceeds exactly like any
+    // already-configured display, no different code path at all.
+    if awaiting_code {
+        let cmscfg = cmscfg.clone();
+        let display_id = cms.display_id.clone();
+        let display_name = cms.display_name.clone();
+        let proxy = cms.proxy.clone();
+        let registration_code = registration_code.clone();
+        let exit_code = exit_code.clone();
+        std::thread::spawn(move || {
+            let client_version = clap::crate_version!();
+            let generated = match authcode::generate_code(&display_id, client_version, proxy.as_deref()) {
+                Ok(g) => g,
+                Err(e) => {
+                    // Nothing else this thread can usefully do -- the
+                    // splash just keeps showing the hostname/IP as it
+                    // always did (registration_code stays None), same
+                    // as if this feature didn't exist at all. A
+                    // technician can still fall back to the manual
+                    // --host/--key flags.
+                    log::error!("Register via Code: could not generate a code: {e:#}");
+                    return;
+                }
+            };
+            log::info!("Register via Code: showing code {} on screen, waiting for it to be \
+                        entered in the CMS", generated.user_code);
+            *registration_code.lock().unwrap() = Some(generated.user_code.clone());
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                match authcode::check_code(&generated.user_code, &generated.device_code, proxy.as_deref()) {
+                    Ok(Some(claimed)) => {
+                        log::info!("Register via Code: claimed, address={}", claimed.cms_address);
+                        let cms = config::CmsSettings {
+                            address: claimed.cms_address, key: claimed.cms_key,
+                            display_id: display_id.clone(),
+                            display_name: display_name.clone(), proxy: proxy.clone(),
+                        };
+                        if let Err(e) = cms.to_file(&cmscfg) {
+                            log::error!("Register via Code: claimed but failed to write \
+                                         cms.json: {e:#}");
+                            continue;
+                        }
+                        *exit_code.lock().unwrap() = 3;
+                        gui::quit();
+                        return;
+                    }
+                    Ok(None) => {} // not claimed yet, keep polling
+                    Err(e) => log::warn!("Register via Code: checking code: {e:#}"),
+                }
+            }
+        });
     }
 
     // BUG fix (found from a real report: a totem got stuck showing
@@ -257,8 +357,9 @@ fn main_inner() -> anyhow::Result<()> {
     // and let the main thread -- once gui::run() actually returns
     // below, meaning Qt's own teardown has already happened -- be the
     // one that calls std::process::exit(), with nothing left running
-    // that could object to it.
-    let exit_code = Arc::new(Mutex::new(1));
+    // that could object to it. (exit_code itself is declared earlier,
+    // right after cmscfg, so the "Register via Code" thread above can
+    // share it too.)
     let exit_code_for_thread = exit_code.clone();
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run()));

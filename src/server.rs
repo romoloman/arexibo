@@ -121,6 +121,17 @@ pub fn effective_port(cms_reported_port: u16) -> u16 {
 /// same content.
 pub type LocalDataStore = Arc<Mutex<HashMap<String, String>>>;
 
+/// Shared, in-memory holder for the current "Register via Code" user
+/// code (see authcode.rs), if a registration is in progress -- `None`
+/// once resolved (a fresh process start after that always has real CMS
+/// settings, so this is only ever populated during the placeholder-CMS
+/// startup path in main.rs). Read by `splash_html` on every request
+/// (unlike the hostname/IP portion, deliberately NOT cached in the same
+/// `OnceLock`, since the code's own value changes over the lifetime of
+/// a single process run -- absent, then a real code, then arguably
+/// resolved right before the process exits to restart).
+pub type RegistrationCodeStore = Arc<Mutex<Option<String>>>;
+
 pub struct Server {
     dir: PathBuf,
     server: tiny_http::Server,
@@ -128,6 +139,7 @@ pub struct Server {
     trigger_tx: Sender<TriggerRequest>,
     fault_tx: Sender<FaultRequest>,
     local_data: LocalDataStore,
+    registration_code: RegistrationCodeStore,
 }
 
 impl Server {
@@ -138,11 +150,11 @@ impl Server {
     pub fn new(dir: PathBuf, bind_addr: &str, port: u16,
                duration_tx: Sender<DurationRequest>, trigger_tx: Sender<TriggerRequest>,
                fault_tx: Sender<FaultRequest>,
-               local_data: LocalDataStore) -> Result<Self> {
+               local_data: LocalDataStore, registration_code: RegistrationCodeStore) -> Result<Self> {
         let server = tiny_http::Server::http((bind_addr, port))
             .map_err(|e| anyhow!(e))?;
         let dir = dir.canonicalize().context("getting canonical server dir name")?;
-        Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, local_data })
+        Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, local_data, registration_code })
     }
 
     pub fn port(&self) -> u16 {
@@ -158,10 +170,12 @@ impl Server {
             let trigger_tx = self.trigger_tx.clone();
             let fault_tx = self.fault_tx.clone();
             let local_data = self.local_data.clone();
+            let registration_code = self.registration_code.clone();
             thread::spawn(move || {
                 loop {
                     let mut req = server.recv().unwrap();
-                    match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx, &local_data) {
+                    match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx,
+                                       &local_data, &registration_code) {
                         Ok(resp) => {  let _ = req.respond(resp); }
                         Err(e) => {
                             log::warn!("processing HTTP req {}: {:#}", req.url(), e);
@@ -255,14 +269,14 @@ impl Server {
     /// over time -- no-store is the strongest, least ambiguous fix.
     fn serve(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
              trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
-             local_data: &LocalDataStore) -> Result<ResponseBox> {
-        let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, local_data)?;
+             local_data: &LocalDataStore, registration_code: &RegistrationCodeStore) -> Result<ResponseBox> {
+        let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, local_data, registration_code)?;
         Ok(resp.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()))
     }
 
     fn serve_inner(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
                     trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
-                    local_data: &LocalDataStore) -> Result<ResponseBox> {
+                    local_data: &LocalDataStore, registration_code: &RegistrationCodeStore) -> Result<ResponseBox> {
         log::debug!("HTTP request: {}", req.url());
         let url = req.url();
         let (path_only, query) = url.split_once('?').unwrap_or((url, ""));
@@ -272,7 +286,7 @@ impl Server {
             "/branding.png" => Response::from_data(SPLASH_LOGO)
                 .with_header(Header::from_bytes(b"Content-Type", b"image/png").unwrap())
                 .boxed(),
-            "/0.xlf.html" => Response::from_data(splash_html()).boxed(),
+            "/0.xlf.html" => Response::from_data(splash_html(registration_code)).boxed(),
 
             // Interactive Control duration overrides (see
             // xibo-interactive-control's setWidgetDuration/
@@ -429,11 +443,21 @@ impl Server {
 }
 
 // Shows the totem's own hostname/IP on the splash screen -- avoids
-// needing a separate SSH session during setup/CMS authorization.
-// Computed once (OnceLock), shared across every Server instance.
-fn splash_html() -> &'static [u8] {
-    static SPLASH: OnceLock<Vec<u8>> = OnceLock::new();
-    SPLASH.get_or_init(|| {
+// needing a separate SSH session during setup/CMS authorization. The
+// hostname/IP portion is computed once (OnceLock, unchanged from
+// before) and shared across every Server instance; the registration
+// code (see RegistrationCodeStore's own doc comment) is read fresh on
+// every request instead, since -- unlike the hostname/IP -- its value
+// genuinely changes over a single process's lifetime (absent, then a
+// real code, then the process exits to restart once resolved).
+//
+// When a code is present, it's shown ALONGSIDE the hostname/IP line,
+// not instead of it -- both are useful at once during setup (someone
+// might still want to SSH in while also reading off the code to enter
+// in the CMS).
+fn splash_html(registration_code: &RegistrationCodeStore) -> Vec<u8> {
+    static HOSTNAME_LINE: OnceLock<String> = OnceLock::new();
+    let hostname_line = HOSTNAME_LINE.get_or_init(|| {
         let hostname = crate::util::get_display_name();
         let ips = crate::util::get_local_ips();
         let ips_display = if ips.is_empty() {
@@ -441,7 +465,22 @@ fn splash_html() -> &'static [u8] {
         } else {
             ips.join(", ")
         };
-        format!(r#"<!DOCTYPE html>
+        format!("{hostname} &middot; {ips_display}")
+    });
+    let code = registration_code.lock().unwrap().clone();
+    let code_line = match &code {
+        Some(code) => format!(
+            r#"<div style="margin-top: 16px; font-family: sans-serif; font-size: 24px;
+                        color: #555555;">
+  Enter this code in your CMS (Displays &rarr; Add Display (Code)):
+</div>
+<div style="margin-top: 8px; font-family: monospace; font-size: 64px;
+            font-weight: 700; color: #222222; letter-spacing: 0.15em;">
+  {code}
+</div>"#),
+        None => String::new(),
+    };
+    format!(r#"<!DOCTYPE html>
 <html>
 <head>
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
@@ -466,12 +505,12 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
 </div>
 <div style="margin-top: 16px; font-family: sans-serif; font-size: 32px;
             font-weight: 500; color: #555555;">
-  {hostname} &middot; {ips_display}
+  {hostname_line}
 </div>
+{code_line}
 </body>
 </html>
 "#).into_bytes()
-    })
 }
 
 // Shown full-screen at startup, before the first collection completes
@@ -512,7 +551,7 @@ mod realtime_tests {
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data.clone()).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
         (port, local_data)
@@ -553,7 +592,7 @@ mod realtime_tests {
         let (trigger_tx, trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -575,7 +614,7 @@ mod realtime_tests {
         let (trigger_tx, trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -598,7 +637,7 @@ mod realtime_tests {
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -651,7 +690,7 @@ mod stable_port_tests {
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         assert_eq!(server.port(), EMBEDDED_SERVER_PORT,
                    "the embedded server must use the fixed, stable port constant, \
                     not a randomly OS-assigned one -- otherwise cached widget iframe \
@@ -676,7 +715,7 @@ mod no_cache_header_tests {
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -756,7 +795,7 @@ mod json_content_type_tests {
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -776,7 +815,8 @@ mod splash_html_tests {
         // own hostname/IP directly on the splash screen, useful during
         // initial setup and while waiting for CMS authorization,
         // instead of requiring a separate SSH session to check).
-        let html = String::from_utf8(splash_html().to_vec()).unwrap();
+        let no_code: RegistrationCodeStore = Arc::new(Mutex::new(None));
+        let html = String::from_utf8(splash_html(&no_code)).unwrap();
         // The real hostname will vary by machine/CI environment, but it
         // must appear verbatim somewhere in the output.
         let hostname = crate::util::get_display_name();
@@ -797,21 +837,32 @@ mod splash_html_tests {
     }
 
     #[test]
-    fn splash_html_is_computed_once_and_cached() {
-        // The whole point of OnceLock here is to avoid recomputing
-        // (and re-shelling-out to `hostname -I`) on every single
-        // request -- confirm two calls return the exact same bytes
-        // (trivially true if it's genuinely cached; would only differ
-        // if something were regenerating it fresh each time, which
-        // would still normally produce the same content anyway unless
-        // network state changed mid-test, but the *real* guarantee
-        // here is architectural: get_or_init only ever runs its
-        // closure once per process).
-        let first = splash_html();
-        let second = splash_html();
-        assert_eq!(first, second);
-        assert!(std::ptr::eq(first, second),
-                "splash_html() must return the exact same cached buffer \
-                 on repeated calls, not recompute it each time");
+    fn splash_html_shows_a_registration_code_alongside_the_ip_when_one_is_set() {
+        // "Register via Code" (see authcode.rs): when a code is
+        // currently active, it's shown ALONGSIDE the existing
+        // hostname/IP line, not instead of it -- both are useful during
+        // setup at once.
+        let code: RegistrationCodeStore = Arc::new(Mutex::new(Some("ABC123".to_string())));
+        let html = String::from_utf8(splash_html(&code)).unwrap();
+        assert!(html.contains("ABC123"), "must show the active code -- got:\n{html}");
+        let hostname = crate::util::get_display_name();
+        assert!(html.contains(&hostname),
+                "must still show the hostname/IP line alongside an active code -- got:\n{html}");
+    }
+
+    #[test]
+    fn splash_html_reads_the_registration_code_fresh_on_every_call() {
+        // Unlike the hostname/IP portion (genuinely static for a
+        // process's lifetime, and so cached in a OnceLock), the code
+        // itself changes over a single run (absent, then a real code
+        // once authcode::generate_code returns one) -- confirm this
+        // reflects a change between two calls, not a stale first value
+        // baked in and never revisited.
+        let code: RegistrationCodeStore = Arc::new(Mutex::new(None));
+        let before = String::from_utf8(splash_html(&code)).unwrap();
+        assert!(!before.contains("XYZ999"));
+        *code.lock().unwrap() = Some("XYZ999".to_string());
+        let after = String::from_utf8(splash_html(&code)).unwrap();
+        assert!(after.contains("XYZ999"), "must pick up a code set after the first call");
     }
 }

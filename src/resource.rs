@@ -303,6 +303,28 @@ impl Cache {
         }
     }
 
+    /// Whether *some* file exists on disk under the layout `id`'s own
+    /// expected name (`{id}.xlf`), regardless of whether it's the exact
+    /// version the CMS currently wants -- unlike `has()` above (which
+    /// requires an md5 match against the *latest* required version),
+    /// this only asks "is there anything at all still playable here".
+    ///
+    /// Exists specifically for `is_exempt_as_currently_playing_layout`
+    /// in mainloop.rs: that check defers redownloading a currently-
+    /// playing layout's newer version, on the assumption an older-but-
+    /// still-present copy keeps playing fine in the meantime -- an
+    /// assumption that silently breaks once something (confirmed from a
+    /// real report: the CMS's own `purgeAll` command) has already
+    /// deleted the file from disk entirely. Without this check, that
+    /// exemption kept firing forever afterward (same scheduleid, every
+    /// single cycle), permanently skipping the one download that would
+    /// have fixed it -- the display was stuck showing
+    /// "purge-triggered reload: ... not found on disk yet" indefinitely
+    /// instead of ever recovering.
+    pub fn layout_file_exists_on_disk(&self, id: LayoutId) -> bool {
+        self.dir().join(format!("{id}.xlf")).exists()
+    }
+
     pub fn download(&mut self, res: ReqFile, cms: &mut xmds::Cms) -> Result<()> {
         match res {
             ReqFile::Resource { id, layoutid, regionid, mediaid, updated } => {
