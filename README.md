@@ -62,7 +62,9 @@ cargo libdbus-1-dev libzmq3-dev qt6-webengine-dev`.
 ## Usage
 
 Create a new directory where Arexibo can store configuration and media files.
-Then, at first start, use the following command line to configure the player:
+Then, you can use several ways to configure the player:
+
+* at first start, use the following command line 
 
 ```
 arexibo --host <https://my.cms/> --key <key> <dir>
@@ -71,8 +73,21 @@ arexibo --host <https://my.cms/> --key <key> <dir>
 Further configuration options are `--display-id` (which is normally
 auto-generated from machine characteristics) and `--proxy` (if needed).
 
+* or launch
+
+```
+arexibo <dir>
+```
+
+then you are given the opportunity to enter cms address and key directly on the screen or user the code to register arexibo on the cms.
+
 Arexibo will cache the configuration in the directory, so that in the future you
 only need to start with
+
+## other configuration parameters:
+
+--allow-offline: tolerates the CMS being unreachable at startup, falling back to cached settings/content if available, instead of failing outright.
+--no-verify: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
 
 ```
 arexibo <dir>
@@ -106,15 +121,13 @@ WantedBy=multi-user.target
 ```
 
 anyway if audio or dbus are required, as well other settings for touch screen, better use the provided arexibo.service which runs arexibo-kiosk-start and customize that script.
-
+btw they are automatically installed by the .deb package.
 
 ## Useful flags for development
 
     --debug: verbose logging (SOAP calls, internal state transitions).
     --web-debug: logs every JS console message and page error from the rendered content – useful when troubleshooting a specific widget that isn’t displaying correctly.
-    --allow-offline: tolerates the CMS being unreachable at startup, falling back to cached settings/content if available, instead of failing outright.
     --clear: wipes the local file cache (downloaded media/widget pages), forcing a full re-download on next start. Does not affect cached CMS connection settings, it's always recommended to run --clear once after a new git pull or git clone 
-    --no-verify: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
 
 ## Some useful environment variables
 
