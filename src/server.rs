@@ -71,6 +71,21 @@ pub struct FaultRequest {
     pub reason: String,
 }
 
+/// Manual CMS address/key entry from the "Register via Code" splash
+/// screen's own form (see splash_html) -- `POST /register`, `{address,
+/// key}`. A fallback for whenever the code-based flow (authcode.rs)
+/// either isn't wanted or its own third-party service is unreachable;
+/// functionally identical to what `--host`/`--key` already do on the
+/// command line, just entered via touch instead. Relayed to main.rs
+/// (not mainloop.rs -- unlike every other *Request type here, this one
+/// is only ever meaningful before Handler exists at all, while still
+/// resolving a real CmsSettings for the first time).
+#[derive(Debug, Clone)]
+pub struct ManualRegisterRequest {
+    pub address: String,
+    pub key: String,
+}
+
 /// How many distinct loopback origins (`127.0.0.1` through
 /// `127.0.0.{HTML_SHARD_COUNT}`) the embedded server is bound to (see
 /// main.rs) -- `layout.rs::write_media` picks one per `render="html"`
@@ -138,6 +153,7 @@ pub struct Server {
     duration_tx: Sender<DurationRequest>,
     trigger_tx: Sender<TriggerRequest>,
     fault_tx: Sender<FaultRequest>,
+    manual_register_tx: Sender<ManualRegisterRequest>,
     local_data: LocalDataStore,
     registration_code: RegistrationCodeStore,
 }
@@ -147,14 +163,16 @@ impl Server {
     /// `HTML_SHARD_COUNT`'s own doc comment for why main.rs binds
     /// several independent `Server` instances, all serving the exact
     /// same `dir`, to different loopback addresses.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(dir: PathBuf, bind_addr: &str, port: u16,
                duration_tx: Sender<DurationRequest>, trigger_tx: Sender<TriggerRequest>,
-               fault_tx: Sender<FaultRequest>,
+               fault_tx: Sender<FaultRequest>, manual_register_tx: Sender<ManualRegisterRequest>,
                local_data: LocalDataStore, registration_code: RegistrationCodeStore) -> Result<Self> {
         let server = tiny_http::Server::http((bind_addr, port))
             .map_err(|e| anyhow!(e))?;
         let dir = dir.canonicalize().context("getting canonical server dir name")?;
-        Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, local_data, registration_code })
+        Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, manual_register_tx,
+                  local_data, registration_code })
     }
 
     pub fn port(&self) -> u16 {
@@ -169,13 +187,14 @@ impl Server {
             let duration_tx = self.duration_tx.clone();
             let trigger_tx = self.trigger_tx.clone();
             let fault_tx = self.fault_tx.clone();
+            let manual_register_tx = self.manual_register_tx.clone();
             let local_data = self.local_data.clone();
             let registration_code = self.registration_code.clone();
             thread::spawn(move || {
                 loop {
                     let mut req = server.recv().unwrap();
                     match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx,
-                                       &local_data, &registration_code) {
+                                       &manual_register_tx, &local_data, &registration_code) {
                         Ok(resp) => {  let _ = req.respond(resp); }
                         Err(e) => {
                             log::warn!("processing HTTP req {}: {:#}", req.url(), e);
@@ -256,8 +275,29 @@ impl Server {
             .boxed())
     }
 
+    /// Manual CMS address/key entry (`POST /register` -- see
+    /// ManualRegisterRequest's own doc comment). Same ACK convention as
+    /// the other handlers here (200 `{}`).
+    fn handle_manual_register(req: &mut Request,
+                               manual_register_tx: &Sender<ManualRegisterRequest>) -> Result<ResponseBox> {
+        let mut body = String::new();
+        req.as_reader().read_to_string(&mut body).context("reading register request body")?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("parsing register request body: {body:?}"))?;
+        let address = json.get("address").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        let key = json.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        ensure!(!address.is_empty() && !key.is_empty(), "address and key must both be non-empty");
+        // Best-effort, same reasoning as handle_duration's own send --
+        // if nothing is listening (the normal, already-configured case;
+        // see main.rs's own doc comment on when this is actually wired
+        // up), this is a harmless no-op.
+        let _ = manual_register_tx.send(ManualRegisterRequest { address, key });
+        Ok(Response::from_data(b"{}".as_slice())
+            .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            .boxed())
+    }
 
-    /// (which keeps all of its existing early-return branches
+
     /// unchanged) purely to apply `Cache-Control: no-store` uniformly
     /// to every successful response, regardless of which of
     /// `serve_inner`'s several return points produced it.
@@ -267,15 +307,20 @@ impl Server {
     /// re-requesting after a retry succeeds and reload code re-assigns
     /// the same iframe src. Every response here can legitimately change
     /// over time -- no-store is the strongest, least ambiguous fix.
+    #[allow(clippy::too_many_arguments)]
     fn serve(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
              trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
+             manual_register_tx: &Sender<ManualRegisterRequest>,
              local_data: &LocalDataStore, registration_code: &RegistrationCodeStore) -> Result<ResponseBox> {
-        let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, local_data, registration_code)?;
+        let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, manual_register_tx,
+                                      local_data, registration_code)?;
         Ok(resp.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn serve_inner(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
                     trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
+                    manual_register_tx: &Sender<ManualRegisterRequest>,
                     local_data: &LocalDataStore, registration_code: &RegistrationCodeStore) -> Result<ResponseBox> {
         log::debug!("HTTP request: {}", req.url());
         let url = req.url();
@@ -309,6 +354,11 @@ impl Server {
             // doc comment) -- xiboIC.reportFault() in a widget's own
             // JS.
             "/fault" => return Self::handle_fault(req, fault_tx),
+
+            // Manual CMS address/key entry from the "Register via
+            // Code" splash screen's own form (see
+            // ManualRegisterRequest's own doc comment).
+            "/register" => return Self::handle_manual_register(req, manual_register_tx),
 
             // Real-time DataSet data lookup -- confirmed from a real
             // `bundle.min.js` the user shared: `xiboIC.getData(dataKey,
@@ -477,7 +527,44 @@ fn splash_html(registration_code: &RegistrationCodeStore) -> Vec<u8> {
 <div style="margin-top: 8px; font-family: monospace; font-size: 64px;
             font-weight: 700; color: #222222; letter-spacing: 0.15em;">
   {code}
-</div>"#),
+</div>
+<div style="margin-top: 32px; font-family: sans-serif; font-size: 20px;
+            color: #888888;">
+  &mdash; or enter the CMS address and key manually &mdash;
+</div>
+<form id="manual-register-form" style="margin-top: 12px; display: flex;
+      flex-direction: column; align-items: center; gap: 8px;">
+  <input id="cms-address" type="text" placeholder="CMS address (https://...)"
+         autocomplete="off"
+         style="font-size: 20px; padding: 8px; width: 420px; text-align: center;">
+  <input id="cms-key" type="text" placeholder="CMS key" autocomplete="off"
+         style="font-size: 20px; padding: 8px; width: 420px; text-align: center;">
+  <button type="submit" style="font-size: 20px; padding: 8px 32px; margin-top: 4px;">
+    Register
+  </button>
+</form>
+<div id="manual-register-status" style="margin-top: 8px; font-family: sans-serif;
+     font-size: 18px; color: #888888; min-height: 24px;"></div>
+<script>
+document.getElementById('manual-register-form').addEventListener('submit', function(ev) {{
+  ev.preventDefault();
+  var status = document.getElementById('manual-register-status');
+  status.textContent = 'Registering...';
+  fetch('/register', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{
+      address: document.getElementById('cms-address').value,
+      key: document.getElementById('cms-key').value,
+    }}),
+  }}).then(function(r) {{
+    status.textContent = r.ok ? 'Registered, restarting...'
+                               : 'Please check the address/key and try again.';
+  }}).catch(function() {{
+    status.textContent = 'Network error, please try again.';
+  }});
+}});
+</script>"#),
         None => String::new(),
     };
     format!(r#"<!DOCTYPE html>
@@ -550,8 +637,9 @@ mod realtime_tests {
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
         (port, local_data)
@@ -591,8 +679,9 @@ mod realtime_tests {
         let (duration_tx, _duration_rx) = unbounded();
         let (trigger_tx, trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -613,8 +702,9 @@ mod realtime_tests {
         let (duration_tx, _duration_rx) = unbounded();
         let (trigger_tx, trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -636,8 +726,9 @@ mod realtime_tests {
         let (duration_tx, _duration_rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -689,8 +780,9 @@ mod stable_port_tests {
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         assert_eq!(server.port(), EMBEDDED_SERVER_PORT,
                    "the embedded server must use the fixed, stable port constant, \
                     not a randomly OS-assigned one -- otherwise cached widget iframe \
@@ -714,8 +806,9 @@ mod no_cache_header_tests {
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -794,14 +887,68 @@ mod json_content_type_tests {
         let (tx, _rx) = unbounded();
         let (trigger_tx, _trigger_rx) = unbounded();
         let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
         let port = server.port();
         server.start_pool();
 
         let resp = ureq::get(&format!("http://127.0.0.1:{port}/4543.json")).call().unwrap();
         let content_type = resp.headers().get("Content-Type").map(|v| v.to_str().unwrap());
         assert_eq!(content_type, Some("application/json"));
+    }
+}
+
+#[cfg(test)]
+mod manual_register_tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn start_test_server() -> (u16, crossbeam_channel::Receiver<ManualRegisterRequest>) {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_manual_register_test_{}_{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, manual_register_rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
+                                  manual_register_tx, local_data,
+                                  Arc::new(Mutex::new(None))).unwrap();
+        let port = server.port();
+        server.start_pool();
+        (port, manual_register_rx)
+    }
+
+    #[test]
+    fn a_valid_submission_is_relayed_and_acknowledged() {
+        let (port, manual_register_rx) = start_test_server();
+        let resp = ureq::post(&format!("http://127.0.0.1:{port}/register"))
+            .header("Content-Type", "application/json")
+            .send(br#"{"address": "https://cms.example.com", "key": "thekey"}"#)
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let req = manual_register_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(req.address, "https://cms.example.com");
+        assert_eq!(req.key, "thekey");
+    }
+
+    #[test]
+    fn an_empty_key_is_rejected_and_not_relayed() {
+        // A widget author's typo/empty field must not silently write a
+        // half-blank cms.json later -- reject here, before it ever
+        // reaches the channel at all.
+        let (port, manual_register_rx) = start_test_server();
+        let resp = ureq::post(&format!("http://127.0.0.1:{port}/register"))
+            .header("Content-Type", "application/json")
+            .send(br#"{"address": "https://cms.example.com", "key": ""}"#);
+        assert!(resp.is_err() || resp.unwrap().status() != 200);
+        assert!(manual_register_rx.try_recv().is_err(),
+                "an invalid submission must not be relayed to the channel");
     }
 }
 
@@ -848,6 +995,19 @@ mod splash_html_tests {
         let hostname = crate::util::get_display_name();
         assert!(html.contains(&hostname),
                 "must still show the hostname/IP line alongside an active code -- got:\n{html}");
+    }
+
+    #[test]
+    fn splash_html_includes_a_manual_registration_form_alongside_the_code() {
+        // The manual CMS address/key fallback (see
+        // ManualRegisterRequest's own doc comment) posts to /register
+        // from the same screen the code is shown on.
+        let code: RegistrationCodeStore = Arc::new(Mutex::new(Some("ABC123".to_string())));
+        let html = String::from_utf8(splash_html(&code)).unwrap();
+        assert!(html.contains("id=\"cms-address\"") && html.contains("id=\"cms-key\""),
+                "must include both manual entry fields -- got:\n{html}");
+        assert!(html.contains("fetch('/register'"),
+                "must post the manual entry form to /register -- got:\n{html}");
     }
 
     #[test]

@@ -209,6 +209,11 @@ fn main_inner() -> anyhow::Result<()> {
     // the background thread below once authcode::generate_code actually
     // returns one.
     let registration_code: server::RegistrationCodeStore = std::sync::Arc::new(std::sync::Mutex::new(None));
+    // Manual CMS address/key entry from the same splash screen (see
+    // server::ManualRegisterRequest's own doc comment) -- only ever
+    // consumed below, and only when awaiting_code; a harmless no-op
+    // send otherwise (nothing listening).
+    let (manual_register_tx, manual_register_rx) = crossbeam_channel::bounded(5);
     // Only the main server's own bind address is affected by
     // embedded_server_allow_wan (for /trigger reachability from
     // outside the display, see Interactive Control's own webhook
@@ -229,7 +234,7 @@ fn main_inner() -> anyhow::Result<()> {
     let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
     let port = server::effective_port(settings.embedded_server_port);
     let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
-                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone(), registration_code.clone())
+                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
     let shard_port = webserver.port();
@@ -256,7 +261,7 @@ fn main_inner() -> anyhow::Result<()> {
         for shard in 2..=server::HTML_SHARD_COUNT {
             let addr = format!("127.0.0.{shard}");
             let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
-                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), local_data.clone(), registration_code.clone())
+                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone())
                 .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
             shard_server.start_pool();
         }
@@ -280,41 +285,63 @@ fn main_inner() -> anyhow::Result<()> {
         let registration_code = registration_code.clone();
         let exit_code = exit_code.clone();
         std::thread::spawn(move || {
+            // Shared by both success paths below (authcode claimed, or
+            // the manual form submitted) -- writes the real cms.json
+            // and asks for the same clean restart as mainloop::
+            // RestartRequired (exit code 3, systemd Restart=always).
+            let finish = |address: String, key: String| -> bool {
+                let cms = config::CmsSettings {
+                    address, key, display_id: display_id.clone(),
+                    display_name: display_name.clone(), proxy: proxy.clone(),
+                };
+                if let Err(e) = cms.to_file(&cmscfg) {
+                    log::error!("Register: resolved but failed to write cms.json: {e:#}");
+                    return false;
+                }
+                *exit_code.lock().unwrap() = 3;
+                gui::quit();
+                true
+            };
             let client_version = clap::crate_version!();
             let generated = match authcode::generate_code(&display_id, client_version, proxy.as_deref()) {
-                Ok(g) => g,
+                Ok(g) => Some(g),
                 Err(e) => {
-                    // Nothing else this thread can usefully do -- the
-                    // splash just keeps showing the hostname/IP as it
-                    // always did (registration_code stays None), same
-                    // as if this feature didn't exist at all. A
-                    // technician can still fall back to the manual
-                    // --host/--key flags.
+                    // Nothing else this thread can usefully do about
+                    // the code-based flow specifically -- the manual
+                    // form (below) still works regardless, so this
+                    // thread keeps running rather than returning here.
                     log::error!("Register via Code: could not generate a code: {e:#}");
-                    return;
+                    None
                 }
             };
-            log::info!("Register via Code: showing code {} on screen, waiting for it to be \
-                        entered in the CMS", generated.user_code);
-            *registration_code.lock().unwrap() = Some(generated.user_code.clone());
+            if let Some(g) = &generated {
+                log::info!("Register via Code: showing code {} on screen, waiting for it to \
+                            be entered in the CMS", g.user_code);
+                *registration_code.lock().unwrap() = Some(g.user_code.clone());
+            }
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                match authcode::check_code(&generated.user_code, &generated.device_code, proxy.as_deref()) {
+                match manual_register_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(server::ManualRegisterRequest { address, key }) => {
+                        log::info!("Register: manual entry submitted, address={address}");
+                        if finish(address, key) { return; }
+                        // Failed to persist -- fall through and keep
+                        // waiting for either another manual attempt or
+                        // the code-based flow to succeed instead.
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        // Every Server thread holds a clone of the
+                        // sender for as long as this process runs --
+                        // shouldn't happen in practice, but isn't a
+                        // reason to stop trying the code-based flow
+                        // below.
+                    }
+                }
+                let Some(g) = &generated else { continue };
+                match authcode::check_code(&g.user_code, &g.device_code, proxy.as_deref()) {
                     Ok(Some(claimed)) => {
                         log::info!("Register via Code: claimed, address={}", claimed.cms_address);
-                        let cms = config::CmsSettings {
-                            address: claimed.cms_address, key: claimed.cms_key,
-                            display_id: display_id.clone(),
-                            display_name: display_name.clone(), proxy: proxy.clone(),
-                        };
-                        if let Err(e) = cms.to_file(&cmscfg) {
-                            log::error!("Register via Code: claimed but failed to write \
-                                         cms.json: {e:#}");
-                            continue;
-                        }
-                        *exit_code.lock().unwrap() = 3;
-                        gui::quit();
-                        return;
+                        if finish(claimed.cms_address, claimed.cms_key) { return; }
                     }
                     Ok(None) => {} // not claimed yet, keep polling
                     Err(e) => log::warn!("Register via Code: checking code: {e:#}"),
