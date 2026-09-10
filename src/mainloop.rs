@@ -1205,12 +1205,8 @@ impl Handler {
                         collect = after(Duration::from_secs(0));
                     }
                 },
-                // Same reasoning as duration_rx just above, for
                 // Interactive Control fault reports -- record into the
-                // same FaultCollector used internally (see faults.rs),
-                // flushed the next time flush_faults runs (end of the
-                // current/next collection cycle, same as any other
-                // recorded fault).
+                // same FaultCollector, flushed with any other fault.
                 recv(self.fault_rx) -> req => if let Ok(req) = req {
                     self.faults.record(faults::Fault::new(req.code, req.reason));
                 }
@@ -1304,16 +1300,9 @@ impl Handler {
     fn collect_once(&mut self) -> Result<()> {
         log::info!("doing collection");
 
-        // A placeholder CmsSettings (see main.rs's own "awaiting_code"
-        // doc comment, for Register via Code / manual entry) has a
-        // genuinely empty address -- register_display() below would
-        // only ever fail on that (an invalid URI, not a real network/
-        // auth problem), and run()'s own caller logs any such failure
-        // at ERROR level (see "during collect: ..."), spamming one
-        // every single collection interval for something completely
-        // expected while waiting for either flow to resolve. Nothing
-        // else in this function has anything useful to do with a blank
-        // address either, so skip the whole cycle quietly instead.
+        // A blank placeholder address (Register via Code/manual entry
+        // pending) would only ever fail register_display() below --
+        // skip the cycle quietly instead of an ERROR every interval.
         if self.cms.address.is_empty() {
             log::debug!("no CMS address configured yet (Register via Code/manual entry \
                          pending) -- skipping this collection cycle");
@@ -2854,17 +2843,9 @@ mod timezone_to_report_tests {
 /// longer exist in the fresh one); 0 means no real schedule entry,
 /// never exempt.
 ///
-/// `still_present_on_disk` (see Cache::layout_file_exists_on_disk's own
-/// doc comment): this whole exemption assumes an older-but-playable
-/// copy is what's keeping the display going while a newer version
-/// waits -- never true once something (e.g. the CMS's own `purgeAll`)
-/// has already deleted the file. Without this guard, a purged
-/// currently-playing layout could never be redownloaded at all: this
-/// same exemption re-fires identically every single cycle afterward
-/// (nothing else about the situation changes), permanently blocking
-/// the one download that would fix it (confirmed from a real report --
-/// the display got stuck on "purge-triggered reload: ... not found on
-/// disk yet" forever).
+/// `still_present_on_disk`: never exempt if the file was already
+/// deleted (e.g. by the CMS's own `purgeAll`) -- otherwise this
+/// exemption would block redownloading it forever.
 fn is_exempt_as_currently_playing_layout(file: &ReqFile, current_scheduleid: i64,
                                           fresh_schedule: &Schedule,
                                           expire_modified_layouts: bool,
@@ -3160,16 +3141,8 @@ mod pending_auth_tests {
 
     #[test]
     fn collect_once_skips_quietly_with_a_blank_placeholder_address() {
-        // Regression test for a real report: main.rs's own placeholder
-        // CmsSettings (address/key both empty, used while awaiting
-        // either Register via Code or manual entry -- see its own
-        // "awaiting_code" doc comment) made collect_once() call
-        // register_display() every single collection interval anyway,
-        // which can only ever fail on the blank address (an invalid
-        // URI, not a real network/auth problem) -- logged by run()'s
-        // own caller as a scary "during collect: ... bad uri: ...
-        // missing scheme" ERROR on every single retry the whole time a
-        // display sat waiting to be registered.
+        // Regression: a blank placeholder address (Register via Code/
+        // manual entry pending) shouldn't spam an ERROR every cycle.
         let cms = CmsSettings { address: String::new(), key: String::new(),
                                  display_id: "test-display".into(),
                                  display_name: None, proxy: None };
@@ -4868,16 +4841,8 @@ mod is_exempt_as_currently_playing_layout_tests {
 
     #[test]
     fn does_not_exempt_a_layout_already_deleted_from_disk() {
-        // Regression test for a real report: `purgeAll` deleted the
-        // currently-playing layout's own file from disk, but this
-        // exemption (meant only to defer redownloading an
-        // *older-but-still-present* copy) kept firing anyway every
-        // cycle afterward -- same scheduleid, nothing about the
-        // situation ever changes on its own -- permanently blocking
-        // the one download that would have recovered the display.
-        // Same setup as `exempts_a_republished_layout_occupying_the_
-        // same_schedule_slot` (which WOULD normally be exempted), but
-        // with `still_present_on_disk: false`.
+        // Regression: purgeAll deleted the file -- must not stay
+        // exempt just because the scheduleid still matches.
         let old_schedule = schedule_with(925, 224);
         let fresh_schedule = schedule_with(927, 224);
         let current_scheduleid = old_schedule.scheduleid_for(925);

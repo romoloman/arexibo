@@ -56,15 +56,8 @@ pub struct TriggerRequest {
     pub code: String,
 }
 
-/// A fault reported by a Widget's own JS via `xiboIC.reportFault({code,
-/// reason}, ...)`, POSTing JSON to `/fault` on this embedded server --
-/// confirmed from a real `bundle.min.js`: `{ code, key, reason, ttl }`
-/// (`key`/`ttl` are for the JS library's own local dedup and aren't
-/// part of the XMDS `ReportFaults` payload the CMS actually expects,
-/// see faults.rs's own doc comment -- deliberately not modeled here).
-/// Relayed to the mainloop (see mainloop.rs's `Handler::run` select!
-/// loop), which owns the `FaultCollector`/XMDS connection this
-/// worker thread has no direct access to.
+/// Fault reported by a Widget via `xiboIC.reportFault(...)`, POST
+/// `/fault`. Relayed to the mainloop's FaultCollector.
 #[derive(Debug, Clone)]
 pub struct FaultRequest {
     pub code: i32,
@@ -72,14 +65,7 @@ pub struct FaultRequest {
 }
 
 /// Manual CMS address/key entry from the "Register via Code" splash
-/// screen's own form (see splash_html) -- `POST /register`, `{address,
-/// key}`. A fallback for whenever the code-based flow (authcode.rs)
-/// either isn't wanted or its own third-party service is unreachable;
-/// functionally identical to what `--host`/`--key` already do on the
-/// command line, just entered via touch instead. Relayed to main.rs
-/// (not mainloop.rs -- unlike every other *Request type here, this one
-/// is only ever meaningful before Handler exists at all, while still
-/// resolving a real CmsSettings for the first time).
+/// screen, POST `/register`. Relayed to main.rs, not mainloop.rs.
 #[derive(Debug, Clone)]
 pub struct ManualRegisterRequest {
     pub address: String,
@@ -136,15 +122,9 @@ pub fn effective_port(cms_reported_port: u16) -> u16 {
 /// same content.
 pub type LocalDataStore = Arc<Mutex<HashMap<String, String>>>;
 
-/// Shared, in-memory holder for the current "Register via Code" user
-/// code (see authcode.rs), if a registration is in progress -- `None`
-/// once resolved (a fresh process start after that always has real CMS
-/// settings, so this is only ever populated during the placeholder-CMS
-/// startup path in main.rs). Read by `splash_html` on every request
-/// (unlike the hostname/IP portion, deliberately NOT cached in the same
-/// `OnceLock`, since the code's own value changes over the lifetime of
-/// a single process run -- absent, then a real code, then arguably
-/// resolved right before the process exits to restart).
+/// Shared holder for the current "Register via Code" user code, if a
+/// registration is in progress. Read by the `/registration-code`
+/// endpoint, polled client-side from the splash screen.
 pub type RegistrationCodeStore = Arc<Mutex<Option<String>>>;
 
 pub struct Server {
@@ -287,10 +267,7 @@ impl Server {
         let address = json.get("address").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         let key = json.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         ensure!(!address.is_empty() && !key.is_empty(), "address and key must both be non-empty");
-        // Best-effort, same reasoning as handle_duration's own send --
-        // if nothing is listening (the normal, already-configured case;
-        // see main.rs's own doc comment on when this is actually wired
-        // up), this is a harmless no-op.
+        // Best-effort: harmless no-op if nothing is listening.
         let _ = manual_register_tx.send(ManualRegisterRequest { address, key });
         Ok(Response::from_data(b"{}".as_slice())
             .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
@@ -360,16 +337,8 @@ impl Server {
             // ManualRegisterRequest's own doc comment).
             "/register" => return Self::handle_manual_register(req, manual_register_tx),
 
-            // Polled by splash_html's own JS (every few seconds) to
-            // pick up a registration code that appears *after* this
-            // page was first loaded -- QtWebEngine only ever navigates
-            // to this page once, at startup (see gui/view.cpp's own
-            // Window constructor), so without this, a code becoming
-            // available later (main.rs's own background thread, itself
-            // started after the splash is already showing) would never
-            // actually reach the screen: a real report confirmed the
-            // code appeared correctly in the log but never on screen at
-            // all.
+            // Polled by the splash screen's own JS to pick up a code
+            // that appears after the page first loaded.
             "/registration-code" => {
                 let code = registration_code.lock().unwrap().clone();
                 let json = serde_json::json!({"code": code}).to_string();
@@ -515,22 +484,10 @@ impl Server {
 // needing a separate SSH session during setup/CMS authorization.
 // Computed once (OnceLock), shared across every Server instance.
 //
-// The "Register via Code" manual-entry form and code display are
-// always present here (not conditioned on a code already existing),
-// and the code itself is filled in/updated *client-side* by polling
-// `/registration-code` every few seconds, rather than being baked into
-// this server-rendered HTML at all. This matters because QtWebEngine
-// only ever navigates to this page ONCE, at startup (see
-// gui/view.cpp's Window constructor) -- a code that only becomes
-// available *after* that (main.rs's own background thread, started
-// after the splash is already on screen) would never reach the screen
-// otherwise: a real report confirmed the code appeared correctly in
-// the log ("showing code ... on screen") but genuinely never appeared
-// on screen at all, since nothing ever re-fetched or re-rendered this
-// page afterward. Polling in place (rather than e.g. reloading the
-// whole page) also means someone mid-typing into the manual-entry
-// fields below is never disrupted by a code appearing in the
-// background.
+// The manual-entry form and code display are always present
+// (regardless of whether a code exists yet); the code itself is
+// filled in client-side by polling `/registration-code`, since
+// QtWebEngine only ever loads this page once, at startup.
 fn splash_html() -> &'static [u8] {
     static SPLASH: OnceLock<Vec<u8>> = OnceLock::new();
     SPLASH.get_or_init(|| {
@@ -612,14 +569,7 @@ document.getElementById('manual-register-form').addEventListener('submit', funct
     status.textContent = 'Network error, please try again.';
   }});
 }});
-// Only ever shows/updates the code section -- never touches the form
-// fields above, so someone mid-typing is never disrupted by this.
-// Stops polling once a code actually appears -- it won't change again
-// in this run (generate_code is only ever attempted again if it
-// failed; once it succeeds, the code stays put until either it's
-// claimed or the manual form succeeds, both of which end this whole
-// process anyway), so continuing to poll every few seconds afterward
-// would just be pointless, endless log noise on the server side.
+// Stops once a code appears -- it won't change again this run.
 var registrationCodePoll = setInterval(pollRegistrationCode, 3000);
 function pollRegistrationCode() {{
   fetch('/registration-code').then(function(r) {{ return r.json(); }})

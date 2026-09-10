@@ -1,34 +1,12 @@
 // Xibo player Rust implementation, (c) 2022-2024 Georg Brandl.
 // Licensed under the GNU AGPL, version 3 or later.
 
-//! "Register via Code" (the Windows/Android player's "Use Code" button):
-//! shows a short user-facing code, which an administrator enters into
-//! the CMS's own "Add Display (Code)" page, resolving to a real CMS
-//! address + key without anyone needing to type either by hand on the
-//! display itself.
-//!
-//! CONFIRMED, not guessed: this whole exchange goes through a *third-party*
-//! service operated by Xibo Signage Ltd (`auth.signlicence.co.uk`), NOT
-//! the self-hosted CMS directly -- read in full from the real, current
-//! source of the official Windows .NET player (OptionsForm.xaml.cs,
-//! xibosignage/xibo-dotnetclient, `develop` branch, fetched during
-//! development). Requires outbound internet access to that specific host;
-//! a CMS reachable only over a private/restricted network (no route to
-//! the public internet) cannot use this feature at all, regardless of
-//! anything arexibo itself does.
-//!
-//! Protocol (an OAuth2 Device Authorization Grant shape, though nothing
-//! here is standard OAuth):
-//! 1. `POST https://auth.signlicence.co.uk/generateCode` with
-//!    `{"hardwareId", "type", "version"}` -> `{"user_code", "device_code"}`
-//!    (`user_code`: the 6-character code to show; `device_code`: kept
-//!    secret client-side, never displayed).
-//! 2. Poll (official client: every 10s) `GET https://auth.signlicence.co
-//!    .uk/getDetails?user_code=...&device_code=...` until the response
-//!    contains a `cmsAddress` key -- at that point it also contains
-//!    `cmsKey`, and registration proceeds exactly as if those had been
-//!    typed in manually (this module's own job ends there; seeting up
-//!    the real Cms/Handler is main.rs's job, same as the manual path).
+//! "Register via Code" (Windows/Android player's "Use Code" button).
+//! Goes through a third-party service (`auth.signlicence.co.uk`), not
+//! the self-hosted CMS directly -- requires outbound internet access
+//! to that host specifically. Protocol: `generate_code` gets a
+//! user-facing code + secret device code; `check_code` polls until
+//! claimed, returning a real CMS address/key.
 
 use std::time::Duration;
 use anyhow::{bail, Context, Result};
@@ -37,20 +15,13 @@ use serde_json::json;
 
 const AUTH_HOST: &str = "https://auth.signlicence.co.uk";
 
-/// Matches the official Windows client's own `type` field for this
-/// exchange -- confirmed as a literal `"windows"` there (not e.g.
-/// "linux"), and nothing in the exchange's own confirmed shape suggests
-/// the CMS-side behavior depends on this value beyond display purposes,
-/// so no separate arexibo-specific value was invented.
+/// Matches the official Windows client's own `type` field.
 const CLIENT_TYPE: &str = "windows";
 
 pub struct GeneratedCode {
-    /// The short code to display to a human, who enters it into the
-    /// CMS's own "Add Display (Code)" page.
+    /// Shown on screen for an admin to enter in the CMS.
     pub user_code: String,
-    /// Kept secret, never displayed -- proves to the auth service that
-    /// whoever polls `check_code` is the same device that generated
-    /// this code in the first place.
+    /// Kept secret, never displayed.
     pub device_code: String,
 }
 
@@ -75,10 +46,7 @@ fn make_agent(proxy: Option<&str>) -> Result<ureq::Agent> {
 struct GenerateCodeResponse {
     user_code: Option<String>,
     device_code: Option<String>,
-    // Confirmed from the real client: a `message` key in the response
-    // means something went wrong server-side even on an HTTP 2xx --
-    // treated as a failure rather than trusting user_code/device_code
-    // to be meaningfully present.
+    // A `message` key means an error even on HTTP 2xx.
     message: Option<String>,
 }
 
@@ -112,9 +80,7 @@ struct GetDetailsResponse {
     cms_key: Option<String>,
 }
 
-/// One poll attempt. `Ok(None)` means "not claimed yet, keep polling" --
-/// NOT an error, this is the expected result of nearly every call until
-/// an administrator actually enters the code in the CMS.
+/// `Ok(None)` means not yet claimed -- not an error.
 pub fn check_code(user_code: &str, device_code: &str, proxy: Option<&str>) -> Result<Option<ClaimedCode>> {
     let agent = make_agent(proxy)?;
     let url = format!("{AUTH_HOST}/getDetails?user_code={user_code}&device_code={device_code}");
@@ -133,10 +99,7 @@ pub fn check_code(user_code: &str, device_code: &str, proxy: Option<&str>) -> Re
 mod tests {
     use super::*;
 
-    // These exercise only the local parsing/decision logic against
-    // canned JSON -- no real network call to the actual third-party
-    // service (which would make tests flaky/slow and hit someone else's
-    // production service from CI).
+    // Only local parsing/decision logic -- no real network call.
 
     #[test]
     fn generate_code_response_message_is_an_error_even_with_other_fields_present() {

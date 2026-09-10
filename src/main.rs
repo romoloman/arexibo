@@ -120,26 +120,15 @@ fn main_inner() -> anyhow::Result<()> {
             args.envdir.display());
     let cmscfg = args.envdir.join("cms.json");
 
-    // See the long comment further down (right before this same
-    // variable was previously declared, next to the mainloop thread
-    // spawn) for why this exists at all -- moved up here so the new
-    // "Register via Code" polling thread below can share it with that
-    // same mainloop thread, both ultimately deciding this one process's
-    // own exit code.
+    // Shared with the "Register via Code" polling thread below.
     let exit_code = Arc::new(Mutex::new(1));
 
-    // check if we have a CMS config either stored, or given with arguments
-    // `awaiting_code`: true only for the newly-added third case (no
-    // config at all, nothing given on the command line either) -- a
-    // placeholder CmsSettings good enough to let Handler::new/the
-    // embedded webserver start normally (showing the splash screen,
-    // see server.rs's own RegistrationCodeStore) while a background
-    // thread further down actually resolves real settings via
-    // authcode.rs's "Register via Code" exchange, matching the official
-    // Windows/Android players' own "Use Code" button. Never written to
-    // cms.json as-is (see the `if !awaiting_code` guard just below) --
-    // doing so would permanently "brick" a fresh totem into thinking
-    // it's configured with a blank address/key on every future boot.
+    // `awaiting_code`: no config at all, nothing given on the command
+    // line either -- a placeholder CmsSettings good enough to let
+    // Handler::new/the webserver start normally (showing the splash,
+    // see server::RegistrationCodeStore) while a background thread
+    // below resolves real settings via authcode.rs. Never written to
+    // cms.json as-is.
     let (cms, awaiting_code) = if let Some((address, key)) = args.host.zip(args.key) {
         let display_id = args.display_id.unwrap_or_else(util::get_display_id);
         (config::CmsSettings { address, key, display_id,
@@ -157,14 +146,8 @@ fn main_inner() -> anyhow::Result<()> {
     if !awaiting_code {
         cms.to_file(&cmscfg).context("writing new CMS config")?;
     }
-    // A placeholder CmsSettings means `register_display()` inside
-    // Handler::new is certain to fail (blank address/key) -- forcing
-    // allow_offline here (regardless of what was actually passed on the
-    // command line) is what makes Handler::new take its own existing
-    // "CMS unreachable, no cache either, show the splash and retry
-    // quietly" path (pending_network, see mainloop.rs) instead of
-    // bailing the whole process out over a failure that is, in this
-    // one specific case, entirely expected.
+    // Forces Handler::new's own "CMS unreachable, no cache, show
+    // splash and retry quietly" path instead of bailing.
     let allow_offline = args.allow_offline || awaiting_code;
 
     // create the backend handler and required channels
@@ -203,16 +186,9 @@ fn main_inner() -> anyhow::Result<()> {
     // shared store, not one per shard.
     let local_data: server::LocalDataStore = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashMap::new()));
-    // Same sharing reasoning as local_data, for the "Register via Code"
-    // splash-screen code (see server::RegistrationCodeStore's own doc
-    // comment) -- starts empty even when awaiting_code, populated by
-    // the background thread below once authcode::generate_code actually
-    // returns one.
+    // Shared "Register via Code" splash-screen state.
     let registration_code: server::RegistrationCodeStore = std::sync::Arc::new(std::sync::Mutex::new(None));
-    // Manual CMS address/key entry from the same splash screen (see
-    // server::ManualRegisterRequest's own doc comment) -- only ever
-    // consumed below, and only when awaiting_code; a harmless no-op
-    // send otherwise (nothing listening).
+    // Manual CMS address/key entry from the same splash screen.
     let (manual_register_tx, manual_register_rx) = crossbeam_channel::bounded(5);
     // Only the main server's own bind address is affected by
     // embedded_server_allow_wan (for /trigger reachability from
@@ -267,16 +243,10 @@ fn main_inner() -> anyhow::Result<()> {
         }
     }
 
-    // "Register via Code": generate a code, show it on the splash
-    // screen (via registration_code, read by server.rs's splash_html on
-    // every request), and poll for its claim in the background -- see
-    // authcode.rs's own doc comment for the full, confirmed protocol.
-    // Once claimed, this writes the REAL cms.json and asks for a clean
-    // process restart (same exit-code-3 idiom as mainloop::
-    // RestartRequired below, reusing exactly the same systemd
-    // Restart=always recovery already relied on there) -- the next run
-    // finds a real cms.json on disk and proceeds exactly like any
-    // already-configured display, no different code path at all.
+    // "Register via Code": generate a code, show it via
+    // registration_code, poll for its claim; on success (or a manual
+    // submission) write cms.json and restart (exit code 3, same as
+    // mainloop::RestartRequired).
     if awaiting_code {
         let cmscfg = cmscfg.clone();
         let display_id = cms.display_id.clone();
@@ -285,10 +255,6 @@ fn main_inner() -> anyhow::Result<()> {
         let registration_code = registration_code.clone();
         let exit_code = exit_code.clone();
         std::thread::spawn(move || {
-            // Shared by both success paths below (authcode claimed, or
-            // the manual form submitted) -- writes the real cms.json
-            // and asks for the same clean restart as mainloop::
-            // RestartRequired (exit code 3, systemd Restart=always).
             let finish = |address: String, key: String| -> bool {
                 let cms = config::CmsSettings {
                     address, key, display_id: display_id.clone(),
@@ -304,18 +270,8 @@ fn main_inner() -> anyhow::Result<()> {
             };
             let client_version = clap::crate_version!();
             let mut generated: Option<authcode::GeneratedCode> = None;
-            // Regression fix: this first attempt must happen
-            // immediately, with no delay at all -- matching the
-            // original (pre-retry-fix) timing exactly. A real report
-            // confirmed the code used to appear on screen quickly
-            // before the retry logic below existed; moving this same
-            // first attempt inside the loop (where it was gated behind
-            // manual_register_rx.recv_timeout(10s), which blocks for
-            // the full 10s before ever falling through to this call on
-            // the loop's very first iteration) meant the code no longer
-            // appeared until up to 10s after this thread started, every
-            // single time, even when the network was fine and the
-            // attempt would have succeeded instantly.
+            // First attempt happens immediately, before the loop below
+            // -- must not be delayed by recv_timeout's own 10s wait.
             match authcode::generate_code(&display_id, client_version, proxy.as_deref()) {
                 Ok(g) => {
                     log::info!("Register via Code: showing code {} on screen, waiting for it \
@@ -331,28 +287,11 @@ fn main_inner() -> anyhow::Result<()> {
                     Ok(server::ManualRegisterRequest { address, key }) => {
                         log::info!("Register: manual entry submitted, address={address}");
                         if finish(address, key) { return; }
-                        // Failed to persist -- fall through and keep
-                        // waiting for either another manual attempt or
-                        // the code-based flow to succeed instead.
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        // Every Server thread holds a clone of the
-                        // sender for as long as this process runs --
-                        // shouldn't happen in practice, but isn't a
-                        // reason to stop trying the code-based flow
-                        // below.
-                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {}
                 }
-                // A real report noted that if the FIRST attempt above
-                // failed (e.g. the network -- a 4G modem's own DNS in
-                // particular, see this project's own earlier history --
-                // genuinely not up yet this early after boot), the
-                // code-based flow stayed permanently disabled for the
-                // rest of this run, with no retry ever attempted again,
-                // even once connectivity recovered a moment later.
-                // Retried here on the same 10s cadence as check_code
-                // below, for any attempt *after* the first one.
+                // Retry any attempt after the first one, same cadence.
                 if generated.is_none() {
                     match authcode::generate_code(&display_id, client_version, proxy.as_deref()) {
                         Ok(g) => {

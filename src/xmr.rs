@@ -595,11 +595,8 @@ impl ZmqSubSocket {
         let port = caps[2].parse().expect("digits");
 
         let mut stream = connect_retrying_eintr((host, port))?;
-        // 5s to match the Lead's own handshake-read timeout in
-        // syncgroup.rs's zmtp_pub_handshake -- shorter than that (was
-        // 1s) let a merely-busy Lead time out the Follower's own read
-        // first, closing the socket and surfacing as a premature EOF
-        // on the Lead's side ("failed to fill whole buffer").
+        // 5s to match the Lead's own handshake timeout (was 1s, too
+        // short -- caused premature EOF on a merely-busy Lead).
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
         // greeting: signature, version (3.0), security (none) and server flag (no),
