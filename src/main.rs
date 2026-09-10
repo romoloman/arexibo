@@ -303,21 +303,28 @@ fn main_inner() -> anyhow::Result<()> {
                 true
             };
             let client_version = clap::crate_version!();
-            let generated = match authcode::generate_code(&display_id, client_version, proxy.as_deref()) {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    // Nothing else this thread can usefully do about
-                    // the code-based flow specifically -- the manual
-                    // form (below) still works regardless, so this
-                    // thread keeps running rather than returning here.
-                    log::error!("Register via Code: could not generate a code: {e:#}");
-                    None
+            let mut generated: Option<authcode::GeneratedCode> = None;
+            // Regression fix: this first attempt must happen
+            // immediately, with no delay at all -- matching the
+            // original (pre-retry-fix) timing exactly. A real report
+            // confirmed the code used to appear on screen quickly
+            // before the retry logic below existed; moving this same
+            // first attempt inside the loop (where it was gated behind
+            // manual_register_rx.recv_timeout(10s), which blocks for
+            // the full 10s before ever falling through to this call on
+            // the loop's very first iteration) meant the code no longer
+            // appeared until up to 10s after this thread started, every
+            // single time, even when the network was fine and the
+            // attempt would have succeeded instantly.
+            match authcode::generate_code(&display_id, client_version, proxy.as_deref()) {
+                Ok(g) => {
+                    log::info!("Register via Code: showing code {} on screen, waiting for it \
+                                to be entered in the CMS", g.user_code);
+                    *registration_code.lock().unwrap() = Some(g.user_code.clone());
+                    generated = Some(g);
                 }
-            };
-            if let Some(g) = &generated {
-                log::info!("Register via Code: showing code {} on screen, waiting for it to \
-                            be entered in the CMS", g.user_code);
-                *registration_code.lock().unwrap() = Some(g.user_code.clone());
+                Err(e) => log::warn!("Register via Code: could not generate a code, will \
+                                       retry: {e:#}"),
             }
             loop {
                 match manual_register_rx.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -337,7 +344,31 @@ fn main_inner() -> anyhow::Result<()> {
                         // below.
                     }
                 }
-                let Some(g) = &generated else { continue };
+                // A real report noted that if the FIRST attempt above
+                // failed (e.g. the network -- a 4G modem's own DNS in
+                // particular, see this project's own earlier history --
+                // genuinely not up yet this early after boot), the
+                // code-based flow stayed permanently disabled for the
+                // rest of this run, with no retry ever attempted again,
+                // even once connectivity recovered a moment later.
+                // Retried here on the same 10s cadence as check_code
+                // below, for any attempt *after* the first one.
+                if generated.is_none() {
+                    match authcode::generate_code(&display_id, client_version, proxy.as_deref()) {
+                        Ok(g) => {
+                            log::info!("Register via Code: showing code {} on screen, waiting \
+                                        for it to be entered in the CMS", g.user_code);
+                            *registration_code.lock().unwrap() = Some(g.user_code.clone());
+                            generated = Some(g);
+                        }
+                        Err(e) => {
+                            log::warn!("Register via Code: could not generate a code, will \
+                                        retry: {e:#}");
+                            continue;
+                        }
+                    }
+                }
+                let g = generated.as_ref().expect("just confirmed Some above");
                 match authcode::check_code(&g.user_code, &g.device_code, proxy.as_deref()) {
                     Ok(Some(claimed)) => {
                         log::info!("Register via Code: claimed, address={}", claimed.cms_address);

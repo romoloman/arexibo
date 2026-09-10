@@ -331,7 +331,7 @@ impl Server {
             "/branding.png" => Response::from_data(SPLASH_LOGO)
                 .with_header(Header::from_bytes(b"Content-Type", b"image/png").unwrap())
                 .boxed(),
-            "/0.xlf.html" => Response::from_data(splash_html(registration_code)).boxed(),
+            "/0.xlf.html" => Response::from_data(splash_html()).boxed(),
 
             // Interactive Control duration overrides (see
             // xibo-interactive-control's setWidgetDuration/
@@ -359,6 +359,25 @@ impl Server {
             // Code" splash screen's own form (see
             // ManualRegisterRequest's own doc comment).
             "/register" => return Self::handle_manual_register(req, manual_register_tx),
+
+            // Polled by splash_html's own JS (every few seconds) to
+            // pick up a registration code that appears *after* this
+            // page was first loaded -- QtWebEngine only ever navigates
+            // to this page once, at startup (see gui/view.cpp's own
+            // Window constructor), so without this, a code becoming
+            // available later (main.rs's own background thread, itself
+            // started after the splash is already showing) would never
+            // actually reach the screen: a real report confirmed the
+            // code appeared correctly in the log but never on screen at
+            // all.
+            "/registration-code" => {
+                let code = registration_code.lock().unwrap().clone();
+                let json = serde_json::json!({"code": code}).to_string();
+                Response::from_data(json.into_bytes())
+                    .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                    .boxed()
+            }
+
 
             // Real-time DataSet data lookup -- confirmed from a real
             // `bundle.min.js` the user shared: `xiboIC.getData(dataKey,
@@ -493,21 +512,28 @@ impl Server {
 }
 
 // Shows the totem's own hostname/IP on the splash screen -- avoids
-// needing a separate SSH session during setup/CMS authorization. The
-// hostname/IP portion is computed once (OnceLock, unchanged from
-// before) and shared across every Server instance; the registration
-// code (see RegistrationCodeStore's own doc comment) is read fresh on
-// every request instead, since -- unlike the hostname/IP -- its value
-// genuinely changes over a single process's lifetime (absent, then a
-// real code, then the process exits to restart once resolved).
+// needing a separate SSH session during setup/CMS authorization.
+// Computed once (OnceLock), shared across every Server instance.
 //
-// When a code is present, it's shown ALONGSIDE the hostname/IP line,
-// not instead of it -- both are useful at once during setup (someone
-// might still want to SSH in while also reading off the code to enter
-// in the CMS).
-fn splash_html(registration_code: &RegistrationCodeStore) -> Vec<u8> {
-    static HOSTNAME_LINE: OnceLock<String> = OnceLock::new();
-    let hostname_line = HOSTNAME_LINE.get_or_init(|| {
+// The "Register via Code" manual-entry form and code display are
+// always present here (not conditioned on a code already existing),
+// and the code itself is filled in/updated *client-side* by polling
+// `/registration-code` every few seconds, rather than being baked into
+// this server-rendered HTML at all. This matters because QtWebEngine
+// only ever navigates to this page ONCE, at startup (see
+// gui/view.cpp's Window constructor) -- a code that only becomes
+// available *after* that (main.rs's own background thread, started
+// after the splash is already on screen) would never reach the screen
+// otherwise: a real report confirmed the code appeared correctly in
+// the log ("showing code ... on screen") but genuinely never appeared
+// on screen at all, since nothing ever re-fetched or re-rendered this
+// page afterward. Polling in place (rather than e.g. reloading the
+// whole page) also means someone mid-typing into the manual-entry
+// fields below is never disrupted by a code appearing in the
+// background.
+fn splash_html() -> &'static [u8] {
+    static SPLASH: OnceLock<Vec<u8>> = OnceLock::new();
+    SPLASH.get_or_init(|| {
         let hostname = crate::util::get_display_name();
         let ips = crate::util::get_local_ips();
         let ips_display = if ips.is_empty() {
@@ -515,18 +541,40 @@ fn splash_html(registration_code: &RegistrationCodeStore) -> Vec<u8> {
         } else {
             ips.join(", ")
         };
-        format!("{hostname} &middot; {ips_display}")
-    });
-    let code = registration_code.lock().unwrap().clone();
-    let code_line = match &code {
-        Some(code) => format!(
-            r#"<div style="margin-top: 16px; font-family: sans-serif; font-size: 24px;
-                        color: #555555;">
-  Enter this code in your CMS (Displays &rarr; Add Display (Code)):
+        format!(r#"<!DOCTYPE html>
+<html>
+<head>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>
+new QWebChannel(qt.webChannelTransport, function(channel) {{
+  window.arexiboGui = channel.objects.arexibo;
+  window.arexiboGui.jsLayoutInit(0, 1920, 1080);
+}});
+</script>
+</head>
+<body style="margin: 0; width: 100vw; height: 100vh; background-color: #ffffff;
+             display: flex; flex-direction: column; align-items: center;
+             justify-content: center;">
+<img style="max-width: 70vw; max-height: 40vh; width: auto; height: auto;"
+     src="branding.png">
+<!-- Separate HTML text element (the old splash.jpg had "LOADING..."
+     baked into its pixels, lost when replaced with branding.png) --
+     stays readable regardless of whatever logo is configured. -->
+<div style="margin-top: 24px; font-family: sans-serif; font-size: 28px;
+            font-weight: 600; color: #333333; letter-spacing: 0.05em;">
+  LOADING...
 </div>
-<div style="margin-top: 8px; font-family: monospace; font-size: 64px;
-            font-weight: 700; color: #222222; letter-spacing: 0.15em;">
-  {code}
+<div style="margin-top: 16px; font-family: sans-serif; font-size: 32px;
+            font-weight: 500; color: #555555;">
+  {hostname} &middot; {ips_display}
+</div>
+<div id="registration-code-section" style="display: none; margin-top: 16px;
+     font-family: sans-serif; font-size: 24px; color: #555555;
+     text-align: center;">
+  <div>Enter this code in your CMS (Displays &rarr; Add Display (Code)):</div>
+  <div id="registration-code-value" style="margin-top: 8px; font-family: monospace;
+       font-size: 64px; font-weight: 700; color: #222222; letter-spacing: 0.15em;">
+  </div>
 </div>
 <div style="margin-top: 32px; font-family: sans-serif; font-size: 20px;
             color: #888888;">
@@ -564,40 +612,34 @@ document.getElementById('manual-register-form').addEventListener('submit', funct
     status.textContent = 'Network error, please try again.';
   }});
 }});
-</script>"#),
-        None => String::new(),
-    };
-    format!(r#"<!DOCTYPE html>
-<html>
-<head>
-<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
-<script>
-new QWebChannel(qt.webChannelTransport, function(channel) {{
-  window.arexiboGui = channel.objects.arexibo;
-  window.arexiboGui.jsLayoutInit(0, 1920, 1080);
-}});
+// Only ever shows/updates the code section -- never touches the form
+// fields above, so someone mid-typing is never disrupted by this.
+// Stops polling once a code actually appears -- it won't change again
+// in this run (generate_code is only ever attempted again if it
+// failed; once it succeeds, the code stays put until either it's
+// claimed or the manual form succeeds, both of which end this whole
+// process anyway), so continuing to poll every few seconds afterward
+// would just be pointless, endless log noise on the server side.
+var registrationCodePoll = setInterval(pollRegistrationCode, 3000);
+function pollRegistrationCode() {{
+  fetch('/registration-code').then(function(r) {{ return r.json(); }})
+    .then(function(data) {{
+      var section = document.getElementById('registration-code-section');
+      if (data.code) {{
+        document.getElementById('registration-code-value').textContent = data.code;
+        section.style.display = 'block';
+        clearInterval(registrationCodePoll);
+      }} else {{
+        section.style.display = 'none';
+      }}
+    }}).catch(function() {{}});
+}}
+pollRegistrationCode();
 </script>
-</head>
-<body style="margin: 0; width: 100vw; height: 100vh; background-color: #ffffff;
-             display: flex; flex-direction: column; align-items: center;
-             justify-content: center;">
-<img style="max-width: 70vw; max-height: 40vh; width: auto; height: auto;"
-     src="branding.png">
-<!-- Separate HTML text element (the old splash.jpg had "LOADING..."
-     baked into its pixels, lost when replaced with branding.png) --
-     stays readable regardless of whatever logo is configured. -->
-<div style="margin-top: 24px; font-family: sans-serif; font-size: 28px;
-            font-weight: 600; color: #333333; letter-spacing: 0.05em;">
-  LOADING...
-</div>
-<div style="margin-top: 16px; font-family: sans-serif; font-size: 32px;
-            font-weight: 500; color: #555555;">
-  {hostname_line}
-</div>
-{code_line}
 </body>
 </html>
 "#).into_bytes()
+    })
 }
 
 // Shown full-screen at startup, before the first collection completes
@@ -962,8 +1004,7 @@ mod splash_html_tests {
         // own hostname/IP directly on the splash screen, useful during
         // initial setup and while waiting for CMS authorization,
         // instead of requiring a separate SSH session to check).
-        let no_code: RegistrationCodeStore = Arc::new(Mutex::new(None));
-        let html = String::from_utf8(splash_html(&no_code)).unwrap();
+        let html = String::from_utf8(splash_html().to_vec()).unwrap();
         // The real hostname will vary by machine/CI environment, but it
         // must appear verbatim somewhere in the output.
         let hostname = crate::util::get_display_name();
@@ -984,45 +1025,71 @@ mod splash_html_tests {
     }
 
     #[test]
-    fn splash_html_shows_a_registration_code_alongside_the_ip_when_one_is_set() {
-        // "Register via Code" (see authcode.rs): when a code is
-        // currently active, it's shown ALONGSIDE the existing
-        // hostname/IP line, not instead of it -- both are useful during
-        // setup at once.
-        let code: RegistrationCodeStore = Arc::new(Mutex::new(Some("ABC123".to_string())));
-        let html = String::from_utf8(splash_html(&code)).unwrap();
-        assert!(html.contains("ABC123"), "must show the active code -- got:\n{html}");
-        let hostname = crate::util::get_display_name();
-        assert!(html.contains(&hostname),
-                "must still show the hostname/IP line alongside an active code -- got:\n{html}");
-    }
-
-    #[test]
-    fn splash_html_includes_a_manual_registration_form_alongside_the_code() {
-        // The manual CMS address/key fallback (see
-        // ManualRegisterRequest's own doc comment) posts to /register
-        // from the same screen the code is shown on.
-        let code: RegistrationCodeStore = Arc::new(Mutex::new(Some("ABC123".to_string())));
-        let html = String::from_utf8(splash_html(&code)).unwrap();
+    fn splash_html_always_includes_the_manual_registration_form_and_code_poller() {
+        // Regression test for a real report: the code appeared
+        // correctly in the log ("showing code ... on screen") but never
+        // actually appeared on screen, because QtWebEngine only ever
+        // navigates to this page ONCE, at startup (gui/view.cpp) --
+        // long before main.rs's own background thread had a code ready.
+        // Fix: the code section and manual-entry form are now always
+        // present in this same static (OnceLock-cached) HTML,
+        // regardless of whether a code exists yet -- a client-side poll
+        // (see below) fills in/reveals the code later, without ever
+        // needing this page to be reloaded or re-rendered server-side.
+        let html = String::from_utf8(splash_html().to_vec()).unwrap();
         assert!(html.contains("id=\"cms-address\"") && html.contains("id=\"cms-key\""),
-                "must include both manual entry fields -- got:\n{html}");
+                "the manual entry fields must always be present, even before/without a \
+                 registration code -- got:\n{html}");
         assert!(html.contains("fetch('/register'"),
                 "must post the manual entry form to /register -- got:\n{html}");
+        assert!(html.contains("id=\"registration-code-section\""),
+                "the (initially hidden) code section must always be present in the markup \
+                 -- got:\n{html}");
+        assert!(html.contains("fetch('/registration-code')"),
+                "must poll /registration-code client-side to fill in a code that appears \
+                 after this page was first loaded -- got:\n{html}");
+    }
+}
+
+#[cfg(test)]
+mod registration_code_endpoint_tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn start_test_server(initial_code: Option<&str>) -> u16 {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_registration_code_test_{}_{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let registration_code: RegistrationCodeStore =
+            Arc::new(Mutex::new(initial_code.map(str::to_string)));
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
+                                  manual_register_tx, local_data, registration_code).unwrap();
+        let port = server.port();
+        server.start_pool();
+        port
     }
 
     #[test]
-    fn splash_html_reads_the_registration_code_fresh_on_every_call() {
-        // Unlike the hostname/IP portion (genuinely static for a
-        // process's lifetime, and so cached in a OnceLock), the code
-        // itself changes over a single run (absent, then a real code
-        // once authcode::generate_code returns one) -- confirm this
-        // reflects a change between two calls, not a stale first value
-        // baked in and never revisited.
-        let code: RegistrationCodeStore = Arc::new(Mutex::new(None));
-        let before = String::from_utf8(splash_html(&code)).unwrap();
-        assert!(!before.contains("XYZ999"));
-        *code.lock().unwrap() = Some("XYZ999".to_string());
-        let after = String::from_utf8(splash_html(&code)).unwrap();
-        assert!(after.contains("XYZ999"), "must pick up a code set after the first call");
+    fn returns_null_when_no_code_is_active() {
+        let port = start_test_server(None);
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/registration-code")).call().unwrap();
+        let body = resp.into_body().read_to_string().unwrap();
+        assert_eq!(body, r#"{"code":null}"#);
+    }
+
+    #[test]
+    fn returns_the_active_code() {
+        let port = start_test_server(Some("ABC123"));
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/registration-code")).call().unwrap();
+        let body = resp.into_body().read_to_string().unwrap();
+        assert_eq!(body, r#"{"code":"ABC123"}"#);
     }
 }
