@@ -136,6 +136,20 @@ pub struct Server {
     manual_register_tx: Sender<ManualRegisterRequest>,
     local_data: LocalDataStore,
     registration_code: RegistrationCodeStore,
+    /// Whether this run started with no real CMS config at all (see
+    /// main.rs's own "awaiting_code" doc comment) -- decided once at
+    /// startup, never changes for this process's lifetime. Splash
+    /// (layout 0) is shown briefly on *every* startup, registered or
+    /// not, while the real first layout resolves -- without this, the
+    /// registration form/code-poll script was unconditionally embedded
+    /// in that same splash regardless, so an already-registered
+    /// display would still poll `/registration-code` once or twice
+    /// during its own brief splash, before navigating away to the real
+    /// layout: harmless (the poll just gets a `null` code and the page
+    /// navigates away before ever mattering), but confusing log noise
+    /// on every single normal boot -- a real report asked about this
+    /// exact line. Gating the whole section on this instead.
+    awaiting_registration: bool,
 }
 
 impl Server {
@@ -147,12 +161,13 @@ impl Server {
     pub fn new(dir: PathBuf, bind_addr: &str, port: u16,
                duration_tx: Sender<DurationRequest>, trigger_tx: Sender<TriggerRequest>,
                fault_tx: Sender<FaultRequest>, manual_register_tx: Sender<ManualRegisterRequest>,
-               local_data: LocalDataStore, registration_code: RegistrationCodeStore) -> Result<Self> {
+               local_data: LocalDataStore, registration_code: RegistrationCodeStore,
+               awaiting_registration: bool) -> Result<Self> {
         let server = tiny_http::Server::http((bind_addr, port))
             .map_err(|e| anyhow!(e))?;
         let dir = dir.canonicalize().context("getting canonical server dir name")?;
         Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, manual_register_tx,
-                  local_data, registration_code })
+                  local_data, registration_code, awaiting_registration })
     }
 
     pub fn port(&self) -> u16 {
@@ -170,11 +185,13 @@ impl Server {
             let manual_register_tx = self.manual_register_tx.clone();
             let local_data = self.local_data.clone();
             let registration_code = self.registration_code.clone();
+            let awaiting_registration = self.awaiting_registration;
             thread::spawn(move || {
                 loop {
                     let mut req = server.recv().unwrap();
                     match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx,
-                                       &manual_register_tx, &local_data, &registration_code) {
+                                       &manual_register_tx, &local_data, &registration_code,
+                                       awaiting_registration) {
                         Ok(resp) => {  let _ = req.respond(resp); }
                         Err(e) => {
                             log::warn!("processing HTTP req {}: {:#}", req.url(), e);
@@ -288,9 +305,10 @@ impl Server {
     fn serve(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
              trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
              manual_register_tx: &Sender<ManualRegisterRequest>,
-             local_data: &LocalDataStore, registration_code: &RegistrationCodeStore) -> Result<ResponseBox> {
+             local_data: &LocalDataStore, registration_code: &RegistrationCodeStore,
+             awaiting_registration: bool) -> Result<ResponseBox> {
         let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, manual_register_tx,
-                                      local_data, registration_code)?;
+                                      local_data, registration_code, awaiting_registration)?;
         Ok(resp.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()))
     }
 
@@ -298,7 +316,8 @@ impl Server {
     fn serve_inner(dir: &Path, req: &mut Request, duration_tx: &Sender<DurationRequest>,
                     trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
                     manual_register_tx: &Sender<ManualRegisterRequest>,
-                    local_data: &LocalDataStore, registration_code: &RegistrationCodeStore) -> Result<ResponseBox> {
+                    local_data: &LocalDataStore, registration_code: &RegistrationCodeStore,
+                    awaiting_registration: bool) -> Result<ResponseBox> {
         log::debug!("HTTP request: {}", req.url());
         let url = req.url();
         let (path_only, query) = url.split_once('?').unwrap_or((url, ""));
@@ -308,7 +327,7 @@ impl Server {
             "/branding.png" => Response::from_data(SPLASH_LOGO)
                 .with_header(Header::from_bytes(b"Content-Type", b"image/png").unwrap())
                 .boxed(),
-            "/0.xlf.html" => Response::from_data(splash_html()).boxed(),
+            "/0.xlf.html" => Response::from_data(splash_html(awaiting_registration)).boxed(),
 
             // Interactive Control duration overrides (see
             // xibo-interactive-control's setWidgetDuration/
@@ -481,16 +500,27 @@ impl Server {
 }
 
 // Shows the totem's own hostname/IP on the splash screen -- avoids
-// needing a separate SSH session during setup/CMS authorization.
-// Computed once (OnceLock), shared across every Server instance.
+// needing a separate SSH session during setup/CMS authorization. Only
+// this part is cached (OnceLock) -- it's the one genuinely expensive
+// bit (a `hostname -I` shell-out), and it never depends on
+// `awaiting_registration` at all.
 //
-// The manual-entry form and code display are always present
-// (regardless of whether a code exists yet); the code itself is
-// filled in client-side by polling `/registration-code`, since
-// QtWebEngine only ever loads this page once, at startup.
-fn splash_html() -> &'static [u8] {
-    static SPLASH: OnceLock<Vec<u8>> = OnceLock::new();
-    SPLASH.get_or_init(|| {
+// The manual-entry form/code-poll section is only included when
+// `awaiting_registration` is true -- splash (layout 0) is shown
+// briefly on *every* startup, registered or not, while the real first
+// layout resolves. Without this, an already-registered display would
+// still poll `/registration-code` once or twice during its own brief
+// splash before navigating away: harmless, but confusing log noise on
+// every single normal boot (a real report asked about this exact
+// line). The rest of the page (unconditionally) is cheap enough to
+// build fresh on every call, not cached as a whole -- deliberately,
+// since a single process only ever calls this with one consistent
+// `awaiting_registration` value, but a *test* binary calling it with
+// both in the same run must see each one reflected correctly, which
+// whole-page OnceLock caching would have broken.
+fn splash_html(awaiting_registration: bool) -> Vec<u8> {
+    static HOSTNAME_LINE: OnceLock<String> = OnceLock::new();
+    let hostname_line = HOSTNAME_LINE.get_or_init(|| {
         let hostname = crate::util::get_display_name();
         let ips = crate::util::get_local_ips();
         let ips_display = if ips.is_empty() {
@@ -498,34 +528,10 @@ fn splash_html() -> &'static [u8] {
         } else {
             ips.join(", ")
         };
-        format!(r#"<!DOCTYPE html>
-<html>
-<head>
-<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
-<script>
-new QWebChannel(qt.webChannelTransport, function(channel) {{
-  window.arexiboGui = channel.objects.arexibo;
-  window.arexiboGui.jsLayoutInit(0, 1920, 1080);
-}});
-</script>
-</head>
-<body style="margin: 0; width: 100vw; height: 100vh; background-color: #ffffff;
-             display: flex; flex-direction: column; align-items: center;
-             justify-content: center;">
-<img style="max-width: 70vw; max-height: 40vh; width: auto; height: auto;"
-     src="branding.png">
-<!-- Separate HTML text element (the old splash.jpg had "LOADING..."
-     baked into its pixels, lost when replaced with branding.png) --
-     stays readable regardless of whatever logo is configured. -->
-<div style="margin-top: 24px; font-family: sans-serif; font-size: 28px;
-            font-weight: 600; color: #333333; letter-spacing: 0.05em;">
-  LOADING...
-</div>
-<div style="margin-top: 16px; font-family: sans-serif; font-size: 32px;
-            font-weight: 500; color: #555555;">
-  {hostname} &middot; {ips_display}
-</div>
-<div id="registration-code-section" style="display: none; margin-top: 16px;
+        format!("{hostname} &middot; {ips_display}")
+    });
+    let registration_section = if awaiting_registration {
+        r#"<div id="registration-code-section" style="display: none; margin-top: 16px;
      font-family: sans-serif; font-size: 24px; color: #555555;
      text-align: center;">
   <div>Enter this code in your CMS (Displays &rarr; Add Display (Code)):</div>
@@ -551,45 +557,75 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
 <div id="manual-register-status" style="margin-top: 8px; font-family: sans-serif;
      font-size: 18px; color: #888888; min-height: 24px;"></div>
 <script>
-document.getElementById('manual-register-form').addEventListener('submit', function(ev) {{
+document.getElementById('manual-register-form').addEventListener('submit', function(ev) {
   ev.preventDefault();
   var status = document.getElementById('manual-register-status');
   status.textContent = 'Registering...';
-  fetch('/register', {{
+  fetch('/register', {
     method: 'POST',
-    headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
       address: document.getElementById('cms-address').value,
       key: document.getElementById('cms-key').value,
-    }}),
-  }}).then(function(r) {{
+    }),
+  }).then(function(r) {
     status.textContent = r.ok ? 'Registered, restarting...'
                                : 'Please check the address/key and try again.';
-  }}).catch(function() {{
+  }).catch(function() {
     status.textContent = 'Network error, please try again.';
-  }});
-}});
+  });
+});
 // Stops once a code appears -- it won't change again this run.
 var registrationCodePoll = setInterval(pollRegistrationCode, 3000);
-function pollRegistrationCode() {{
-  fetch('/registration-code').then(function(r) {{ return r.json(); }})
-    .then(function(data) {{
+function pollRegistrationCode() {
+  fetch('/registration-code').then(function(r) { return r.json(); })
+    .then(function(data) {
       var section = document.getElementById('registration-code-section');
-      if (data.code) {{
+      if (data.code) {
         document.getElementById('registration-code-value').textContent = data.code;
         section.style.display = 'block';
         clearInterval(registrationCodePoll);
-      }} else {{
+      } else {
         section.style.display = 'none';
-      }}
-    }}).catch(function() {{}});
-}}
+      }
+    }).catch(function() {});
+}
 pollRegistrationCode();
+</script>"#
+    } else {
+        ""
+    };
+    format!(r#"<!DOCTYPE html>
+<html>
+<head>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>
+new QWebChannel(qt.webChannelTransport, function(channel) {{
+  window.arexiboGui = channel.objects.arexibo;
+  window.arexiboGui.jsLayoutInit(0, 1920, 1080);
+}});
 </script>
+</head>
+<body style="margin: 0; width: 100vw; height: 100vh; background-color: #ffffff;
+             display: flex; flex-direction: column; align-items: center;
+             justify-content: center;">
+<img style="max-width: 70vw; max-height: 40vh; width: auto; height: auto;"
+     src="branding.png">
+<!-- Separate HTML text element (the old splash.jpg had "LOADING..."
+     baked into its pixels, lost when replaced with branding.png) --
+     stays readable regardless of whatever logo is configured. -->
+<div style="margin-top: 24px; font-family: sans-serif; font-size: 28px;
+            font-weight: 600; color: #333333; letter-spacing: 0.05em;">
+  LOADING...
+</div>
+<div style="margin-top: 16px; font-family: sans-serif; font-size: 32px;
+            font-weight: 500; color: #555555;">
+  {hostname_line}
+</div>
+{registration_section}
 </body>
 </html>
 "#).into_bytes()
-    })
 }
 
 // Shown full-screen at startup, before the first collection completes
@@ -631,7 +667,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
         let port = server.port();
         server.start_pool();
         (port, local_data)
@@ -673,7 +709,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -696,7 +732,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -720,7 +756,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -774,7 +810,7 @@ mod stable_port_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
         assert_eq!(server.port(), EMBEDDED_SERVER_PORT,
                    "the embedded server must use the fixed, stable port constant, \
                     not a randomly OS-assigned one -- otherwise cached widget iframe \
@@ -800,7 +836,7 @@ mod no_cache_header_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -881,7 +917,7 @@ mod json_content_type_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -910,7 +946,7 @@ mod manual_register_tests {
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
                                   manual_register_tx, local_data,
-                                  Arc::new(Mutex::new(None))).unwrap();
+                                  Arc::new(Mutex::new(None)), false).unwrap();
         let port = server.port();
         server.start_pool();
         (port, manual_register_rx)
@@ -954,7 +990,7 @@ mod splash_html_tests {
         // own hostname/IP directly on the splash screen, useful during
         // initial setup and while waiting for CMS authorization,
         // instead of requiring a separate SSH session to check).
-        let html = String::from_utf8(splash_html().to_vec()).unwrap();
+        let html = String::from_utf8(splash_html(true)).unwrap();
         // The real hostname will vary by machine/CI environment, but it
         // must appear verbatim somewhere in the output.
         let hostname = crate::util::get_display_name();
@@ -975,29 +1011,39 @@ mod splash_html_tests {
     }
 
     #[test]
-    fn splash_html_always_includes_the_manual_registration_form_and_code_poller() {
-        // Regression test for a real report: the code appeared
-        // correctly in the log ("showing code ... on screen") but never
-        // actually appeared on screen, because QtWebEngine only ever
-        // navigates to this page ONCE, at startup (gui/view.cpp) --
-        // long before main.rs's own background thread had a code ready.
-        // Fix: the code section and manual-entry form are now always
-        // present in this same static (OnceLock-cached) HTML,
-        // regardless of whether a code exists yet -- a client-side poll
-        // (see below) fills in/reveals the code later, without ever
-        // needing this page to be reloaded or re-rendered server-side.
-        let html = String::from_utf8(splash_html().to_vec()).unwrap();
+    fn splash_html_includes_the_manual_registration_form_and_code_poller_when_awaiting_registration() {
+        let html = String::from_utf8(splash_html(true)).unwrap();
         assert!(html.contains("id=\"cms-address\"") && html.contains("id=\"cms-key\""),
-                "the manual entry fields must always be present, even before/without a \
-                 registration code -- got:\n{html}");
+                "the manual entry fields must be present -- got:\n{html}");
         assert!(html.contains("fetch('/register'"),
                 "must post the manual entry form to /register -- got:\n{html}");
         assert!(html.contains("id=\"registration-code-section\""),
-                "the (initially hidden) code section must always be present in the markup \
+                "the (initially hidden) code section must be present in the markup \
                  -- got:\n{html}");
         assert!(html.contains("fetch('/registration-code')"),
                 "must poll /registration-code client-side to fill in a code that appears \
                  after this page was first loaded -- got:\n{html}");
+    }
+
+    #[test]
+    fn splash_html_omits_the_registration_section_entirely_when_already_configured() {
+        // Regression test for a real report: splash (layout 0) is
+        // shown briefly on *every* startup, registered or not, while
+        // the real first layout resolves -- an already-registered
+        // display was still polling /registration-code once or twice
+        // during its own brief splash before this fix, purely because
+        // the whole section used to be unconditional. Confirmed
+        // harmless in practice (the page navigates away before it ever
+        // matters), but confusing log noise on every single normal
+        // boot.
+        let html = String::from_utf8(splash_html(false)).unwrap();
+        assert!(!html.contains("registration-code") && !html.contains("cms-address")
+                && !html.contains("/register"),
+                "an already-configured display's own splash must not poll/reference \
+                 registration at all -- got:\n{html}");
+        // The rest of the splash (hostname/IP, loading text) is
+        // unaffected either way.
+        assert!(html.contains("LOADING..."));
     }
 }
 
@@ -1021,7 +1067,7 @@ mod registration_code_endpoint_tests {
         let registration_code: RegistrationCodeStore =
             Arc::new(Mutex::new(initial_code.map(str::to_string)));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
-                                  manual_register_tx, local_data, registration_code).unwrap();
+                                  manual_register_tx, local_data, registration_code, false).unwrap();
         let port = server.port();
         server.start_pool();
         port

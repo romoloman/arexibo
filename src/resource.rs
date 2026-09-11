@@ -4,7 +4,7 @@
 //! Handling resources such as media and layout files.
 
 use std::collections::HashMap;
-use std::{fs, io, io::Write, path::PathBuf, sync::Arc};
+use std::{fs, io, io::Write, path::{Path, PathBuf}, sync::Arc};
 use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use elementtree::Element;
@@ -61,17 +61,40 @@ impl ReqFile {
         }
     }
 
-    pub fn inventory(&self) -> (&'static str, i64) {
+    /// Builds the MediaInventory entry for this file -- see
+    /// InventoryEntry's own doc comment for why dependencies need a
+    /// distinct shape from every other file type here.
+    pub fn to_inventory_entry(&self, complete: bool) -> InventoryEntry {
         match self {
-            ReqFile::File { id, typ, .. } => (typ, *id),
-            ReqFile::Resource { id, .. } => ("resource", *id),
-            // Dependencies have no integer id (see the variant's own
-            // doc comment) and aren't part of MediaInventory reporting
-            // in the reference client either -- 0 is a harmless
-            // placeholder, never actually looked up by this id.
-            ReqFile::Dependency { .. } => ("dependency", 0),
+            ReqFile::File { id, typ, .. } => InventoryEntry::Simple { typ, id: *id, complete },
+            ReqFile::Resource { id, .. } => InventoryEntry::Simple { typ: "resource", id: *id, complete },
+            ReqFile::Dependency { id, file_type, .. } =>
+                InventoryEntry::Dependency { id: id.clone(), file_type: file_type.clone(), complete },
         }
     }
+}
+
+/// One entry in a MediaInventory submission -- confirmed real from the
+/// reference client's own source (xibo-dotnetclient's RequiredFiles.cs,
+/// ReportInventory()): media/layout/resource files use `<file type=
+/// "..." id="{int}" complete="0|1"/>`, but a dependency (font, player
+/// bundle JS/CSS, etc.) uses a *distinct* shape --
+/// `<file type="dependency" id="{string}" fileType="{string}"
+/// complete="0|1" lastChecked="{timestamp}"/>` -- its own `id` is a
+/// string (e.g. a font file's name), not the integer every other file
+/// type uses, and it carries an extra `fileType` (font/bundle/fontCss/
+/// etc.) and `lastChecked` attribute neither of the others has. A
+/// previous version of this code assumed (never actually verified
+/// against the reference client) that dependencies weren't reported
+/// via MediaInventory at all, and skipped them entirely -- confirmed
+/// wrong from a real report: the CMS's own Manage Display page showed
+/// every dependency file permanently "Pending" even though it
+/// downloaded and served correctly, because the CMS was never once
+/// told it had completed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InventoryEntry {
+    Simple { typ: &'static str, id: i64, complete: bool },
+    Dependency { id: String, file_type: String, complete: bool },
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -212,6 +235,14 @@ struct DataWidgetState {
     last_attempt_failed_at: Option<Instant>,
 }
 
+/// See `Cache::fetch_content`'s own doc comment.
+pub enum FetchedContent {
+    Resource { name: String, info: ResourceInfo, data: String, discover: Option<(i64, LayoutId)> },
+    Layout { name: String, info: LayoutInfo },
+    Media { name: String, info: MediaInfo },
+    Dependency { name: String, info: DependencyInfo },
+}
+
 impl Cache {
     pub fn new(cms: &CmsSettings, dir: PathBuf, clear: bool, no_verify: bool) -> Result<Self> {
         let mut content = HashMap::new();
@@ -282,6 +313,18 @@ impl Cache {
         &self.dir
     }
 
+    /// Needed by mainloop.rs's own parallel download dispatch to build
+    /// each worker's own independent, owned copy (cloned once, up
+    /// front, before dispatching -- see `fetch_content`'s own doc
+    /// comment for why workers never touch `self.cache` at all).
+    pub fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    pub fn code_map(&self) -> &HashMap<String, LayoutId> {
+        &self.code_map
+    }
+
     pub fn has(&self, res: &ReqFile) -> bool {
         match *res {
             ReqFile::Resource { id, updated, .. } => {
@@ -311,23 +354,33 @@ impl Cache {
         self.dir().join(format!("{id}.xlf")).exists()
     }
 
-    pub fn download(&mut self, res: ReqFile, cms: &mut xmds::Cms) -> Result<()> {
+    /// Fetched (network, and for a layout its CPU-bound translation
+    /// pass) but not yet committed to `self.content`/disk metadata --
+    /// returned by `fetch_content`, deliberately callable with no live
+    /// `Cache` at all (see that function's own doc comment for why),
+    /// so a parallel download worker thread (mainloop.rs's own
+    /// `download_required_files`) can call it directly. `commit` (a
+    /// real `&mut self` method) applies this the same way `download`
+    /// always did in one synchronous step, just working from
+    /// already-fetched data instead of fetching it itself.
+    pub fn fetch_content(res: ReqFile, dir: &Path, agent: &Agent,
+                          code_map: &HashMap<String, LayoutId>,
+                          adspace_cfg: Option<crate::adspace::AdspaceConfig>,
+                          html_port: u16, cms: &mut xmds::Cms) -> Result<FetchedContent> {
         match res {
             ReqFile::Resource { id, layoutid, regionid, mediaid, updated } => {
                 let data = cms.get_resource(layoutid, &regionid.to_string(),
-                                            &mediaid.to_string())?;
+                                             &mediaid.to_string())?;
                 let fname = format!("{id}.html");
-
                 // v7 GetData polling groundwork -- explicitly gated
                 // even though the trigger (needs_get_data) never fires
                 // against a real v5 CMS anyway (confirmed via real
                 // comparison): v5's own generated HTML always has data
                 // embedded directly. This gate is defense in depth,
-                // not the only thing keeping this inert on v5.
-                if xmds::xmds_supports_v6_v7_methods() {
-                    self.discover_data_widgets(&data, id, layoutid);
-                }
-
+                // not the only thing keeping this inert on v5. Applied
+                // in `commit` below (needs `&mut self`), not here --
+                // only the *decision* of whether to, made here.
+                let discover = xmds::xmds_supports_v6_v7_methods().then_some((id, layoutid));
                 // TODO: re-download after given updateInterval
                 let duration = data.find("<!-- DURATION=").and_then(|index| {
                     data[index + 14..].find(" -->").and_then(|endindex| {
@@ -339,16 +392,16 @@ impl Cache {
                         data[index + 14..][..endindex].parse::<i64>().ok()
                     })
                 });
-                fs::write(self.dir.join(&fname), data)?;
-                self.content.insert(fname, Resource::Resource(Arc::new(
-                    ResourceInfo { id, layoutid, regionid, mediaid, updated, duration, numitems }
-                )));
-                self.save()?;
+                Ok(FetchedContent::Resource {
+                    name: fname,
+                    info: ResourceInfo { id, layoutid, regionid, mediaid, updated, duration, numitems },
+                    data, discover,
+                })
             }
             ReqFile::File { id, typ, http, size, md5, path, name, code } => {
-                let filename = self.dir.join(&name);
+                let filename = dir.join(&name);
                 if http {
-                    match self.download_http(&path, &filename, Some(&md5)) {
+                    match download_http_to(agent, &path, &filename, Some(&md5)) {
                         Ok(()) => {},
                         Err(e) => {
                             log::warn!("failing download of {name} over http, retrying \
@@ -359,38 +412,25 @@ impl Cache {
                 } else {
                     Self::download_xmds(id, typ, size, cms, &filename, &md5)?;
                 }
-
                 if typ == "layout" {
-                    // translate the layout into HTML
-                    let adspace_cfg = self.adspace_enabled.then(|| crate::adspace::AdspaceConfig {
-                        agent: self.agent.clone(),
-                        cache_dir: self.dir.join("adspace"),
-                        partner: self.adspace_partner.clone(),
-                    });
                     let xl = layout::Translator::new(
-                        id,
-                        &self.dir.join(&name),
-                        &self.dir.join(format!("{name}.html")),
-                        &self.code_map,
-                        adspace_cfg,
-                        self.html_port,
+                        id, &dir.join(&name), &dir.join(format!("{name}.html")),
+                        code_map, adspace_cfg, html_port,
                     )?;
                     let (w, h, enable_stat, sync_keys) = xl.translate()?;
-                    self.content.insert(name, Resource::Layout(Arc::new(
-                        LayoutInfo { id, md5, size: (w, h), code, enable_stat,
-                                     translated_version: TRANSLATOR_VERSION, sync_keys }
-                    )));
+                    Ok(FetchedContent::Layout {
+                        name,
+                        info: LayoutInfo { id, md5, size: (w, h), code, enable_stat,
+                                           translated_version: TRANSLATOR_VERSION, sync_keys },
+                    })
                 } else {
-                    self.content.insert(name, Resource::Media(Arc::new(
-                        MediaInfo { id, size, md5 }
-                    )));
+                    Ok(FetchedContent::Media { name, info: MediaInfo { id, size, md5 } })
                 }
-                self.save()?;
             }
             ReqFile::Dependency { id, file_type, size, http, path, name } => {
-                let filename = self.dir.join(&name);
+                let filename = dir.join(&name);
                 if http {
-                    match self.download_http(&path, &filename, None) {
+                    match download_http_to(agent, &path, &filename, None) {
                         Ok(()) => {},
                         Err(e) => {
                             log::warn!("failing download of dependency {name} over http, \
@@ -401,25 +441,50 @@ impl Cache {
                 } else {
                     Self::download_dependency_xmds(&id, &file_type, size, cms, &filename)?;
                 }
-                self.content.insert(name, Resource::Dependency(Arc::new(
-                    DependencyInfo { id, file_type, size }
-                )));
-                self.save()?;
+                Ok(FetchedContent::Dependency { name, info: DependencyInfo { id, file_type, size } })
             }
         }
-        Ok(())
     }
 
-    fn download_http(&mut self, path: &str, filename: &PathBuf,
-                     md5: Option<&[u8]>) -> Result<()> {
-        let body = self.agent.get(path).call()?.into_body();
-        let file = io::BufWriter::new(fs::File::create(filename)?);
-        let mut wrapper = HashingWriter::new(file);
-        io::copy(&mut body.into_reader(), &mut wrapper)?;
-        if let Some(md5) = md5 {
-            ensure!(wrapper.hash() == md5, "md5 mismatch");
+    /// Applies a `fetch_content` result -- the other half of what
+    /// `download` used to do in one step. Only ever called from the
+    /// main thread (mainloop.rs never calls this from a worker), so no
+    /// locking of `self.content` is needed here at all.
+    pub fn commit(&mut self, content: FetchedContent) -> Result<()> {
+        match content {
+            FetchedContent::Resource { name, info, data, discover } => {
+                if let Some((id, layoutid)) = discover {
+                    self.discover_data_widgets(&data, id, layoutid);
+                }
+                fs::write(self.dir.join(&name), data)?;
+                self.content.insert(name, Resource::Resource(Arc::new(info)));
+            }
+            FetchedContent::Layout { name, info } => {
+                self.content.insert(name, Resource::Layout(Arc::new(info)));
+            }
+            FetchedContent::Media { name, info } => {
+                self.content.insert(name, Resource::Media(Arc::new(info)));
+            }
+            FetchedContent::Dependency { name, info } => {
+                self.content.insert(name, Resource::Dependency(Arc::new(info)));
+            }
         }
-        Ok(())
+        self.save()
+    }
+
+    /// Fetches and commits in one synchronous step -- kept for
+    /// existing single-threaded call sites (mostly tests); the actual
+    /// parallel dispatch (mainloop.rs's own `download_required_files`)
+    /// calls `fetch_content`/`commit` separately instead.
+    pub fn download(&mut self, res: ReqFile, cms: &mut xmds::Cms) -> Result<()> {
+        let adspace_cfg = self.adspace_enabled.then(|| crate::adspace::AdspaceConfig {
+            agent: self.agent.clone(),
+            cache_dir: self.dir.join("adspace"),
+            partner: self.adspace_partner.clone(),
+        });
+        let content = Self::fetch_content(res, &self.dir, &self.agent, &self.code_map,
+                                           adspace_cfg, self.html_port, cms)?;
+        self.commit(content)
     }
 
     fn download_xmds(id: i64, typ: &str, size: u64, cms: &mut xmds::Cms,
@@ -904,6 +969,22 @@ impl Cache {
     }
 }
 
+
+/// Free function version of what used to be a `&mut self` method --
+/// only ever needs a `ureq::Agent` (cheap to give an independent clone
+/// of to each parallel download worker; see mainloop.rs's own
+/// `download_required_files`), nothing else from `Cache` itself.
+fn download_http_to(agent: &Agent, path: &str, filename: &PathBuf,
+                     md5: Option<&[u8]>) -> Result<()> {
+    let body = agent.get(path).call()?.into_body();
+    let file = io::BufWriter::new(fs::File::create(filename)?);
+    let mut wrapper = HashingWriter::new(file);
+    io::copy(&mut body.into_reader(), &mut wrapper)?;
+    if let Some(md5) = md5 {
+        ensure!(wrapper.hash() == md5, "md5 mismatch");
+    }
+    Ok(())
+}
 
 pub struct HashingWriter<W> {
     writer: W,

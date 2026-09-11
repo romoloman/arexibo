@@ -77,6 +77,15 @@ impl SyncRole {
 pub struct PlayerSettings {
     #[serde(default = "default_collect_interval")]
     pub collect_interval: u64,
+    // Confirmed real (present in both REAL_LEAD_XML and
+    // REAL_FOLLOWER_XML in xmds.rs's own tests, value 2 in both), but
+    // never parsed/used until now -- the CMS's own per-display limit
+    // on concurrent file downloads. Defaults to 1 (today's existing
+    // fully-sequential behavior) if a CMS/client-type combination
+    // omits it, rather than assuming it's safe to parallelize without
+    // the CMS ever having said so.
+    #[serde(default = "default_max_concurrent_downloads")]
+    pub max_concurrent_downloads: u32,
     // Matches the real RegisterDisplay parsing fallback (def_child's
     // own `1` -- see xmds.rs) for the same field, same reasoning as
     // send_current_layout_as_status_update's own default_true just
@@ -257,6 +266,7 @@ impl Default for PlayerSettings {
     fn default() -> Self {
         PlayerSettings {
             collect_interval: default_collect_interval(),
+            max_concurrent_downloads: default_max_concurrent_downloads(),
             stats_enabled: true,
             xmr_network_address: String::new(),
             xmr_web_socket_address: String::new(),
@@ -309,6 +319,7 @@ impl fmt::Debug for PlayerSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PlayerSettings")
             .field("collect_interval", &self.collect_interval)
+            .field("max_concurrent_downloads", &self.max_concurrent_downloads)
             .field("stats_enabled", &self.stats_enabled)
             .field("xmr_network_address", &self.xmr_network_address)
             .field("xmr_web_socket_address", &self.xmr_web_socket_address)
@@ -487,6 +498,9 @@ impl ArexiboMeta {
 }
 
 fn default_collect_interval() -> u64 { 900 }
+// Sequential (today's existing, always-correct behavior) unless the
+// CMS explicitly says otherwise -- see the field's own doc comment.
+fn default_max_concurrent_downloads() -> u32 { 1 }
 fn default_true() -> bool { true }
 fn default_log_level() -> String { "debug".into() }
 fn default_embedded_server_port() -> u16 { 9696 }
@@ -666,7 +680,8 @@ mod tests {
         let settings = PlayerSettings::default();
         let debug_output = format!("{settings:?}");
         for field in [
-            "collect_interval", "stats_enabled", "xmr_network_address",
+            "collect_interval", "max_concurrent_downloads", "stats_enabled",
+            "xmr_network_address",
             "xmr_web_socket_address", "xmr_web_socket_address_in_use",
             "xmr_cms_key", "log_level", "screenshot_interval", "screenshot_size",
             "send_current_layout_as_status_update", "is_adspace_enabled",

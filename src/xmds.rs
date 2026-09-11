@@ -16,6 +16,7 @@ use serde::Serialize;
 use crate::config::{CmsSettings, PlayerSettings, SyncRole};
 use crate::command::Command;
 use crate::util::{TIME_FMT, Base64Field, ElementExt, retrieve_mac, get_display_name};
+use time::OffsetDateTime;
 use crate::resource::ReqFile;
 use crate::schedule::Schedule;
 use crate::logger::LogEntry;
@@ -250,6 +251,16 @@ impl Cms {
                 // 300s (5 minutes) matches Xibo's own commonly-documented
                 // default collection interval.
                 collect_interval: tree.def_child("collectInterval", 300u32)?,
+                // Confirmed real (present in a real captured
+                // RegisterDisplay response, value 2 -- see this
+                // module's own REAL_LEAD_XML/REAL_FOLLOWER_XML test
+                // fixtures), but this specific field was never parsed
+                // here until now. `1` (sequential) if the CMS omits
+                // it, matching this project's own established
+                // "unrecognized/absent field -> today's existing safe
+                // behavior" convention for optional fields throughout
+                // this whole function.
+                max_concurrent_downloads: tree.def_child("maxConcurrentDownloads", 1u32)?,
                 // 0 already means "don't poll for screenshots" elsewhere
                 // (see mainloop.rs's `if self.settings.screenshot_interval
                 // != 0`) -- safe, inert default.
@@ -533,13 +544,40 @@ impl Cms {
         Ok(())
     }
 
-    pub fn submit_media_inventory(&mut self, inv: Vec<((&'static str, i64), bool)>) -> Result<()> {
+    pub fn submit_media_inventory(&mut self, inv: Vec<crate::resource::InventoryEntry>) -> Result<()> {
+        use crate::resource::InventoryEntry;
         let mut files = Element::new("files");
-        for ((typ, id), complete) in inv {
+        // Confirmed real from the reference client's own source
+        // (xibo-dotnetclient's RequiredFiles.cs, ReportInventory()):
+        // every dependency entry in the same submission gets the exact
+        // same lastChecked timestamp, snapshotted once per report, not
+        // tracked per-file -- matches that behavior closely enough
+        // (the reference client's own per-file field is set once when
+        // the required-files response is first parsed, not updated
+        // per report either, so a single per-submission "now" is not
+        // meaningfully less accurate). Format (`TIME_FMT`, "YYYY-MM-DD
+        // HH:MM:SS") matches this codebase's own established
+        // convention for every other CMS-facing timestamp, not the
+        // C#reference client's own culture-ambiguous DateTime.ToString()
+        // -- a reasonable choice, not verified byte-for-byte against a
+        // real CMS response.
+        let last_checked = OffsetDateTime::now_utc().format(&TIME_FMT).unwrap_or_default();
+        for entry in inv {
             let mut file = Element::new("file");
-            file.set_attr("type", typ);
-            file.set_attr("id", id.to_string());
-            file.set_attr("complete", if complete { "1" } else { "0" });
+            match entry {
+                InventoryEntry::Simple { typ, id, complete } => {
+                    file.set_attr("type", typ);
+                    file.set_attr("id", id.to_string());
+                    file.set_attr("complete", if complete { "1" } else { "0" });
+                }
+                InventoryEntry::Dependency { id, file_type, complete } => {
+                    file.set_attr("type", "dependency");
+                    file.set_attr("id", id);
+                    file.set_attr("fileType", file_type);
+                    file.set_attr("complete", if complete { "1" } else { "0" });
+                    file.set_attr("lastChecked", &last_checked);
+                }
+            }
             files.append_child(file);
         }
 
@@ -1234,6 +1272,8 @@ mod sync_group_parsing_tests {
         assert_eq!(settings.sync_publisher_port, 9590);
         assert_eq!(settings.sync_switch_delay, 750);
         assert_eq!(settings.sync_video_pause_delay, 100);
+        assert_eq!(settings.max_concurrent_downloads, 2,
+                   "confirmed real in this same capture -- must actually be parsed now");
     }
 
     #[test]
@@ -1258,6 +1298,8 @@ mod sync_group_parsing_tests {
         assert_eq!(settings.sync_publisher_port, 9590);
         assert_eq!(settings.sync_switch_delay, 750);
         assert_eq!(settings.sync_video_pause_delay, 100);
+        assert_eq!(settings.max_concurrent_downloads, 1,
+                   "must fail safe to sequential when the CMS omits this field entirely");
     }
 }
 
@@ -1347,5 +1389,104 @@ mod send_current_layout_as_status_update_parsing_tests {
         let mut cms = test_cms(port);
         let settings = cms.register_display().unwrap().unwrap();
         assert!(settings.send_current_layout_as_status_update);
+    }
+}
+
+#[cfg(test)]
+mod media_inventory_tests {
+    use super::*;
+    use crate::resource::InventoryEntry;
+
+    /// Captures the raw request body sent (not just the response),
+    /// so a test can inspect the actual MediaInventory XML this crate
+    /// sends -- responds with a real, valid MediaInventoryResponse
+    /// (success=true) so the call itself completes normally.
+    fn start_capturing_mock() -> (u16, std::sync::Arc<std::sync::Mutex<String>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_for_thread = captured.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                *captured_for_thread.lock().unwrap() = body;
+                let response_body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><MediaInventoryResponse><success>true</success></MediaInventoryResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(response_body));
+            }
+        });
+        (port, captured)
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_media_inventory_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn a_dependency_entry_is_sent_with_the_reference_clients_own_extended_shape() {
+        // Confirmed real from the reference client's own source
+        // (xibo-dotnetclient's RequiredFiles.cs, ReportInventory()): a
+        // dependency's own MediaInventory entry needs `type="dependency"`,
+        // a *string* `id` (not the integer every other file type uses),
+        // an extra `fileType` attribute, and a `lastChecked` timestamp --
+        // a previous version of this code silently skipped dependencies
+        // from MediaInventory reporting entirely, believing (incorrectly,
+        // never actually verified) that the reference client did too --
+        // confirmed wrong from a real report: the CMS's own Manage
+        // Display page showed every dependency file permanently
+        // "Pending" even though it downloaded and served correctly.
+        let (port, captured) = start_capturing_mock();
+        let mut cms = test_cms(port);
+
+        cms.submit_media_inventory(vec![InventoryEntry::Dependency {
+            id: "AbhayaLibre-Bold.ttf".into(), file_type: "font".into(), complete: true,
+        }]).unwrap();
+
+        let sent = captured.lock().unwrap().clone();
+        assert!(sent.contains(r#"type="dependency""#),
+                "must report type=\"dependency\" -- got:\n{sent}");
+        assert!(sent.contains("AbhayaLibre-Bold.ttf"),
+                "must report the dependency's own string id -- got:\n{sent}");
+        assert!(sent.contains("fileType") && sent.contains(r#"fileType="font""#),
+                "must report the dependency's own fileType (font/bundle/fontCss/etc) -- got:\n{sent}");
+        assert!(sent.contains("lastChecked"),
+                "must report a lastChecked timestamp, same as the reference client -- got:\n{sent}");
+        assert!(sent.contains(r#"complete="1""#),
+                "must still report completion status -- got:\n{sent}");
+    }
+
+    #[test]
+    fn a_simple_entry_keeps_the_original_unchanged_shape() {
+        // Regression guard: media/layout/resource entries must NOT
+        // suddenly gain the dependency-only fileType/lastChecked
+        // attributes -- only dependencies need the extended shape.
+        let (port, captured) = start_capturing_mock();
+        let mut cms = test_cms(port);
+
+        cms.submit_media_inventory(vec![InventoryEntry::Simple {
+            typ: "layout", id: 1136, complete: true,
+        }]).unwrap();
+
+        let sent = captured.lock().unwrap().clone();
+        assert!(sent.contains("1136"), "must report the layout's own integer id -- got:\n{sent}");
+        assert!(!sent.contains("fileType"),
+                "a non-dependency entry must not gain the dependency-only fileType \
+                 attribute -- got:\n{sent}");
+        assert!(!sent.contains("lastChecked"),
+                "a non-dependency entry must not gain the dependency-only lastChecked \
+                 attribute -- got:\n{sent}");
     }
 }

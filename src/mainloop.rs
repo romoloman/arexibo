@@ -13,7 +13,7 @@ use subprocess::Popen;
 use time::OffsetDateTime;
 use crate::config::{ArexiboMeta, CmsSettings, PlayerSettings, SyncRole};
 use crate::{logger, schedule, server, syncgroup, util, xmds, xmr};
-use crate::resource::{Cache, ReqFile};
+use crate::resource::{Cache, FetchedContent, ReqFile};
 use crate::faults;
 use crate::schedule::Schedule;
 use crate::stats::{StatCollector, LayoutStat};
@@ -420,15 +420,19 @@ const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
 /// requests while genuinely just waiting.
 const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Whether any *media* or *layout* file in a collection cycle's own
-/// per-file download results failed -- used by
+/// Whether any *media*, *layout*, or *dependency* file in a collection
+/// cycle's own per-file download results failed -- used by
 /// `maybe_force_reload_after_purge` (see its own doc comment) to avoid
 /// firing a purge-triggered reload before every piece the currently-
-/// showing layout might need is actually back on disk.
+/// showing layout might need is actually back on disk. Dependencies
+/// (fonts, the player bundle JS/CSS for Elements-based widgets) count
+/// here too -- a currently-showing layout's own rendering genuinely
+/// depends on them the same way it depends on its own media/layout
+/// files.
 ///
 /// "resource" failures (dataset/webpage-manual/bestfit widgets, see
-/// their own `ReqFile::inventory()`) are deliberately excluded: those
-/// already have their own, separate recovery mechanism
+/// their own `ReqFile::to_inventory_entry()`) are deliberately
+/// excluded: those already have their own, separate recovery mechanism
 /// (`resource_retry_queue`'s own short-delay retry, plus
 /// `note_layout_file_downloaded`'s own reload-on-arrival for the
 /// currently-showing layout) once they eventually download
@@ -438,8 +442,12 @@ const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// this one small piece of logic is directly unit-testable against a
 /// plain, hand-built slice, without needing a real `Handler` or any
 /// network/collection machinery at all.
-fn any_non_resource_failure(result: &[((&'static str, i64), bool)]) -> bool {
-    result.iter().any(|((typ, _), success)| *typ != "resource" && !success)
+fn any_non_resource_failure(result: &[crate::resource::InventoryEntry]) -> bool {
+    use crate::resource::InventoryEntry;
+    result.iter().any(|entry| match entry {
+        InventoryEntry::Simple { typ, complete, .. } => *typ != "resource" && !complete,
+        InventoryEntry::Dependency { complete, .. } => !complete,
+    })
 }
 
 impl Handler {
@@ -1562,8 +1570,25 @@ impl Handler {
     /// real `Cache` without needing to mock the full RegisterDisplay/
     /// RequiredFiles/Schedule/GetWeather/SubmitLog/NotifyStatus SOAP
     /// chain `collect_once` otherwise requires just to reach it.
+    /// Builds a fresh, entirely independent `xmds::Cms` instance,
+    /// identical in configuration to `self.xmds` -- used to give each
+    /// parallel download worker its own client (`Cms` has no real
+    /// mutable session state at all, just plain config fields plus a
+    /// `ureq::Agent`, itself already `Clone`; every XMDS call
+    /// self-authenticates via the CMS key/hardware key baked into the
+    /// request body, not a server-side session, so this is safe -- see
+    /// download_required_files's own doc comment for the full
+    /// reasoning). Cheap: no network call happens here, just
+    /// re-deriving the same public key PEM from the already-loaded
+    /// private key (same pattern already used in commit_cms_migration).
+    fn new_worker_cms(&self) -> Result<xmds::Cms> {
+        let pub_key = RsaPublicKey::from(&self.xmr_privkey).to_public_key_pem(Default::default())
+            .context("re-deriving public key for a download worker's own Cms")?;
+        xmds::Cms::new(&self.cms, pub_key, self.no_verify, self.envdir.join("xml"))
+    }
+
     fn download_required_files(&mut self, required: Vec<ReqFile>, current_scheduleid: i64,
-                                schedule: &Schedule) -> Vec<((&'static str, i64), bool)> {
+                                schedule: &Schedule) -> Vec<crate::resource::InventoryEntry> {
         let mut result = Vec::new();
         let total = required.len();
         // DownloadStartWindow/DownloadEndWindow gates only bulk file
@@ -1578,19 +1603,12 @@ impl Handler {
                        self.settings.download_end_window);
             return result;
         }
-        for (i, file) in required.into_iter().enumerate() {
-            let filedesc = file.description();
-            let inventory = file.inventory();
-            // Dependencies are excluded from the MediaInventory report
-            // below entirely -- unlike media/layout files, they have
-            // no single meaningful integer id to report (see ReqFile::
-            // Dependency's own doc comment), and the reference client
-            // doesn't appear to report on them via MediaInventory
-            // either. Reporting a synthetic placeholder id for every
-            // dependency downloaded/cached in the same cycle would
-            // produce multiple identical, meaningless entries in that
-            // report.
-            let is_dependency = matches!(file, crate::resource::ReqFile::Dependency { .. });
+        // Phase 1: filter down to genuinely pending items -- unchanged
+        // from before parallel downloading existed (has()/exempt
+        // checks are cheap, local, and don't benefit from
+        // parallelizing at all).
+        let mut pending: Vec<ReqFile> = Vec::new();
+        for file in required {
             if self.cache.has(&file) {
                 // A file already fully cached from an earlier cycle
                 // (re-scheduled after being removed) used to be
@@ -1598,8 +1616,11 @@ impl Handler {
                 // cached -- so it was never included in a later
                 // collection's own MediaInventory, leaving the CMS's
                 // Manage Display view showing it pending indefinitely
-                // even though it was already playing correctly.
-                if !is_dependency { result.push((inventory, true)); }
+                // even though it was already playing correctly. This
+                // now applies to dependencies too (see InventoryEntry's
+                // own doc comment for the real report that found they
+                // need reporting at all).
+                result.push(file.to_inventory_entry(true));
                 continue;
             }
             let still_present_on_disk = match &file {
@@ -1617,22 +1638,84 @@ impl Handler {
                 // already-fully-cached case just above.
                 continue;
             }
-            {
-                // Captured before `file` is moved into `download()` below
-                // -- used only to attach a layoutId to a fault report if
-                // this specific download fails and it was a layout (see
-                // faults.rs; other required-file types aren't reported
-                // as faults yet, deliberately scoped out for now).
+            pending.push(file);
+        }
+        if pending.is_empty() {
+            return result;
+        }
+
+        // Phase 2/3: fetch in parallel (bounded by max_concurrent_downloads,
+        // straight from the CMS's own RegisterDisplay response -- see
+        // PlayerSettings::max_concurrent_downloads's own doc comment;
+        // 1 means fully sequential, today's original behavior, unless
+        // the CMS ever says otherwise), then commit -- and handle
+        // success/failure exactly as the original sequential version
+        // did -- one at a time, back on this thread. Splitting fetch
+        // (network + CPU-bound layout translation, safe to run
+        // concurrently -- see Cache::fetch_content's own doc comment)
+        // from commit (mutates self.cache.content/disk metadata,
+        // deliberately kept single-threaded so nothing there ever
+        // needs a lock) is what makes this safe without touching
+        // Cache's own internals' thread-safety at all.
+        let pending_count = pending.len();
+        let max_workers = (self.settings.max_concurrent_downloads as usize).max(1);
+        let dir = self.cache.dir().clone();
+        let agent = self.cache.agent().clone();
+        let code_map = self.cache.code_map().clone();
+        let adspace_cfg = self.cache.adspace_enabled.then(|| crate::adspace::AdspaceConfig {
+            agent: agent.clone(), cache_dir: dir.join("adspace"),
+            partner: self.cache.adspace_partner.clone(),
+        });
+        let html_port = self.cache.html_port;
+        let mut done = 0usize;
+
+        for chunk in pending.chunks(max_workers) {
+            let mut cms_instances: Vec<Result<xmds::Cms>> =
+                chunk.iter().map(|_| self.new_worker_cms()).collect();
+            let adspace_cfg = &adspace_cfg;
+            let dir = &dir;
+            let agent = &agent;
+            let code_map = &code_map;
+            let fetch_results: Vec<(ReqFile, Result<FetchedContent>)> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = chunk.iter().zip(cms_instances.iter_mut())
+                        .map(|(file, cms_result)| {
+                            let file = file.clone();
+                            let adspace_cfg = adspace_cfg.clone();
+                            scope.spawn(move || {
+                                let fetch_result = match cms_result {
+                                    Ok(cms) => Cache::fetch_content(
+                                        file.clone(), dir, agent, code_map,
+                                        adspace_cfg, html_port, cms),
+                                    Err(e) => Err(anyhow::anyhow!(
+                                        "constructing this worker's own Cms: {e:#}")),
+                                };
+                                (file, fetch_result)
+                            })
+                        })
+                        .collect();
+                    handles.into_iter()
+                        .map(|h| h.join().expect("download worker thread panicked"))
+                        .collect()
+                });
+
+            for (file, fetch_result) in fetch_results {
+                done += 1;
+                let filedesc = file.description();
+                // Captured before `file` is moved into the fault-report
+                // path below -- see faults.rs; other required-file
+                // types aren't reported as faults yet, deliberately
+                // scoped out for now.
                 let layout_id_if_any = match &file {
                     ReqFile::File { typ: "layout", id, .. } => Some(*id),
                     _ => None,
                 };
-                log::info!("downloading required file {}/{}: {}", i+1, total, filedesc);
-                match self.cache.download(file.clone(), &mut self.xmds)
-                                .with_context(|| format!("downloading {filedesc}"))
-                {
+                log::info!("downloading required file {done}/{pending_count} \
+                            (of {total} total this cycle): {filedesc}");
+                match fetch_result.and_then(|content| self.cache.commit(content))
+                                  .with_context(|| format!("downloading {filedesc}")) {
                     Ok(()) => {
-                        if !is_dependency { result.push((inventory, true)); }
+                        result.push(file.to_inventory_entry(true));
                         // A media item changed in the CMS's own library
                         // without republishing the layout still bumps
                         // the layout's own required version too -- both
@@ -1659,10 +1742,12 @@ impl Handler {
                         // (see resource_retry_queue's own doc comment)
                         // instead of just being reported as failed.
                         if matches!(file, crate::resource::ReqFile::Resource { .. }) {
+                            result.push(file.to_inventory_entry(false));
                             self.resource_retry_queue.push((file, 0));
                             self.resource_retry_timer = after(RESOURCE_RETRY_DELAY);
+                        } else {
+                            result.push(file.to_inventory_entry(false));
                         }
-                        if !is_dependency { result.push((inventory, false)); }
                     }
                 }
             }
@@ -5354,25 +5439,33 @@ mod data_refresh_timer_tests {
         // must NOT count -- those already self-heal via
         // resource_retry_queue/note_layout_file_downloaded once they
         // eventually succeed.
+        use crate::resource::InventoryEntry;
+        fn simple(typ: &'static str, id: i64, complete: bool) -> InventoryEntry {
+            InventoryEntry::Simple { typ, id, complete }
+        }
         assert!(!any_non_resource_failure(&[]),
                 "an empty result (e.g. nothing needed downloading) must not count as a \
                  failure");
-        assert!(!any_non_resource_failure(&[(("media", 1), true), (("layout", 2), true)]),
+        assert!(!any_non_resource_failure(&[simple("media", 1, true), simple("layout", 2, true)]),
                 "all-success must not count as a failure");
-        assert!(any_non_resource_failure(&[(("media", 1), false)]),
+        assert!(any_non_resource_failure(&[simple("media", 1, false)]),
                 "a failed media file must count as a failure");
-        assert!(any_non_resource_failure(&[(("layout", 1), false)]),
+        assert!(any_non_resource_failure(&[simple("layout", 1, false)]),
                 "a failed layout file must count as a failure");
-        assert!(!any_non_resource_failure(&[(("resource", 1), false)]),
+        assert!(!any_non_resource_failure(&[simple("resource", 1, false)]),
                 "a failed *resource* (dataset/webpage-manual/bestfit) must NOT count -- \
                  those already self-heal via resource_retry_queue/\
                  note_layout_file_downloaded once they eventually succeed");
-        assert!(any_non_resource_failure(&[(("resource", 1), false), (("media", 2), false)]),
+        assert!(any_non_resource_failure(&[simple("resource", 1, false), simple("media", 2, false)]),
                 "a genuine media failure must still count even alongside an ignored \
                  resource failure");
-        assert!(!any_non_resource_failure(&[(("resource", 1), false), (("media", 2), true)]),
+        assert!(!any_non_resource_failure(&[simple("resource", 1, false), simple("media", 2, true)]),
                 "an ignored resource failure alongside an otherwise fully successful \
                  collection must not count as a failure overall");
+        assert!(any_non_resource_failure(&[InventoryEntry::Dependency {
+                    id: "AbhayaLibre-Bold.ttf".into(), file_type: "font".into(), complete: false }]),
+                "a failed dependency (font/bundle/fontCss) must count as a failure too -- a \
+                 currently-showing layout's own rendering genuinely depends on these");
     }
 
     #[test]
@@ -5503,7 +5596,8 @@ mod data_refresh_timer_tests {
 
         let result = handler.download_required_files(vec![file], 0, &Schedule::default());
 
-        assert_eq!(result, vec![(("layout", 100), true)],
+        assert_eq!(result, vec![crate::resource::InventoryEntry::Simple {
+                        typ: "layout", id: 100, complete: true }],
                     "an already-cached file must still be reported as complete in this \
                      collection's own MediaInventory submission, not silently omitted \
                      just because it didn't need downloading this cycle");
@@ -5536,7 +5630,8 @@ mod data_refresh_timer_tests {
 
         let result = handler.download_required_files(vec![file], 0, &Schedule::default());
 
-        assert_eq!(result, vec![(("layout", 999), false)],
+        assert_eq!(result, vec![crate::resource::InventoryEntry::Simple {
+                        typ: "layout", id: 999, complete: false }],
                     "a genuinely missing file that fails to download must still be \
                      reported as incomplete, same as before this fix");
     }
@@ -6636,5 +6731,189 @@ mod sync_group_schedule_check_tests {
         assert_eq!(handler.pending_sync_keys, Some(vec!["already-pending".to_string()]),
                    "an already-pending sync_keys value must be left completely \
                     untouched when a different, not-yet-cached layout is discovered");
+    }
+}
+
+#[cfg(test)]
+mod parallel_download_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn start_mock_ready() -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        port
+    }
+
+    /// Same minimal "READY" mock used elsewhere in this file, but also
+    /// tracks how many requests were genuinely in flight *at the same
+    /// time* (a small artificial delay before responding widens the
+    /// window in which concurrent requests can actually overlap) --
+    /// lets a test confirm real concurrency happened, not just that
+    /// results came back correctly.
+    fn start_mock_ready_counting_concurrency() -> (u16, std::sync::Arc<AtomicU32>) {
+        let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let current = std::sync::Arc::new(AtomicU32::new(0));
+        let max_seen = std::sync::Arc::new(AtomicU32::new(0));
+        // Several handling threads sharing the same server, matching
+        // server.rs's own real `start_pool` pattern -- a single
+        // handling thread/loop (this mock's first draft) can only ever
+        // process one request at a time itself, regardless of how many
+        // requests a genuinely-parallel client sends concurrently, so
+        // it could never actually observe real client-side concurrency
+        // at all (confirmed the hard way: every attempt showed "1",
+        // never more, until this fix).
+        for _ in 0..8 {
+            let server = server.clone();
+            let current = current.clone();
+            let max_seen = max_seen.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let Ok(request) = server.recv() else { break };
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                    let _ = request.respond(tiny_http::Response::from_string(body));
+                }
+            });
+        }
+        (port, max_seen)
+    }
+
+    fn test_cms_settings(port: u16) -> CmsSettings {
+        CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(), display_id: "test-display".into(),
+            display_name: None, proxy: None,
+        }
+    }
+
+    fn test_envdir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_parallel_download_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn not_cached_layout_file(id: i64) -> ReqFile {
+        ReqFile::File { id, typ: "layout", size: 100, md5: vec![1, 2, 3],
+                         http: false, path: String::new(), name: format!("{id}.xlf"),
+                         code: None }
+    }
+
+    #[test]
+    fn several_pending_downloads_are_all_processed_in_order_even_if_some_fail() {
+        // The mock here never serves real file content (same mechanism
+        // the existing single-file failure test above relies on) --
+        // every one of these genuinely fails. The point of this test
+        // is that *all* of them still get processed and correctly
+        // reported, in the same order they were given, whether
+        // dispatched in parallel chunks or not -- confirmed with the
+        // user: a failure must not block the others, same as the
+        // original sequential behavior.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
+        handler.settings.max_concurrent_downloads = 3;
+
+        let files = vec![not_cached_layout_file(101), not_cached_layout_file(102),
+                          not_cached_layout_file(103), not_cached_layout_file(104)];
+        let result = handler.download_required_files(files, 0, &Schedule::default());
+
+        assert_eq!(result, vec![
+                       crate::resource::InventoryEntry::Simple { typ: "layout", id: 101, complete: false },
+                       crate::resource::InventoryEntry::Simple { typ: "layout", id: 102, complete: false },
+                       crate::resource::InventoryEntry::Simple { typ: "layout", id: 103, complete: false },
+                       crate::resource::InventoryEntry::Simple { typ: "layout", id: 104, complete: false },
+                   ],
+                   "every pending file must still be reported, in the same order given, \
+                    even though none of them succeeded");
+    }
+
+    #[test]
+    fn respects_max_concurrent_downloads_from_the_cms() {
+        // The actual point of this whole feature: confirms genuine
+        // concurrency happens (not just that results come back
+        // correctly, which the test above already covers) -- and that
+        // it never exceeds the CMS's own configured limit.
+        let (port, max_seen) = start_mock_ready_counting_concurrency();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
+        // Reset here -- Handler::new's own initial RegisterDisplay call
+        // (sequential, one request) already touched the counter once,
+        // harmlessly, before this test's own real subject even starts.
+        max_seen.store(0, Ordering::SeqCst);
+        handler.settings.max_concurrent_downloads = 3;
+
+        let files = vec![not_cached_layout_file(201), not_cached_layout_file(202),
+                          not_cached_layout_file(203), not_cached_layout_file(204),
+                          not_cached_layout_file(205)];
+        handler.download_required_files(files, 0, &Schedule::default());
+
+        let observed = max_seen.load(Ordering::SeqCst);
+        assert!(observed > 1,
+                "must actually run more than one download concurrently -- observed {observed}, \
+                 not just sequential");
+        assert!(observed <= 3,
+                "must never exceed the CMS's own configured max_concurrent_downloads (3) -- \
+                 observed {observed} simultaneous requests");
+    }
+
+    #[test]
+    fn a_max_concurrent_downloads_of_one_stays_fully_sequential() {
+        // Today's original, always-safe behavior, still exactly
+        // reachable -- confirms the CMS's own default (1, or an older
+        // CMS/client-type combination that never sends this field at
+        // all) is respected, not silently overridden.
+        let (port, max_seen) = start_mock_ready_counting_concurrency();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
+        max_seen.store(0, Ordering::SeqCst);
+        assert_eq!(handler.settings.max_concurrent_downloads, 1,
+                   "this test's own premise -- the mock's RegisterDisplay response never \
+                    sets this field, so it must already default to 1");
+
+        let files = vec![not_cached_layout_file(301), not_cached_layout_file(302),
+                          not_cached_layout_file(303)];
+        handler.download_required_files(files, 0, &Schedule::default());
+
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1,
+                   "max_concurrent_downloads=1 must never let more than one download run \
+                    at the same time");
     }
 }
