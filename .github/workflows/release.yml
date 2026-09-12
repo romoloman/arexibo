@@ -1,4 +1,9 @@
-name: Release
+name: Release build
+
+# Trigger separato e indipendente dalla nightly (.github/workflows/nightly-deb.yml,
+# NON toccato da questo file) -- build/pubblicazione volutamente
+# duplicate qui piuttosto che condivise, cosi' un errore in questo
+# workflow non puo' mai rompere la nightly che funziona gia'.
 
 on:
   push:
@@ -6,47 +11,52 @@ on:
       - 'v*'
 
 jobs:
-  build:
+  release-deb:
+    name: Build release .deb (${{ matrix.arch }})
     strategy:
       matrix:
         include:
-          - target: amd64
-            runner: ubuntu-24.04
-          - target: arm64
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    env:
+      NODE_OPTIONS: --disable-warning=DEP0040
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install Qt6 and build deps
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qt6-base-dev qt6-webengine-dev build-essential
+          sudo apt-get install -y --no-install-recommends \
+            cmake \
+            g++ \
+            libdbus-1-dev \
+            libzmq3-dev \
+            qt6-webengine-dev \
+            libudev-dev \
+            pkg-config
 
-      - name: Build release binary
-        run: cargo build --release
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
 
-      - name: Package artifact
+      - name: Determine version from tag
+        id: version
         run: |
-          mkdir -p dist
-          cp target/release/arexibo dist/arexibo-${{ matrix.target }}
-          tar czf arexibo-${{ matrix.target }}.tar.gz -C dist arexibo-${{ matrix.target }}
+          # es. tag "v0.7.0" -> versione "0.7.0" (toglie solo la v iniziale)
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: arexibo-${{ matrix.target }}
-          path: arexibo-${{ matrix.target }}.tar.gz
+      - name: Build .deb
+        run: bash deb/build-deb.sh "${{ steps.version.outputs.version }}"
 
-  release:
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
         with:
-          path: dist
-          merge-multiple: true
-
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.tar.gz
+          files: dist/arexibo_*.deb
+    
