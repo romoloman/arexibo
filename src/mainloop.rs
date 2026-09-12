@@ -1563,6 +1563,22 @@ impl Handler {
         Ok(())
     }
 
+    /// Builds a fresh, entirely independent `xmds::Cms` instance,
+    /// identical in configuration to `self.xmds` -- used to give each
+    /// parallel download worker its own client (`Cms` has no real
+    /// mutable session state at all, just plain config fields plus a
+    /// `ureq::Agent`, itself already `Clone`; every XMDS call
+    /// self-authenticates via the CMS key/hardware key baked into the
+    /// request body, not a server-side session, so this is safe).
+    /// Cheap: no network call happens here, just re-deriving the same
+    /// public key PEM from the already-loaded private key (same
+    /// pattern already used in commit_cms_migration).
+    fn new_worker_cms(&self) -> Result<xmds::Cms> {
+        let pub_key = RsaPublicKey::from(&self.xmr_privkey).to_public_key_pem(Default::default())
+            .context("re-deriving public key for a download worker's own Cms")?;
+        xmds::Cms::new(&self.cms, pub_key, self.no_verify, self.envdir.join("xml"))
+    }
+
     /// For each file RequiredFiles said this display needs: download
     /// it if missing, and build the MediaInventory report to submit
     /// back to the CMS confirming what's actually on disk. A separate
@@ -1570,23 +1586,6 @@ impl Handler {
     /// real `Cache` without needing to mock the full RegisterDisplay/
     /// RequiredFiles/Schedule/GetWeather/SubmitLog/NotifyStatus SOAP
     /// chain `collect_once` otherwise requires just to reach it.
-    /// Builds a fresh, entirely independent `xmds::Cms` instance,
-    /// identical in configuration to `self.xmds` -- used to give each
-    /// parallel download worker its own client (`Cms` has no real
-    /// mutable session state at all, just plain config fields plus a
-    /// `ureq::Agent`, itself already `Clone`; every XMDS call
-    /// self-authenticates via the CMS key/hardware key baked into the
-    /// request body, not a server-side session, so this is safe -- see
-    /// download_required_files's own doc comment for the full
-    /// reasoning). Cheap: no network call happens here, just
-    /// re-deriving the same public key PEM from the already-loaded
-    /// private key (same pattern already used in commit_cms_migration).
-    fn new_worker_cms(&self) -> Result<xmds::Cms> {
-        let pub_key = RsaPublicKey::from(&self.xmr_privkey).to_public_key_pem(Default::default())
-            .context("re-deriving public key for a download worker's own Cms")?;
-        xmds::Cms::new(&self.cms, pub_key, self.no_verify, self.envdir.join("xml"))
-    }
-
     fn download_required_files(&mut self, required: Vec<ReqFile>, current_scheduleid: i64,
                                 schedule: &Schedule) -> Vec<crate::resource::InventoryEntry> {
         let mut result = Vec::new();
@@ -1644,19 +1643,14 @@ impl Handler {
             return result;
         }
 
-        // Phase 2/3: fetch in parallel (bounded by max_concurrent_downloads,
-        // straight from the CMS's own RegisterDisplay response -- see
+        // Fetch in parallel, bounded by max_concurrent_downloads (from
+        // the CMS's own RegisterDisplay response -- see
         // PlayerSettings::max_concurrent_downloads's own doc comment;
-        // 1 means fully sequential, today's original behavior, unless
-        // the CMS ever says otherwise), then commit -- and handle
-        // success/failure exactly as the original sequential version
-        // did -- one at a time, back on this thread. Splitting fetch
-        // (network + CPU-bound layout translation, safe to run
-        // concurrently -- see Cache::fetch_content's own doc comment)
-        // from commit (mutates self.cache.content/disk metadata,
-        // deliberately kept single-threaded so nothing there ever
-        // needs a lock) is what makes this safe without touching
-        // Cache's own internals' thread-safety at all.
+        // 1 means sequential). Fetch (network + CPU-bound layout
+        // translation -- see Cache::fetch_content's own doc comment)
+        // and commit (mutates self.cache.content/disk metadata) are
+        // split so commit can stay single-threaded, needing no lock on
+        // Cache's own internals at all.
         let pending_count = pending.len();
         let max_workers = (self.settings.max_concurrent_downloads as usize).max(1);
         let dir = self.cache.dir().clone();
@@ -2304,8 +2298,6 @@ impl Handler {
                 self.sync_peer_connected = never();
             }
             SyncRole::Lead => {
-                log::info!("Sync Group: starting as Lead, listening on port {}",
-                            self.settings.sync_publisher_port);
                 let switch_delay = Duration::from_millis(self.settings.sync_switch_delay);
                 match syncgroup::SyncGroup::start_lead(self.settings.sync_publisher_port,
                                                         switch_delay) {

@@ -1441,13 +1441,7 @@ mod media_inventory_tests {
         // (xibo-dotnetclient's RequiredFiles.cs, ReportInventory()): a
         // dependency's own MediaInventory entry needs `type="dependency"`,
         // a *string* `id` (not the integer every other file type uses),
-        // an extra `fileType` attribute, and a `lastChecked` timestamp --
-        // a previous version of this code silently skipped dependencies
-        // from MediaInventory reporting entirely, believing (incorrectly,
-        // never actually verified) that the reference client did too --
-        // confirmed wrong from a real report: the CMS's own Manage
-        // Display page showed every dependency file permanently
-        // "Pending" even though it downloaded and served correctly.
+        // an extra `fileType` attribute, and a `lastChecked` timestamp.
         let (port, captured) = start_capturing_mock();
         let mut cms = test_cms(port);
 

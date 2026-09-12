@@ -83,14 +83,7 @@ impl ReqFile {
 /// complete="0|1" lastChecked="{timestamp}"/>` -- its own `id` is a
 /// string (e.g. a font file's name), not the integer every other file
 /// type uses, and it carries an extra `fileType` (font/bundle/fontCss/
-/// etc.) and `lastChecked` attribute neither of the others has. A
-/// previous version of this code assumed (never actually verified
-/// against the reference client) that dependencies weren't reported
-/// via MediaInventory at all, and skipped them entirely -- confirmed
-/// wrong from a real report: the CMS's own Manage Display page showed
-/// every dependency file permanently "Pending" even though it
-/// downloaded and served correctly, because the CMS was never once
-/// told it had completed.
+/// etc.) and `lastChecked` attribute neither of the others has.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InventoryEntry {
     Simple { typ: &'static str, id: i64, complete: bool },
@@ -447,7 +440,7 @@ impl Cache {
     }
 
     /// Applies a `fetch_content` result -- the other half of what
-    /// `download` used to do in one step. Only ever called from the
+    /// `download` does in one step. Only ever called from the
     /// main thread (mainloop.rs never calls this from a worker), so no
     /// locking of `self.content` is needed here at all.
     pub fn commit(&mut self, content: FetchedContent) -> Result<()> {
