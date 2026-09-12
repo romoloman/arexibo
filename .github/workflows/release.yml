@@ -1,18 +1,13 @@
 name: Release build
 
-# Trigger separato e indipendente dalla nightly (.github/workflows/nightly-deb.yml,
-# NON toccato da questo file) -- build/pubblicazione volutamente
-# duplicate qui piuttosto che condivise, cosi' un errore in questo
-# workflow non puo' mai rompere la nightly che funziona gia'.
-
 on:
   push:
     tags:
       - 'v*'
 
 jobs:
-  release-deb:
-    name: Build release .deb (${{ matrix.arch }})
+  build:
+    name: Build .deb (${{ matrix.arch }})
     strategy:
       matrix:
         include:
@@ -21,10 +16,6 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: write
-    env:
-      NODE_OPTIONS: --disable-warning=DEP0040
     steps:
       - uses: actions/checkout@v5
 
@@ -47,7 +38,6 @@ jobs:
       - name: Determine version from tag
         id: version
         run: |
-          # es. tag "v0.7.0" -> versione "0.7.0" (toglie solo la v iniziale)
           VERSION="${GITHUB_REF_NAME#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building version: ${VERSION}"
@@ -55,8 +45,28 @@ jobs:
       - name: Build .deb
         run: bash deb/build-deb.sh "${{ steps.version.outputs.version }}"
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/arexibo_*.deb
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      NODE_OPTIONS: --disable-warning=DEP0040
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: deb-*
+          merge-multiple: true
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
           files: dist/arexibo_*.deb
-    
+          
