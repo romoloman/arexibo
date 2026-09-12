@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: amd64
+            runner: ubuntu-24.04
+          - target: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt6 and build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev qt6-webengine-dev build-essential
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/release/arexibo dist/arexibo-${{ matrix.target }}
+          tar czf arexibo-${{ matrix.target }}.tar.gz -C dist arexibo-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arexibo-${{ matrix.target }}
+          path: arexibo-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
