@@ -652,7 +652,7 @@ impl Cms {
             soap::ReportFaultsRequest {
                 serverKey: &self.cms_key,
                 hardwareKey: &self.hw_key,
-                faults: &wrapped,
+                fault: &wrapped,
             }
         ).context("reporting faults")?;
         ensure!(res.success, "reporting faults not successful");

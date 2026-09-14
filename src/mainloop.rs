@@ -1216,6 +1216,8 @@ impl Handler {
                 // Interactive Control fault reports -- record into the
                 // same FaultCollector, flushed with any other fault.
                 recv(self.fault_rx) -> req => if let Ok(req) = req {
+                    log::debug!("fault recorded (code {}, reason {:?}) -- will be sent \
+                                 with the next flush_faults()", req.code, req.reason);
                     self.faults.record(faults::Fault::new(req.code, req.reason));
                 }
             }
@@ -1844,13 +1846,23 @@ impl Handler {
     /// availability is fully determined by the endpoint version alone
     /// -- no runtime-learned flag needed.
     fn flush_faults(&mut self) {
-        if self.faults.is_empty() || !xmds::xmds_supports_v6_v7_methods() {
+        if self.faults.is_empty() {
+            return;
+        }
+        if !xmds::xmds_supports_v6_v7_methods() {
+            log::debug!("fault(s) pending but ReportFaults needs XMDS v6/v7 -- \
+                         this build/endpoint doesn't support it, dropping silently \
+                         rather than requeuing forever");
             return;
         }
         let (json, recs) = self.faults.build_and_clear();
-        if let Err(e) = self.xmds.report_faults(&json) {
-            log::error!("reporting faults: {e:#}");
-            self.faults.requeue(recs);
+        log::debug!("sending {} fault(s) to the CMS", recs.len());
+        match self.xmds.report_faults(&json) {
+            Ok(()) => log::debug!("fault(s) reported successfully"),
+            Err(e) => {
+                log::error!("reporting faults: {e:#}");
+                self.faults.requeue(recs);
+            }
         }
     }
 
@@ -5841,6 +5853,47 @@ mod flush_faults_tests {
 
         assert_eq!(mock.report_calls.load(Ordering::SeqCst), 0,
                     "flush_faults must not call ReportFaults at all when nothing is pending");
+    }
+
+    #[test]
+    fn the_request_uses_the_real_cms_own_parameter_name() {
+        // Checks the actual parameter name sent, not just that a call
+        // happens (the test above can't catch a wrong name).
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_for_thread = captured.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                if body.contains("ReportFaults") {
+                    *captured_for_thread.lock().unwrap() = body;
+                }
+                let response = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><ReportFaultsResponse><success>1</success></ReportFaultsResponse></soap:Body>
+</soap:Envelope>"#;
+                let _ = request.respond(tiny_http::Response::from_string(response));
+            }
+        });
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, _togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
+
+        handler.faults.record(faults::Fault::new(9001, "test fault"));
+        handler.flush_faults();
+
+        let sent = captured.lock().unwrap().clone();
+        assert!(sent.contains("<fault>") || sent.contains("<fault "),
+                "must use the real CMS's own parameter name \"fault\" (singular) -- got:\n{sent}");
+        assert!(!sent.contains("<faults>") && !sent.contains("<faults "),
+                "must NOT use the old, confirmed-wrong \"faults\" (plural) name -- got:\n{sent}");
     }
 }
 
