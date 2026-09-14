@@ -548,8 +548,15 @@ fn splash_html(awaiting_registration: bool) -> Vec<u8> {
   <input id="cms-address" type="text" placeholder="CMS address (https://...)"
          autocomplete="off"
          style="font-size: 20px; padding: 8px; width: 420px; text-align: center;">
-  <input id="cms-key" type="text" placeholder="CMS key" autocomplete="off"
-         style="font-size: 20px; padding: 8px; width: 420px; text-align: center;">
+  <div style="position: relative; width: 420px;">
+    <input id="cms-key" type="password" placeholder="CMS key" autocomplete="off"
+           style="font-size: 20px; padding: 8px; padding-right: 44px; width: 100%;
+                  box-sizing: border-box; text-align: center;">
+    <button type="button" id="toggle-cms-key" aria-label="Show/hide CMS key"
+            style="position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+                   border: none; background: none; cursor: pointer; font-size: 22px;
+                   padding: 8px; line-height: 1;">&#128065;</button>
+  </div>
   <button type="submit" style="font-size: 20px; padding: 8px 32px; margin-top: 4px;">
     Register
   </button>
@@ -557,6 +564,10 @@ fn splash_html(awaiting_registration: bool) -> Vec<u8> {
 <div id="manual-register-status" style="margin-top: 8px; font-family: sans-serif;
      font-size: 18px; color: #888888; min-height: 24px;"></div>
 <script>
+document.getElementById('toggle-cms-key').addEventListener('click', function() {
+  var input = document.getElementById('cms-key');
+  input.type = input.type === 'password' ? 'text' : 'password';
+});
 document.getElementById('manual-register-form').addEventListener('submit', function(ev) {
   ev.preventDefault();
   var status = document.getElementById('manual-register-status');
@@ -1023,6 +1034,10 @@ mod splash_html_tests {
         assert!(html.contains("fetch('/registration-code')"),
                 "must poll /registration-code client-side to fill in a code that appears \
                  after this page was first loaded -- got:\n{html}");
+        assert!(html.contains(r#"id="cms-key" type="password""#),
+                "the CMS key field must be masked by default -- got:\n{html}");
+        assert!(html.contains("id=\"toggle-cms-key\""),
+                "must offer a way to reveal the masked key -- got:\n{html}");
     }
 
     #[test]
