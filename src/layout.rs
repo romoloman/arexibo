@@ -123,7 +123,20 @@ window.arexibo = {
 
     // Loop only applies to single-item regions (confirmed in official
     // Xibo docs) -- a region with 2+ items must keep cycling regardless.
-    if (next == 0 && !first && !loop && total <= 1) {
+    // media[cur][4] (auto_restart_when_alone) additionally lets a
+    // single video/audio item keep restarting itself even with region
+    // Loop off -- see MediaInfo's own doc comment for why: the CMS
+    // offers no way to turn region Loop on at all when it's the
+    // region's only item, so without this a video here would otherwise
+    // just freeze dead after one play.
+    if (next == 0 && !first && !loop && total <= 1 && !media[cur][4]) {
+      // Actually stop the current media before bailing out -- found
+      // from a real report: a single-item, non-looping video widget
+      // otherwise kept playing right past its own configured duration,
+      // since this branch used to return before ever reaching the
+      // stop call below.
+      if (cur !== null)
+        media[cur][1]();
       this.region_done(rid);
       return;
     }
@@ -463,7 +476,21 @@ enum Trans {
 
 /// (mid, duration expr, add_start, add_stop, trans_in, ms_in, trans_out, ms_out)
 /// -- see write_media's transition-resolution logic.
-type MediaInfo = (i32, String, String, String, Trans, u32, Trans, u32);
+/// (mid, duration expr, add_start, add_stop, trans_in, ms_in, trans_out,
+/// ms_out, auto_restart_when_alone) -- the last one: a single-item,
+/// non-looping region normally stops its media for good once its
+/// duration elapses (per official Xibo semantics -- correct for e.g.
+/// an image, which just stays as its own last visible state). Found
+/// from a real report: for a video (or audio, same play/pause
+/// mechanic), the CMS offers no way to enable region-level Loop when
+/// it's the region's only item at all, so a video in that exact
+/// situation would otherwise just freeze dead after one play, with no
+/// way to configure it to keep going. `true` only for video/audio --
+/// region_switch checks this per-widget instead of only the region's
+/// own `loop` setting, letting those two keep auto-restarting while
+/// every other widget type's own current "freeze after one play"
+/// behavior is unchanged.
+type MediaInfo = (i32, String, String, String, Trans, u32, Trans, u32, bool);
 
 /// Enter/exit animation for a single media item -- groups what used to
 /// be four separate parameters (trans_in, ms_in, trans_out, ms_out) on
@@ -960,13 +987,14 @@ impl<'a> Translator<'a> {
         // top. `swap_target_regions` names every region that's the
         // actual target of such a swap, regardless of item count.
         let always_hide = nitems > 1 || self.swap_target_regions.contains(&rid);
-        for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in sequence {
+        for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out,
+             auto_restart_when_alone) in sequence {
             writeln!(self.out, "    [")?;
             self.write_show_stop_functions(mid, &add_start, &add_stop,
                                             Transitions { in_kind: trans_in, in_ms: ms_in,
                                                           out_kind: trans_out, out_ms: ms_out },
                                             always_hide)?;
-            writeln!(self.out, "    , {duration}, {mid}],")?;
+            writeln!(self.out, "    , {duration}, {mid}, {auto_restart_when_alone}],")?;
         }
         writeln!(self.out, "  ],")?;
         writeln!(self.out, "}};\n</script>")?;
@@ -1194,7 +1222,8 @@ impl<'a> Translator<'a> {
 
         writeln!(self.out, "<script type='text/javascript'>")?;
         writeln!(self.out, "window.arexibo.drawerWidgets = window.arexibo.drawerWidgets || {{}};")?;
-        for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out) in widgets {
+        for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out,
+             _auto_restart_when_alone) in widgets {
             self.drawer_widgets.insert(mid);
             writeln!(self.out, "window.arexibo.drawerWidgets[{mid}] = [")?;
             self.write_show_stop_functions(mid, &add_start, &add_stop,
@@ -1216,6 +1245,11 @@ impl<'a> Translator<'a> {
             "() => {}", media.def_attr("duration", "").parse::<i32>().unwrap_or(10));
         let mut add_start = String::new();
         let mut add_stop = String::new();
+        // Whether this widget should keep restarting itself
+        // indefinitely even when alone in a non-looping region (see
+        // MediaInfo's own doc comment for the full story) -- video and
+        // audio only, set within their own match arms below.
+        let mut auto_restart_when_alone = false;
 
         // Per-widget transition override -- every widget's own
         // <options> can carry transIn/transInDuration/transInDirection
@@ -1370,6 +1404,8 @@ impl<'a> Translator<'a> {
                          object_fit(opts), object_pos(opts))?;
             }
             (_, Some("video" | "localvideo")) => {
+                // See MediaInfo's own doc comment for why.
+                auto_restart_when_alone = true;
                 let url = percent_decode(opts.find("uri").context("no video uri")?.text());
                 let mute = opts.find("mute").is_some_and(|el| el.text() == "1");
                 // loop=1 uses the native HTML loop attribute (browser
@@ -1449,6 +1485,8 @@ impl<'a> Translator<'a> {
                        el.pause(); el.currentTime = 0; }}");
             }
             (_, Some("audio")) => {
+                // See MediaInfo's own doc comment for why.
+                auto_restart_when_alone = true;
                 // Standalone Audio widget (audio attached to another
                 // widget is embedded as <audio> tags inside that
                 // widget's own HTML, handled by the resource/iframe path
@@ -1577,7 +1615,8 @@ impl<'a> Translator<'a> {
                 return Ok(None);
             }
         }
-        Ok(Some((mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out)))
+        Ok(Some((mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out,
+                 auto_restart_when_alone)))
     }
 }
 
@@ -2022,7 +2061,7 @@ mod per_widget_transition_tests {
         assert!(html.contains("setTimeout(() => { el.style.visibility = 'hidden'; }, 500)"));
         // ...but correctly still the region's 2000ms fadeIn for showing,
         // since it doesn't specify its own transIn at all.
-        let end = html.find("4001],").unwrap() + "4001],".len();
+        let end = html.find("4001, false],").unwrap() + "4001, false],".len();
         let widget_4001_block = &html[..end];
         assert!(widget_4001_block.contains("opacity 2000ms"),
                 "widget 4001 doesn't override transIn, so it must still use \
@@ -2360,7 +2399,54 @@ mod loop_tests {
             </region>
         </layout>"#;
         let html = translate_xlf(xlf);
-        assert!(html.contains("if (next == 0 && !first && !loop && total <= 1)"));
+        assert!(html.contains("if (next == 0 && !first && !loop && total <= 1 && !media[cur][4])"));
+    }
+
+    #[test]
+    fn a_single_item_non_looping_region_stops_its_media_before_bailing_out() {
+        // Regression test for a real report: a single-item, non-looping
+        // video widget kept playing right past its own configured
+        // duration, because this branch returned before ever reaching
+        // the normal stop call further down region_switch.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="1" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        let cond_pos = html.find("if (next == 0 && !first && !loop && total <= 1 && !media[cur][4]) {")
+            .expect("the branch itself must still be present");
+        let branch = &html[cond_pos..];
+        let stop_pos = branch.find("media[cur][1]();")
+            .expect("the current media's own stop function must run in this branch \
+                     -- got:\n{html}");
+        let return_pos = branch.find("return;").expect("this branch must still return");
+        assert!(stop_pos < return_pos,
+                "the stop call must happen before bailing out, not after -- got:\n{html}");
+    }
+
+    #[test]
+    fn a_lone_video_is_flagged_to_auto_restart_but_a_lone_image_is_not() {
+        // The CMS offers no way to turn region-level Loop on at all
+        // when a region has only one item -- without this flag, a lone
+        // video would otherwise just freeze dead after one play, with
+        // no way to configure it to keep going (confirmed with the
+        // user). An image has no such problem (its own "last state"
+        // is just the image itself, correctly staying as-is), so it
+        // must NOT get this flag.
+        let xlf = r#"<layout width="720" height="1280">
+            <region id="1" left="0" top="0" width="250" height="250">
+                <media id="1" type="video" duration="5"><options><uri>a.mp4</uri></options></media>
+            </region>
+            <region id="2" left="300" top="0" width="250" height="250">
+                <media id="2" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains(", () => 86400, 1, true],"),
+                "a lone video must be flagged to auto-restart -- got:\n{html}");
+        assert!(html.contains(", () => 5, 2, false],"),
+                "a lone image must NOT be flagged to auto-restart -- got:\n{html}");
     }
 
     #[test]
