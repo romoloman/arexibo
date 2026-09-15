@@ -99,20 +99,47 @@ impl ElementExt for elementtree::Element {
 
 
 pub fn percent_decode(s: &str) -> String {
-    let mut res = String::new();
-    let mut iter = s.char_indices();
-    while let Some((i, ch)) = iter.next() {
-        match ch {
-            '%' => {
-                let codepoint = s.get(i+1..i+3)
-                                 .and_then(|s| u8::from_str_radix(s, 16).ok());
-                if let Some(hex) = codepoint {
-                    res.push(hex as char);
-                    iter.nth(1);
+    // Operates on raw bytes throughout (not chars) -- a `%XY` escape
+    // can represent any single byte, including one half of a
+    // multi-byte UTF-8 sequence (e.g. "%C3%A9" for 'é'); reassembling
+    // byte-by-byte and converting to a String only once at the end is
+    // what correctly reconstructs those, instead of misinterpreting
+    // each decoded byte as its own standalone Unicode codepoint.
+    let bytes = s.as_bytes();
+    let mut res = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hex = s.get(i+1..i+3).and_then(|s| u8::from_str_radix(s, 16).ok());
+                match hex {
+                    Some(b) => { res.push(b); i += 3; }
+                    None => { res.push(b'%'); i += 1; }
                 }
-            },
-            '+' => res.push(' '),
-            _ => res.push(ch),
+            }
+            b'+' => { res.push(b' '); i += 1; }
+            b => { res.push(b); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&res).into_owned()
+}
+
+/// Minimal percent-encoding for a value embedded both in a URL query
+/// string and a single-quoted HTML attribute (see the `/local-file`
+/// endpoint's own doc comment in server.rs for why this exists at
+/// all) -- keeps only a safe ASCII whitelist (letters, digits, and a
+/// few common filesystem-path punctuation marks) unescaped, percent-
+/// encoding every other byte, including every individual byte of a
+/// multi-byte UTF-8 character (never reinterpreting a raw byte as its
+/// own `char`, which would otherwise corrupt any non-ASCII character
+/// in the original string).
+pub fn percent_encode(s: &str) -> String {
+    let mut res = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' =>
+                res.push(b as char),
+            _ => res.push_str(&format!("%{b:02X}")),
         }
     }
     res
@@ -353,6 +380,28 @@ mod tests {
             ),
             r#"http|http://192.168.0.245:8888/ping|application/json|{"method":"GET","headers":"{}","body":"{}"}"#
         );
+    }
+
+    #[test]
+    fn percent_encode_leaves_plain_paths_alone() {
+        assert_eq!(percent_encode("/home/tmaxlab/arexibo-test/res/148.mp4"),
+                   "/home/tmaxlab/arexibo-test/res/148.mp4");
+    }
+
+    #[test]
+    fn percent_encode_escapes_query_and_attribute_breaking_chars() {
+        assert_eq!(percent_encode("/a b/c&d=e'f\"g<h>i.mp4"),
+                   "/a%20b/c%26d%3De%27f%22g%3Ch%3Ei.mp4");
+    }
+
+    #[test]
+    fn percent_encode_handles_multibyte_utf8_without_corruption() {
+        // A raw-byte-as-char bug here would corrupt any non-ASCII
+        // character in the original string -- round-tripping through
+        // percent_decode must reproduce it exactly.
+        let original = "/home/usuário/vidéo.mp4";
+        let encoded = percent_encode(original);
+        assert_eq!(percent_decode(&encoded), original);
     }
 
     #[test]

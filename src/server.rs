@@ -329,6 +329,47 @@ impl Server {
                 .boxed(),
             "/0.xlf.html" => Response::from_data(splash_html(awaiting_registration)).boxed(),
 
+            // Serves a "Local Video" widget's own file:// URI (a path
+            // already present on the display's own disk, outside the
+            // normal cache -- confirmed real from a report: the
+            // generated page is itself served over http://, and
+            // Chromium/QtWebEngine (no exception made for it anywhere
+            // in this codebase) blocks a file:// resource referenced
+            // from an http:// origin outright, by design, regardless
+            // of any QWebEngineSettings toggle -- so the raw file://
+            // URI can never just be embedded directly). Proxying it
+            // through this same http:// origin instead sidesteps that
+            // restriction entirely, without weakening browser security
+            // globally (the alternative, --disable-web-security, would
+            // also strip protections this player still needs for
+            // legitimately remote Webpage widgets).
+            //
+            // Deliberately NOT confined to `dir` (the cache directory)
+            // like the generic static-file branch below -- the whole
+            // point is serving an arbitrary path elsewhere on disk.
+            // Not a meaningfully new exposure: the path itself comes
+            // only from the CMS's own layout XML (the same trust
+            // boundary as every other file this player already reads
+            // and serves), and the player process already has
+            // whatever filesystem access its own OS user has anyway.
+            "/local-file" if query.starts_with("path=") => {
+                let path = percent_decode(&query["path=".len()..]);
+                let path = std::path::Path::new(&path);
+                if !path.is_file() {
+                    log::warn!("processing HTTP req {}: 404 local file not found", req.url());
+                    Response::empty(404).boxed()
+                } else {
+                    match fs::File::open(path) {
+                        Ok(fp) => Response::from_file(fp).boxed(),
+                        Err(e) => {
+                            log::warn!("processing HTTP req {}: 404 opening local file: {e}",
+                                       req.url());
+                            Response::empty(404).boxed()
+                        }
+                    }
+                }
+            }
+
             // Interactive Control duration overrides (see
             // xibo-interactive-control's setWidgetDuration/
             // extendWidgetDuration/expireNow) -- actually applied now
@@ -1102,5 +1143,63 @@ mod registration_code_endpoint_tests {
         let resp = ureq::get(&format!("http://127.0.0.1:{port}/registration-code")).call().unwrap();
         let body = resp.into_body().read_to_string().unwrap();
         assert_eq!(body, r#"{"code":"ABC123"}"#);
+    }
+}
+
+#[cfg(test)]
+mod local_file_tests {
+    use super::*;
+    use crate::util::percent_encode;
+    use crossbeam_channel::unbounded;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn make_test_server() -> u16 {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("arexibo_local_file_test_{}_{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
+                                  manual_register_tx, local_data,
+                                  std::sync::Arc::new(std::sync::Mutex::new(None)), false).unwrap();
+        let port = server.port();
+        server.start_pool();
+        port
+    }
+
+    #[test]
+    fn serves_a_file_entirely_outside_the_cache_dir() {
+        // The whole point of this endpoint (see its own doc comment
+        // above) -- a Local Video widget's own file:// path is, by
+        // definition, somewhere else on disk entirely, not in the
+        // cache dir the generic static-file branch is confined to.
+        let n = std::sync::atomic::AtomicU32::new(0).fetch_add(1, Ordering::SeqCst);
+        let outside_dir = std::env::temp_dir().join(format!(
+            "arexibo_local_file_outside_test_{}_{n}", std::process::id()));
+        fs::create_dir_all(&outside_dir).unwrap();
+        let file_path = outside_dir.join("148.mp4");
+        fs::write(&file_path, b"fake video content").unwrap();
+
+        let port = make_test_server();
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/local-file?path={}",
+                                       percent_encode(file_path.to_str().unwrap())))
+            .call().unwrap();
+        let body = resp.into_body().read_to_vec().unwrap();
+        assert_eq!(body, b"fake video content");
+    }
+
+    #[test]
+    fn returns_a_clean_404_for_a_nonexistent_path() {
+        let port = make_test_server();
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/local-file?path=%2Fdoes%2Fnot%2Fexist.mp4"))
+            .call();
+        match resp {
+            Err(ureq::Error::StatusCode(404)) => {} // expected
+            other => panic!("expected clean 404, got: {other:?}"),
+        }
     }
 }

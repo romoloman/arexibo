@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use elementtree::Element;
 use crate::resource::LayoutId;
-use crate::util::{ElementExt, percent_decode};
+use crate::util::{ElementExt, percent_decode, percent_encode};
 
 // TODO:
 // - fly transition (fadeIn/fadeOut implemented, see write_region)
@@ -1402,7 +1402,19 @@ impl<'a> Translator<'a> {
             (_, Some("video" | "localvideo")) => {
                 // See MediaInfo's own doc comment for why.
                 always_hide_when_stopped = true;
-                let url = percent_decode(opts.find("uri").context("no video uri")?.text());
+                let raw_url = percent_decode(opts.find("uri").context("no video uri")?.text());
+                // A Local Video widget's own file:// URI (a path
+                // already on the display's own disk, outside the
+                // normal cache) can't be embedded directly -- see the
+                // /local-file endpoint's own doc comment in server.rs
+                // for why (a real, confirmed Chromium/QtWebEngine
+                // restriction, not something a settings toggle here
+                // can work around). Proxied through that same
+                // same-origin endpoint instead.
+                let url = match raw_url.strip_prefix("file://") {
+                    Some(path) => format!("/local-file?path={}", percent_encode(path)),
+                    None => raw_url,
+                };
                 let mute = opts.find("mute").is_some_and(|el| el.text() == "1");
                 // loop=1 uses the native HTML loop attribute (browser
                 // handles repetition) and keeps the widget's own static
@@ -2638,6 +2650,38 @@ width: 1080px; height: 1920px;"),
 style='position: fixed"),
                 "a video without showFullScreen must keep its normal region-relative \
                  positioning -- got:\n{html}");
+    }
+
+    #[test]
+    fn a_local_video_widgets_own_file_uri_is_proxied_through_local_file() {
+        // Regression test for a real report: a Local Video widget's
+        // own file:// URI (a path on the display's own disk, outside
+        // the normal cache) was embedded directly as the <video>'s own
+        // src -- confirmed real that Chromium/QtWebEngine blocks a
+        // file:// resource referenced from the http:// origin this
+        // page is itself served from, by design, so the video never
+        // loaded at all. Proxied through the same-origin /local-file
+        // endpoint instead (see its own doc comment in server.rs).
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="250" height="141">
+                <media id="1" type="localvideo" duration="60">
+                    <options><uri>file%3A%2F%2F%2Fhome%2Ftmaxlab%2Farexibo-test%2Fres%2F148.mp4</uri></options>
+                </media>
+            </region>
+            <region id="2" left="300" top="0" width="250" height="141">
+                <media id="2" type="video" duration="5">
+                    <options><uri>192.mp4</uri></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains(
+            "id='m1' src='/local-file?path=/home/tmaxlab/arexibo-test/res/148.mp4'"),
+            "a file:// URI must be proxied through the same-origin /local-file endpoint, \
+             not embedded directly -- got:\n{html}");
+        assert!(html.contains("id='m2' src='192.mp4'"),
+                "a normal (non-file://) video URI must be left completely unchanged -- \
+                 got:\n{html}");
     }
 
     #[test]
