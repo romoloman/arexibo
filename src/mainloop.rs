@@ -1171,17 +1171,34 @@ impl Handler {
                         }
                     }
                     Ok(FromGui::LayoutCompleted) => {
-                        // Only meaningful for a Scheduled Action's own
-                        // navLayout target with duration == 0 (see
-                        // override_revert_on_completion's own doc
-                        // comment) -- a no-op otherwise (e.g. normal
-                        // schedule cycling, which handles its own
-                        // advancement entirely on the GUI side).
                         if self.override_revert_on_completion && self.override_layout.take().is_some() {
                             log::info!("Scheduled Action's override layout completed its own \
                                         natural cycle -- reverting to normal schedule");
                             self.override_revert_on_completion = false;
                             self.schedule_check();
+                        } else if self.override_layout.is_none() {
+                            // Confirmed real from a difference with the
+                            // Windows client: when a layout completes
+                            // its own natural cycle and is still the
+                            // only one currently scheduled, Windows
+                            // moves on to "the next layout" -- which,
+                            // with only one, means reloading it fresh.
+                            // schedule_check() alone never does this on
+                            // its own (it only reloads when the
+                            // resolved layout set actually *changes*,
+                            // by design, for every other -- much more
+                            // frequent -- caller), so this needs its
+                            // own explicit check here instead.
+                            let resolved = self.schedule.layouts_now(&self.criteria);
+                            let available: Vec<_> = resolved.iter().copied()
+                                .filter(|&id| self.cache.get_layout(id).is_some())
+                                .collect();
+                            if available == self.layouts && available.len() == 1 {
+                                log::info!("layout {} completed its own natural cycle and is \
+                                            still the only one scheduled -- reloading it fresh",
+                                           available[0]);
+                                self.to_gui.send(ToGui::ForceReloadLayout(available[0])).unwrap();
+                            }
                         }
                     }
                     Ok(FromGui::Command(code)) =>
@@ -4489,6 +4506,58 @@ mod handle_trigger_code_tests {
         assert_eq!(handler.override_layout, Some(971),
                    "a timer-based override must not be cleared by a mere \
                     natural-completion signal");
+    }
+
+    #[test]
+    fn layout_completed_reloads_a_single_still_scheduled_layout() {
+        // Confirmed real difference from the Windows client: when a
+        // layout completes its own natural cycle and is still the
+        // only one scheduled, Windows moves on to "the next layout" --
+        // which, with only one, means reloading it fresh.
+        // schedule_check() alone never does this on its own (it only
+        // reloads when the resolved layout set actually changes), so
+        // this needs its own explicit check in the real
+        // FromGui::LayoutCompleted handler -- simulated here the same
+        // way the other tests in this module already do.
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
+
+        let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="0" playCount="0" maxPlaysPerHour="0"/>
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
+        handler.schedule = Schedule::parse(&tree).unwrap();
+        handler.cache.insert_fake_layout_for_test(913);
+        handler.layouts = vec![913];
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        // Same simulated FromGui::LayoutCompleted logic the real
+        // select! loop runs (see the other tests in this module).
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+            handler.schedule_check();
+        } else if handler.override_layout.is_none() {
+            let resolved = handler.schedule.layouts_now(&handler.criteria);
+            let available: Vec<_> = resolved.iter().copied()
+                .filter(|&id| handler.cache.get_layout(id).is_some())
+                .collect();
+            if available == handler.layouts && available.len() == 1 {
+                handler.to_gui.send(ToGui::ForceReloadLayout(available[0])).unwrap();
+            }
+        }
+
+        let msg = togui_rx.try_recv().expect("a reload must have been sent");
+        assert!(matches!(msg, ToGui::ForceReloadLayout(913)),
+                "the single still-scheduled layout must be force-reloaded");
     }
 }
 
