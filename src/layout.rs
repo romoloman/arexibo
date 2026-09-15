@@ -123,13 +123,7 @@ window.arexibo = {
 
     // Loop only applies to single-item regions (confirmed in official
     // Xibo docs) -- a region with 2+ items must keep cycling regardless.
-    // media[cur][4] (auto_restart_when_alone) additionally lets a
-    // single video/audio item keep restarting itself even with region
-    // Loop off -- see MediaInfo's own doc comment for why: the CMS
-    // offers no way to turn region Loop on at all when it's the
-    // region's only item, so without this a video here would otherwise
-    // just freeze dead after one play.
-    if (next == 0 && !first && !loop && total <= 1 && !media[cur][4]) {
+    if (next == 0 && !first && !loop && total <= 1) {
       // Actually stop the current media before bailing out -- found
       // from a real report: a single-item, non-looping video widget
       // otherwise kept playing right past its own configured duration,
@@ -477,19 +471,21 @@ enum Trans {
 /// (mid, duration expr, add_start, add_stop, trans_in, ms_in, trans_out, ms_out)
 /// -- see write_media's transition-resolution logic.
 /// (mid, duration expr, add_start, add_stop, trans_in, ms_in, trans_out,
-/// ms_out, auto_restart_when_alone) -- the last one: a single-item,
-/// non-looping region normally stops its media for good once its
-/// duration elapses (per official Xibo semantics -- correct for e.g.
-/// an image, which just stays as its own last visible state). Found
-/// from a real report: for a video (or audio, same play/pause
-/// mechanic), the CMS offers no way to enable region-level Loop when
-/// it's the region's only item at all, so a video in that exact
-/// situation would otherwise just freeze dead after one play, with no
-/// way to configure it to keep going. `true` only for video/audio --
-/// region_switch checks this per-widget instead of only the region's
-/// own `loop` setting, letting those two keep auto-restarting while
-/// every other widget type's own current "freeze after one play"
-/// behavior is unchanged.
+/// ms_out, always_hide_when_stopped) -- the last one: a single-item,
+/// non-looping region normally just leaves its one item's own last
+/// visible state on screen forever once its stop function runs (per
+/// official Xibo semantics, confirmed real -- see Launchpad bug
+/// #346260, "I have nothing else to show, I might as well continue
+/// showing this"). Correct for e.g. an image (nothing wrong with it
+/// just staying as-is). Confirmed with the user this isn't wanted for
+/// a video (or audio, same play/pause mechanic) that's stopped for
+/// good: rather than leave a frozen/black video element visible, it
+/// should actually disappear (background/whatever's behind it showing
+/// instead) -- `true` only for video/audio, ORed into this widget's
+/// own `always_hide` regardless of item count (harmless when the
+/// region loops or has several items: hide immediately precedes a
+/// restart/next-item show in the very same synchronous call, so
+/// there's nothing to visibly flicker).
 type MediaInfo = (i32, String, String, String, Trans, u32, Trans, u32, bool);
 
 /// Enter/exit animation for a single media item -- groups what used to
@@ -988,13 +984,13 @@ impl<'a> Translator<'a> {
         // actual target of such a swap, regardless of item count.
         let always_hide = nitems > 1 || self.swap_target_regions.contains(&rid);
         for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out,
-             auto_restart_when_alone) in sequence {
+             always_hide_this_widget) in sequence {
             writeln!(self.out, "    [")?;
             self.write_show_stop_functions(mid, &add_start, &add_stop,
                                             Transitions { in_kind: trans_in, in_ms: ms_in,
                                                           out_kind: trans_out, out_ms: ms_out },
-                                            always_hide)?;
-            writeln!(self.out, "    , {duration}, {mid}, {auto_restart_when_alone}],")?;
+                                            always_hide || always_hide_this_widget)?;
+            writeln!(self.out, "    , {duration}, {mid}],")?;
         }
         writeln!(self.out, "  ],")?;
         writeln!(self.out, "}};\n</script>")?;
@@ -1223,7 +1219,7 @@ impl<'a> Translator<'a> {
         writeln!(self.out, "<script type='text/javascript'>")?;
         writeln!(self.out, "window.arexibo.drawerWidgets = window.arexibo.drawerWidgets || {{}};")?;
         for (mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out,
-             _auto_restart_when_alone) in widgets {
+             _always_hide_when_stopped) in widgets {
             self.drawer_widgets.insert(mid);
             writeln!(self.out, "window.arexibo.drawerWidgets[{mid}] = [")?;
             self.write_show_stop_functions(mid, &add_start, &add_stop,
@@ -1245,11 +1241,11 @@ impl<'a> Translator<'a> {
             "() => {}", media.def_attr("duration", "").parse::<i32>().unwrap_or(10));
         let mut add_start = String::new();
         let mut add_stop = String::new();
-        // Whether this widget should keep restarting itself
-        // indefinitely even when alone in a non-looping region (see
-        // MediaInfo's own doc comment for the full story) -- video and
-        // audio only, set within their own match arms below.
-        let mut auto_restart_when_alone = false;
+        // Whether this widget should always be visually hidden once
+        // its own stop function runs, even when alone in a region
+        // (see MediaInfo's own doc comment for the full story) --
+        // video and audio only, set within their own match arms below.
+        let mut always_hide_when_stopped = false;
 
         // Per-widget transition override -- every widget's own
         // <options> can carry transIn/transInDuration/transInDirection
@@ -1405,7 +1401,7 @@ impl<'a> Translator<'a> {
             }
             (_, Some("video" | "localvideo")) => {
                 // See MediaInfo's own doc comment for why.
-                auto_restart_when_alone = true;
+                always_hide_when_stopped = true;
                 let url = percent_decode(opts.find("uri").context("no video uri")?.text());
                 let mute = opts.find("mute").is_some_and(|el| el.text() == "1");
                 // loop=1 uses the native HTML loop attribute (browser
@@ -1413,12 +1409,79 @@ impl<'a> Translator<'a> {
                 // XLF duration, instead of a timer-mediated JS restart
                 // with a real pause between loops.
                 let loop_video = opts.find("loop").is_some_and(|el| el.text().trim() == "1");
+                // Confirmed real from Xibo's own developer docs:
+                // "Expand over the top of existing content to show
+                // video full screen" -- covers the *entire layout*,
+                // not just this widget's own region. The region's own
+                // wrapper div clips anything larger than itself
+                // (`overflow: hidden`, see write_region's own doc
+                // comment), so a normal `position: absolute` child
+                // can't escape it -- `position: fixed` (relative to the
+                // viewport, ignoring every ancestor's own bounds) is
+                // needed to actually cover the whole screen. A known
+                // bug in the reference client itself for years (this
+                // option silently not working at all, GitHub issues
+                // #122/#210) -- not a reason to replicate the bug here.
+                let show_full_screen = opts.find("showFullScreen")
+                    .is_some_and(|el| el.text().trim() == "1");
+                let (video_x, video_y, video_w, video_h, video_position) = if show_full_screen {
+                    (0, 0, self.size.0, self.size.1, "position: fixed; z-index: 9999; ")
+                } else {
+                    (x, y, w, h, "")
+                };
                 writeln!(self.out, "<video class='media r{rid}' id='m{mid}' src='{url}' {} {} \
-                                    style='left: {x}px; top: {y}px; width: {w}px; \
-                                    height: {h}px;{}{}'></video>",
+                                    style='{video_position}left: {video_x}px; top: {video_y}px; \
+                                    width: {video_w}px; height: {video_h}px;{}{}'></video>",
                          if mute { "muted" } else { "" },
                          if loop_video { "loop" } else { "" },
                          object_fit(opts), object_pos(opts))?;
+                // Attached secondary audio track -- sibling of
+                // <options>/<raw>, not inside either. Confirmed real
+                // behavior with the user (matching the Windows
+                // client): the video restarts this audio every time
+                // *it* (the video) restarts, regardless of where the
+                // audio currently is; independently, if the audio's
+                // own natural length is shorter than the video's, its
+                // own `loop` attribute decides whether it restarts on
+                // its own to keep going, or just stays silent for the
+                // rest of that same video playthrough.
+                let audio = media.find("audio").and_then(|a| a.find("uri")).map(|uri_el| {
+                    let audio_url = percent_decode(uri_el.text());
+                    let audio_volume = uri_el.get_attr("volume")
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .map(|v| v / 100.0)
+                        .unwrap_or(1.0);
+                    let audio_loop = uri_el.get_attr("loop").is_some_and(|v| v == "1");
+                    (audio_url, audio_volume, audio_loop)
+                });
+                if let Some((audio_url, _, _)) = &audio {
+                    writeln!(self.out,
+                              "<audio id='m{mid}-audio' src='{audio_url}' style='display:none'></audio>")?;
+                }
+                // Embedded inside add_start, right where the video
+                // itself starts playing -- (re)starts the paired audio
+                // alongside it every single time, from its own
+                // beginning, regardless of where it currently was.
+                let audio_start = audio.as_ref().map(|(_, volume, audio_loop)| format!(
+                    "let audioEl = document.getElementById('m{mid}-audio'); \
+                     audioEl.volume = {volume}; audioEl.currentTime = 0; \
+                     audioEl.play().catch(() => {{}}); \
+                     audioEl.onended = () => {{ if ({audio_loop}) {{ audioEl.currentTime = 0; \
+                     audioEl.play().catch(() => {{}}); }} }}; "
+                )).unwrap_or_default();
+                // Prefixed onto the video's own onended below -- when
+                // the video reaches its own end, the paired audio (if
+                // any) gets restarted alongside it, confirmed with the
+                // user (matching the Windows client's own behavior).
+                let video_onended_audio_restart = if audio.is_some() {
+                    "audioEl.currentTime = 0; audioEl.play().catch(() => {}); "
+                } else {
+                    ""
+                };
+                let audio_stop = audio.as_ref().map(|_| format!(
+                    "let audioEl = document.getElementById('m{mid}-audio'); \
+                     audioEl.pause(); audioEl.currentTime = 0; "
+                )).unwrap_or_default();
                 // useDuration="1" (confirmed real CMS attribute): play
                 // for the configured `duration` regardless of the
                 // video's natural length, instead of always using the
@@ -1433,11 +1496,35 @@ impl<'a> Translator<'a> {
                     // itself (`_canplayRetry`) lets add_stop below
                     // remove it explicitly -- see that comment for why
                     // `{ once: true }` alone isn't quite enough.
+                    // With a paired audio track, `onended` fires anyway
+                    // purely to restart the *audio* -- confirmed with
+                    // the user: whenever the video itself ends, the
+                    // audio gets restarted alongside it, regardless of
+                    // where the audio currently is. The audio's own
+                    // separate `loop` attribute (in `audio_start`
+                    // above) is what governs the *opposite* case (audio
+                    // ending before the video does).
+                    //
+                    // Known gap: if `loop_video` is *also* true (the
+                    // native HTML `loop` attribute, set below), `ended`
+                    // never fires at all for a natively-looping video --
+                    // this onended-based audio restart silently never
+                    // triggers in that specific combination. Not the
+                    // combination in the real report that found this
+                    // feature (loop_video was false there), left
+                    // unaddressed for now.
+                    let onended = if audio.is_some() {
+                        " el.onended = () => { audioEl.currentTime = 0; \
+                          audioEl.play().catch(() => {}); };".to_string()
+                    } else {
+                        String::new()
+                    };
                     add_start = format!(
-                        "{{ let el = document.getElementById('m{mid}'); \
+                        "{{ let el = document.getElementById('m{mid}'); {audio_start}\
                            el.play().catch(() => {{}}); \
                            el._canplayRetry = () => el.play().catch(() => {{}}); \
-                           el.addEventListener('canplay', el._canplayRetry, {{ once: true }}); }}");
+                           el.addEventListener('canplay', el._canplayRetry, {{ once: true }});\
+                           {onended} }}");
                     // `duration` already defaults to the XLF-configured
                     // value; loop's own repetition is handled by the
                     // native `loop` attribute above.
@@ -1461,12 +1548,17 @@ impl<'a> Translator<'a> {
                     // trigger a fresh canplay -- stashed as
                     // `_canplayRetry` so add_stop can remove it
                     // explicitly before that happens.
+                    // With a paired audio track, the video's own
+                    // natural end also restarts the audio alongside it
+                    // -- confirmed with the user -- before proceeding
+                    // exactly as before (region_switch, unchanged).
                     add_start = format!(
-                        "{{ let el = document.getElementById('m{mid}'); \
+                        "{{ let el = document.getElementById('m{mid}'); {audio_start}\
                            el.play().catch(() => {{}}); \
                            el._canplayRetry = () => el.play().catch(() => {{}}); \
                            el.addEventListener('canplay', el._canplayRetry, {{ once: true }}); \
-                           el.onended = () => window.arexibo.region_switch({rid}, -1, false); }}");
+                           el.onended = () => {{ {video_onended_audio_restart}\
+                           window.arexibo.region_switch({rid}, -1, false); }}; }}");
                     duration = "() => 86400".to_string();
                 }
                 // Pause+reset when sent to background (regardless of
@@ -1482,11 +1574,11 @@ impl<'a> Translator<'a> {
                     "{{ let el = document.getElementById('m{mid}'); \
                        if (el._canplayRetry) {{ el.removeEventListener('canplay', el._canplayRetry); \
                                                  el._canplayRetry = null; }} \
-                       el.pause(); el.currentTime = 0; }}");
+                       el.pause(); el.currentTime = 0; {audio_stop}}}");
             }
             (_, Some("audio")) => {
                 // See MediaInfo's own doc comment for why.
-                auto_restart_when_alone = true;
+                always_hide_when_stopped = true;
                 // Standalone Audio widget (audio attached to another
                 // widget is embedded as <audio> tags inside that
                 // widget's own HTML, handled by the resource/iframe path
@@ -1616,7 +1708,7 @@ impl<'a> Translator<'a> {
             }
         }
         Ok(Some((mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out,
-                 auto_restart_when_alone)))
+                 always_hide_when_stopped)))
     }
 }
 
@@ -2061,7 +2153,7 @@ mod per_widget_transition_tests {
         assert!(html.contains("setTimeout(() => { el.style.visibility = 'hidden'; }, 500)"));
         // ...but correctly still the region's 2000ms fadeIn for showing,
         // since it doesn't specify its own transIn at all.
-        let end = html.find("4001, false],").unwrap() + "4001, false],".len();
+        let end = html.find("4001],").unwrap() + "4001],".len();
         let widget_4001_block = &html[..end];
         assert!(widget_4001_block.contains("opacity 2000ms"),
                 "widget 4001 doesn't override transIn, so it must still use \
@@ -2256,7 +2348,7 @@ mod loop_tests {
         // must NOT read video.duration synchronously anymore
         assert!(!html.contains("document.getElementById('m5002').duration"));
         // must use the native 'ended' event to advance instead
-        assert!(html.contains("el.onended = () => window.arexibo.region_switch(1, -1, false);"));
+        assert!(html.contains("el.onended = () => { window.arexibo.region_switch(1, -1, false); };"));
         assert!(html.contains("() => 86400"));
     }
 
@@ -2399,7 +2491,7 @@ mod loop_tests {
             </region>
         </layout>"#;
         let html = translate_xlf(xlf);
-        assert!(html.contains("if (next == 0 && !first && !loop && total <= 1 && !media[cur][4])"));
+        assert!(html.contains("if (next == 0 && !first && !loop && total <= 1)"));
     }
 
     #[test]
@@ -2414,7 +2506,7 @@ mod loop_tests {
             </region>
         </layout>"#;
         let html = translate_xlf(xlf);
-        let cond_pos = html.find("if (next == 0 && !first && !loop && total <= 1 && !media[cur][4]) {")
+        let cond_pos = html.find("if (next == 0 && !first && !loop && total <= 1) {")
             .expect("the branch itself must still be present");
         let branch = &html[cond_pos..];
         let stop_pos = branch.find("media[cur][1]();")
@@ -2426,14 +2518,13 @@ mod loop_tests {
     }
 
     #[test]
-    fn a_lone_video_is_flagged_to_auto_restart_but_a_lone_image_is_not() {
-        // The CMS offers no way to turn region-level Loop on at all
-        // when a region has only one item -- without this flag, a lone
-        // video would otherwise just freeze dead after one play, with
-        // no way to configure it to keep going (confirmed with the
-        // user). An image has no such problem (its own "last state"
-        // is just the image itself, correctly staying as-is), so it
-        // must NOT get this flag.
+    fn a_lone_video_is_always_hidden_when_stopped_but_a_lone_image_is_not() {
+        // A lone, non-looping widget normally just leaves its own last
+        // visible state on screen forever (per official Xibo semantics
+        // -- correct for e.g. an image, which just stays as-is). Not
+        // wanted for a video (confirmed with the user): rather than a
+        // frozen/black video element staying visible once stopped for
+        // good, it should actually disappear.
         let xlf = r#"<layout width="720" height="1280">
             <region id="1" left="0" top="0" width="250" height="250">
                 <media id="1" type="video" duration="5"><options><uri>a.mp4</uri></options></media>
@@ -2443,10 +2534,110 @@ mod loop_tests {
             </region>
         </layout>"#;
         let html = translate_xlf(xlf);
-        assert!(html.contains(", () => 86400, 1, true],"),
-                "a lone video must be flagged to auto-restart -- got:\n{html}");
-        assert!(html.contains(", () => 5, 2, false],"),
-                "a lone image must NOT be flagged to auto-restart -- got:\n{html}");
+        assert!(html.contains("document.getElementById('m1').style.visibility = 'hidden';"),
+                "a lone video must actually be hidden once stopped -- got:\n{html}");
+        assert!(!html.contains("document.getElementById('m2').style.visibility = 'hidden';"),
+                "a lone image must keep its current (correct) behavior of just staying \
+                 visible -- got:\n{html}");
+    }
+
+    #[test]
+    fn a_videos_own_attached_audio_track_is_downloaded_and_wired_up() {
+        // Regression test for a real report: a video's own <audio>
+        // sibling (a separate audio track, distinct from a standalone
+        // Audio widget) was never even referenced in the generated
+        // HTML at all, so the browser never requested the file --
+        // confirmed from real logs showing no HTTP request for it ever
+        // happening.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="250" height="141">
+                <media id="6635" type="video" duration="596" useDuration="1">
+                    <options><uri>192.mp4</uri><loop>0</loop></options>
+                    <audio><uri volume="30" loop="1" mediaId="166">166.mp3</uri></audio>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("<audio id='m6635-audio' src='166.mp3'"),
+                "the attached audio track must actually be referenced in the generated \
+                 HTML, or the browser never requests it at all -- got:\n{html}");
+        assert!(html.contains("audioEl.volume = 0.3"),
+                "volume is 0-100 in the XLF, must be converted to HTML5's own 0.0-1.0 \
+                 scale -- got:\n{html}");
+        assert!(html.contains("audioEl.currentTime = 0; audioEl.play()"),
+                "the video's own start must also (re)start the paired audio, from its \
+                 own beginning -- got:\n{html}");
+        assert!(html.contains("el.onended = () => { audioEl.currentTime = 0; \
+audioEl.play().catch(() => {}); };"),
+                "when the video itself ends, the paired audio must be restarted \
+                 alongside it -- got:\n{html}");
+    }
+
+    #[test]
+    fn a_videos_own_attached_audio_only_restarts_itself_if_flagged_to_loop() {
+        // Confirmed with the user (matching the Windows client's own
+        // behavior): if the *video* ends first, the audio just gets
+        // restarted alongside it regardless (covered by the test
+        // above) -- but if the *audio* itself reaches its own natural
+        // end first (it's shorter than the video), whether it restarts
+        // on its own to keep going, or just stays silent for the rest
+        // of that same video playthrough, depends on the audio's own
+        // `loop` attribute specifically (independent of the video's
+        // own `loop`/region Loop settings entirely).
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="0" top="0" width="250" height="141">
+                <media id="1" type="video" duration="10">
+                    <options><uri>a.mp4</uri></options>
+                    <audio><uri volume="100" loop="1" mediaId="1">a.mp3</uri></audio>
+                </media>
+            </region>
+            <region id="2" left="300" top="0" width="250" height="141">
+                <media id="2" type="video" duration="10">
+                    <options><uri>b.mp4</uri></options>
+                    <audio><uri volume="100" loop="0" mediaId="2">b.mp3</uri></audio>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("if (true) { audioEl.currentTime = 0; audioEl.play()"),
+                "loop=\"1\" on the audio itself must make it restart on its own -- \
+                 got:\n{html}");
+        assert!(html.contains("if (false) { audioEl.currentTime = 0; audioEl.play()"),
+                "loop=\"0\" on the audio itself must be wired through as false (never \
+                 restarts on its own) -- got:\n{html}");
+    }
+
+    #[test]
+    fn showfullscreen_expands_the_video_over_the_whole_layout() {
+        // Regression test for a real report: showFullScreen was
+        // entirely unhandled, so the video always stayed within its
+        // own (possibly tiny) region -- confirmed real from Xibo's own
+        // developer docs: "Expand over the top of existing content to
+        // show video full screen". The region's own wrapper clips
+        // anything larger than itself (overflow: hidden), so this
+        // needs `position: fixed` to actually escape it, not just a
+        // bigger width/height within the normal absolute positioning.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="1" left="3" top="3" width="250" height="141">
+                <media id="1" type="video" duration="0">
+                    <options><uri>a.mp4</uri><showFullScreen>1</showFullScreen></options>
+                </media>
+            </region>
+            <region id="2" left="300" top="0" width="250" height="141">
+                <media id="2" type="video" duration="0">
+                    <options><uri>b.mp4</uri></options>
+                </media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains("position: fixed; z-index: 9999; left: 0px; top: 0px; \
+width: 1080px; height: 1920px;"),
+                "showFullScreen=\"1\" must expand the video to cover the whole layout, \
+                 escaping its own region's bounds via position: fixed -- got:\n{html}");
+        assert!(!html.contains("id='m2' src='b.mp4'  \
+style='position: fixed"),
+                "a video without showFullScreen must keep its normal region-relative \
+                 positioning -- got:\n{html}");
     }
 
     #[test]
