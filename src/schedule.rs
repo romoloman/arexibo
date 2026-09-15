@@ -3,7 +3,7 @@
 
 //! Schedule parsing and scheduling.
 
-use std::{fs::File, path::Path};
+use std::{collections::HashMap, fs::File, path::Path};
 use anyhow::{Context, Result};
 use time::{OffsetDateTime, PrimitiveDateTime};
 use elementtree::Element;
@@ -146,6 +146,26 @@ struct ScheduleEntry {
     // (defaults false) on every ordinary, non-synchronised entry.
     #[serde(default)]
     sync_event: bool,
+    // Cycle Playback (Campaign-level layout rotation) -- all three
+    // confirmed real, seen literally in a live schedule.xml the user
+    // captured (`cyclePlayback="0" groupKey="0" playCount="0"` on an
+    // ordinary, non-cycling entry). `group_key` is the Campaign's own
+    // id: entries sharing a non-zero `group_key` with
+    // `cycle_playback=true` belong to the same cycle group and rotate
+    // between each other, instead of each being scheduled
+    // independently. `play_count` is how many complete natural
+    // playthroughs (region_done/jsLayoutDone, not a duration timer --
+    // confirmed from the real client's own source, see
+    // active_cycle_groups's own doc comment) this specific member gets
+    // before the group advances to its next member. `group_key == 0`
+    // (the default/non-cycling value) means "not part of any cycle
+    // group" regardless of `cycle_playback`'s own value.
+    #[serde(default)]
+    cycle_playback: bool,
+    #[serde(default)]
+    group_key: i64,
+    #[serde(default)]
+    play_count: i64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -158,6 +178,22 @@ pub struct Schedule {
     commands: Vec<ScheduledCommand>,
     #[serde(default)]
     actions: Vec<ScheduledAction>,
+}
+
+/// Persistent Cycle Playback state -- which member of each active cycle
+/// group (keyed by `group_key`) is currently showing, and how many
+/// complete natural playthroughs it's had so far. Deliberately NOT part
+/// of `Schedule` itself: a fresh `Schedule` replaces the previous one on
+/// every schedule refresh (which can happen every few minutes, far more
+/// often than a full cycle typically completes), so this must be owned
+/// and persisted by the caller (mainloop.rs's own `Handler`) across
+/// those refreshes instead, the same way `CriteriaStore` already is.
+#[derive(Debug, Default, Clone)]
+pub struct CycleState {
+    // group_key -> (index into that group's own member list, in the
+    // same document order active_cycle_groups returns; plays completed
+    // so far for the member currently at that index)
+    positions: HashMap<i64, (usize, i64)>,
 }
 
 impl Schedule {
@@ -204,9 +240,14 @@ impl Schedule {
             // false) rather than erroring, matching this file's general
             // defensive-parsing convention for booleans-as-strings.
             let sync_event = layout.get_attr("syncEvent") == Some("1");
+            let cycle_playback = layout.get_attr("cyclePlayback") == Some("1");
+            let group_key = layout.get_attr("groupKey")
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
+            let play_count = layout.get_attr("playCount")
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
             schedules.push(ScheduleEntry {
                 from, to, layoutid, priority, scheduleid, criteria, share_of_voice, duration,
-                sync_event,
+                sync_event, cycle_playback, group_key, play_count,
             });
         }
         let mut default = None;
@@ -368,6 +409,80 @@ impl Schedule {
         0
     }
 
+    /// Persistent Cycle Playback state -- which member of each active
+    /// cycle group (keyed by `group_key`) is currently showing, and how
+    /// many complete natural playthroughs it's had so far. Deliberately
+    /// NOT part of `Schedule` itself: a fresh `Schedule` replaces the
+    /// previous one on every schedule refresh (which can happen every
+    /// few minutes, far more often than a full cycle typically
+    /// completes), so this must be owned and persisted by the caller
+    /// (mainloop.rs's own `Handler`) across those refreshes instead, the
+    /// same way `CriteriaStore` already is.
+    ///
+    /// Currently-active cycle groups (Cycle Playback, see
+    /// ScheduleEntry's own doc comment for the full story), keyed by
+    /// `group_key`, each with its own ordered member list in the same
+    /// order they appear in `self.schedules` -- matching the real
+    /// client's own "first-seen member is the group's representative"
+    /// convention (`ParseCyclePlayback()`,
+    /// xibo-dotnetclient/Logic/ScheduleManager.cs). Playthrough counting
+    /// happens at the *layout render* level in the real client
+    /// (`Rendering/Layout.xaml.cs`), i.e. on each complete natural
+    /// cycle, not on a schedule-resolution timer -- matches this
+    /// codebase's own existing `region_done`/`jsLayoutDone` signal
+    /// exactly (see `record_cycle_group_completion` below), no new
+    /// timer needed.
+    fn active_cycle_groups(&self, now: OffsetDateTime, criteria: &CriteriaStore)
+                           -> HashMap<i64, Vec<&ScheduleEntry>> {
+        let mut groups: HashMap<i64, Vec<&ScheduleEntry>> = HashMap::new();
+        for e in &self.schedules {
+            if e.cycle_playback && e.group_key != 0
+               && e.from <= now && now <= e.to && self.criteria_satisfied(e, criteria) {
+                groups.entry(e.group_key).or_default().push(e);
+            }
+        }
+        groups
+    }
+
+    /// Called whenever a layout completes one full natural playthrough
+    /// (region_done/jsLayoutDone, i.e. `FromGui::LayoutCompleted`) -- if
+    /// `layout_id` is the *current* member of an active cycle group,
+    /// counts this play; once that member's own `play_count` (at least
+    /// 1, even if the CMS sends 0) is reached, advances to the group's
+    /// next member (wrapping around), resetting the count for it. A
+    /// no-op if `layout_id` isn't the current member of any active cycle
+    /// group at all -- including, deliberately, if it's a *non-current*
+    /// member of one (can't happen in practice: a non-current member
+    /// never gets shown by `layouts_now()` in the first place, so it
+    /// could never complete a playthrough to begin with).
+    ///
+    /// Counts on *every* completed playthrough, unconditionally --
+    /// confirmed real from a bug in the reference client itself (issue
+    /// #273, xibo-dotnetclient: "Sub Playlist: cycle playback only
+    /// plays the first item when play count > 1"), caused there by only
+    /// incrementing once a decision to advance had *already* been made,
+    /// not on every completed cycle. Deliberately not replicated here.
+    pub fn record_cycle_group_completion(&self, layout_id: LayoutId,
+                                          criteria: &CriteriaStore, state: &mut CycleState) {
+        let now = OffsetDateTime::now_local().unwrap();
+        for (group_key, members) in self.active_cycle_groups(now, criteria) {
+            let (idx, plays) = state.positions.entry(group_key).or_insert((0, 0));
+            let idx_clamped = (*idx).min(members.len().saturating_sub(1));
+            if members[idx_clamped].layoutid != layout_id {
+                continue;
+            }
+            *plays += 1;
+            let needed = members[idx_clamped].play_count.max(1);
+            if *plays >= needed {
+                *idx = (idx_clamped + 1) % members.len();
+                *plays = 0;
+            } else {
+                *idx = idx_clamped;
+            }
+            return;
+        }
+    }
+
     /// Layouts that should be showing right now. Without any active
     /// Interrupt Layout (`shareOfVoice > 0`), this is just the
     /// highest-active-priority normal layouts (or the default, if
@@ -378,11 +493,30 @@ impl Schedule {
     /// advance through and wrap around an arbitrary-length sequence, so
     /// no changes are needed there to support the (possibly much
     /// longer, with repeated entries) sequence this can now return.
-    pub fn layouts_now(&self, criteria: &CriteriaStore) -> Vec<LayoutId> {
+    ///
+    /// Cycle Playback groups (see `active_cycle_groups`) are resolved to
+    /// just their own *current* member (per `cycle_state`) before
+    /// anything else below ever sees them -- every other member of the
+    /// same group is excluded here, as if it weren't scheduled at all
+    /// right now. Deliberately scoped to the non-interrupt path only for
+    /// now: a cycle-group entry that's *also* an Interrupt Layout
+    /// (`share_of_voice > 0`) isn't specially handled, a known,
+    /// documented gap (an unusual combination in practice).
+    pub fn layouts_now(&self, criteria: &CriteriaStore, cycle_state: &mut CycleState) -> Vec<LayoutId> {
         let now = OffsetDateTime::now_local().unwrap();
-        let active: Vec<&ScheduleEntry> = self.schedules.iter()
-            .filter(|e| e.from <= now && now <= e.to && self.criteria_satisfied(e, criteria))
+        let cycle_groups = self.active_cycle_groups(now, criteria);
+        let cycle_members: std::collections::HashSet<(i64, LayoutId)> = cycle_groups.iter()
+            .flat_map(|(&gk, members)| members.iter().map(move |m| (gk, m.layoutid)))
             .collect();
+        let mut active: Vec<&ScheduleEntry> = self.schedules.iter()
+            .filter(|e| e.from <= now && now <= e.to && self.criteria_satisfied(e, criteria)
+                        && !cycle_members.contains(&(e.group_key, e.layoutid)))
+            .collect();
+        for (group_key, members) in &cycle_groups {
+            let (idx, _) = cycle_state.positions.entry(*group_key).or_insert((0, 0));
+            let idx = (*idx).min(members.len().saturating_sub(1));
+            active.push(members[idx]);
+        }
 
         let normal_entries = Self::highest_priority(
             active.iter().copied().filter(|e| e.share_of_voice <= 0));
@@ -693,6 +827,7 @@ mod tests {
             to: now + time::Duration::hours(1),
             layoutid, priority, scheduleid: 1, criteria,
             share_of_voice: 0, duration: None, sync_event: false,
+            cycle_playback: false, group_key: 0, play_count: 0,
         }
     }
 
@@ -706,7 +841,7 @@ mod tests {
     #[test]
     fn layout_with_no_criteria_is_always_eligible() {
         let sched = Schedule { default: None, schedules: vec![entry(1, 0, vec![])], overlays: vec![], commands: vec![], actions: vec![] };
-        assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![1]);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default()), vec![1]);
     }
 
     #[test]
@@ -716,11 +851,11 @@ mod tests {
         };
         let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![] };
         // no criteria set at all -> fails closed, falls back to default
-        assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![99]);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default()), vec![99]);
 
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "20".into(), 3600); // below the gt 30 threshold
-        assert_eq!(sched.layouts_now(&cs), vec![99]);
+        assert_eq!(sched.layouts_now(&cs, &mut CycleState::default()), vec![99]);
     }
 
     #[test]
@@ -731,7 +866,7 @@ mod tests {
         let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![] };
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "35".into(), 3600);
-        assert_eq!(sched.layouts_now(&cs), vec![1]);
+        assert_eq!(sched.layouts_now(&cs, &mut CycleState::default()), vec![1]);
     }
 
     #[test]
@@ -751,7 +886,7 @@ mod tests {
         cs.set("temperature".into(), "35".into(), 3600);
         cs.set("weather_condition".into(), "clear".into(), 3600); // doesn't match "rain"
         // one of two criteria fails -> whole entry excluded
-        assert_eq!(sched.layouts_now(&cs), vec![99]);
+        assert_eq!(sched.layouts_now(&cs, &mut CycleState::default()), vec![99]);
     }
 
     #[test]
@@ -761,7 +896,7 @@ mod tests {
             schedules: vec![entry(1, 0, vec![]), entry(2, 0, vec![])],
             overlays: vec![], commands: vec![], actions: vec![],
         };
-        let result = sched.layouts_now(&CriteriaStore::default());
+        let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         assert_eq!(result, vec![1, 2]);
     }
 
@@ -777,7 +912,7 @@ mod tests {
             ],
             overlays: vec![], commands: vec![], actions: vec![],
         };
-        assert_eq!(sched.layouts_now(&CriteriaStore::default()), vec![2]);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default()), vec![2]);
     }
 
     #[test]
@@ -800,7 +935,7 @@ mod tests {
             ],
             overlays: vec![], commands: vec![], actions: vec![],
         };
-        let result = sched.layouts_now(&CriteriaStore::default());
+        let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         // Both layouts appear, interrupt spread through rather than
         // clustered entirely at the start or end.
         assert!(result.contains(&1));
@@ -830,7 +965,7 @@ mod tests {
             ],
             overlays: vec![], commands: vec![], actions: vec![],
         };
-        let result = sched.layouts_now(&CriteriaStore::default());
+        let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         assert_eq!(result.iter().filter(|&&id| id == 2).count(), 3);
         assert_eq!(result.iter().filter(|&&id| id == 3).count(), 3);
     }
@@ -842,9 +977,145 @@ mod tests {
             schedules: vec![interrupt_entry(2, 10, 60)],
             overlays: vec![], commands: vec![], actions: vec![],
         };
-        let result = sched.layouts_now(&CriteriaStore::default());
+        let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         assert!(result.contains(&99));
         assert!(result.contains(&2));
+    }
+
+    fn cycle_entry(layoutid: LayoutId, group_key: i64, play_count: i64) -> ScheduleEntry {
+        let mut e = entry(layoutid, 0, vec![]);
+        e.cycle_playback = true;
+        e.group_key = group_key;
+        e.play_count = play_count;
+        e
+    }
+
+    fn sched_with(entries: Vec<ScheduleEntry>) -> Schedule {
+        Schedule { default: None, schedules: entries, overlays: vec![], commands: vec![], actions: vec![] }
+    }
+
+    #[test]
+    fn a_cycle_group_starts_at_its_first_seen_member() {
+        // Matches the reference client's own convention
+        // (ParseCyclePlayback()): the first member encountered in
+        // document order is the group's initial "representative".
+        let sched = sched_with(vec![cycle_entry(1, 42, 1), cycle_entry(2, 42, 1)]);
+        let mut cs = CycleState::default();
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![1]);
+    }
+
+    #[test]
+    fn only_the_current_members_layout_is_ever_returned_not_every_group_member() {
+        // The whole point: the *other* members of the same group must
+        // never appear in layouts_now()'s own result, as if they
+        // weren't scheduled at all right now.
+        let sched = sched_with(vec![cycle_entry(1, 42, 1), cycle_entry(2, 42, 1),
+                                     cycle_entry(3, 42, 1)]);
+        let mut cs = CycleState::default();
+        let result = sched.layouts_now(&CriteriaStore::default(), &mut cs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], 1);
+    }
+
+    #[test]
+    fn completing_a_playthrough_advances_to_the_next_member_once_play_count_is_reached() {
+        let sched = sched_with(vec![cycle_entry(1, 42, 1), cycle_entry(2, 42, 1)]);
+        let mut cs = CycleState::default();
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![1]);
+
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![2],
+                   "play_count of 1 must advance to the next member after a single \
+                    completed playthrough");
+    }
+
+    #[test]
+    fn the_group_wraps_back_to_the_first_member_after_the_last_one() {
+        let sched = sched_with(vec![cycle_entry(1, 42, 1), cycle_entry(2, 42, 1)]);
+        let mut cs = CycleState::default();
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![2]);
+
+        sched.record_cycle_group_completion(2, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![1],
+                   "must wrap back around to the first member, not stop at the last");
+    }
+
+    #[test]
+    fn a_higher_play_count_requires_that_many_completions_before_advancing() {
+        let sched = sched_with(vec![cycle_entry(1, 42, 3), cycle_entry(2, 42, 1)]);
+        let mut cs = CycleState::default();
+
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![1],
+                   "1 of 3 required completions must not advance yet");
+
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![1],
+                   "2 of 3 required completions must still not advance");
+
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![2],
+                   "the 3rd completion must finally advance to the next member");
+    }
+
+    #[test]
+    fn every_completed_playthrough_counts_not_only_the_one_that_triggers_advancement() {
+        // Regression guard for a real bug in the reference client itself
+        // (xibo-dotnetclient issue #273: "Sub Playlist: cycle playback
+        // only plays the first item when play count > 1") -- caused
+        // there by only incrementing the counter once a decision to
+        // advance had already been made, not on every completed cycle.
+        // This test would pass even with that bug if play_count were 1,
+        // so it deliberately uses play_count > 1 and completes it one
+        // playthrough at a time, exactly like the real natural-
+        // completion signal does (never in a single batched call).
+        let sched = sched_with(vec![cycle_entry(1, 7, 2)]);
+        let mut cs = CycleState::default();
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        // Only one member in this group -- wraps back to itself, but the
+        // internal play count must have genuinely reset to 0 (not still
+        // sitting at a stale, never-incremented value) for the *next*
+        // cycle to also require 2 completions again.
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![1],
+                   "1 of 2 completions in the new cycle must not advance again yet");
+    }
+
+    #[test]
+    fn a_completion_of_a_non_current_layout_id_is_a_no_op() {
+        // Can't really happen in practice (a non-current member is
+        // never shown, so it could never signal a completion) -- but
+        // must not corrupt state if it somehow did.
+        let sched = sched_with(vec![cycle_entry(1, 42, 1), cycle_entry(2, 42, 1)]);
+        let mut cs = CycleState::default();
+        sched.record_cycle_group_completion(2, &CriteriaStore::default(), &mut cs);
+        assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut cs), vec![1],
+                   "completing a layout id that isn't the current member must not \
+                    advance anything");
+    }
+
+    #[test]
+    fn a_completion_of_an_ordinary_non_cycling_layout_is_a_no_op() {
+        let sched = sched_with(vec![entry(1, 0, vec![])]);
+        let mut cs = CycleState::default();
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        assert!(cs.positions.is_empty(),
+                "an ordinary layout with no cycle group at all must never touch \
+                 CycleState");
+    }
+
+    #[test]
+    fn two_independent_cycle_groups_do_not_interfere_with_each_other() {
+        let sched = sched_with(vec![cycle_entry(1, 10, 1), cycle_entry(2, 10, 1),
+                                     cycle_entry(3, 20, 1), cycle_entry(4, 20, 1)]);
+        let mut cs = CycleState::default();
+        sched.record_cycle_group_completion(1, &CriteriaStore::default(), &mut cs);
+        let result = sched.layouts_now(&CriteriaStore::default(), &mut cs);
+        assert!(result.contains(&2), "group 10 must have advanced to its own next member");
+        assert!(result.contains(&3), "group 20 must be entirely unaffected, still at its \
+                                       own first member");
     }
 }
 
@@ -954,7 +1225,7 @@ mod overlay_tests {
         let tree = Element::from_reader(xml.as_bytes()).unwrap();
         let sched = Schedule::parse(&tree).unwrap();
         let criteria = CriteriaStore::default();
-        assert_eq!(sched.layouts_now(&criteria), vec![1014]);
+        assert_eq!(sched.layouts_now(&criteria, &mut CycleState::default()), vec![1014]);
         assert!(sched.is_sync_gated(1014, &criteria));
         // The schedule's own <default> (854) is never itself sync-gated
         // -- it's a fallback, not a real scheduled entry at all.
@@ -970,7 +1241,7 @@ mod overlay_tests {
         let tree = Element::from_reader(xml.as_bytes()).unwrap();
         let sched = Schedule::parse(&tree).unwrap();
         let criteria = CriteriaStore::default();
-        assert_eq!(sched.layouts_now(&criteria), vec![614]);
+        assert_eq!(sched.layouts_now(&criteria, &mut CycleState::default()), vec![614]);
         assert!(!sched.is_sync_gated(614, &criteria),
                 "an ordinary syncEvent=\"0\" layout must never be reported as sync-gated");
     }

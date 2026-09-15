@@ -15,7 +15,7 @@ use crate::config::{ArexiboMeta, CmsSettings, PlayerSettings, SyncRole};
 use crate::{logger, schedule, server, syncgroup, util, xmds, xmr};
 use crate::resource::{Cache, FetchedContent, ReqFile};
 use crate::faults;
-use crate::schedule::Schedule;
+use crate::schedule::{Schedule, CycleState};
 use crate::stats::{StatCollector, LayoutStat};
 use crate::criteria::CriteriaStore;
 use crate::command::Command;
@@ -281,6 +281,11 @@ pub struct Handler {
     /// Runtime state for Schedule Criteria (XMR `criteriaUpdate`) -- see
     /// criteria.rs. Deliberately not persisted across restarts.
     criteria: CriteriaStore,
+    /// Cycle Playback runtime state (see schedule::CycleState's own doc
+    /// comment for why this must live here, not inside `schedule`
+    /// itself). Deliberately not persisted across restarts, same as
+    /// `criteria` above.
+    cycle_state: CycleState,
     shell_process: Option<Popen>,
     /// Outcome of the most recently run player command, None if no command has
     /// run yet in this lifetime.
@@ -620,7 +625,7 @@ impl Handler {
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
                                  layout_playing_since: None,
-                                 criteria: CriteriaStore::default(),
+                                 criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, fault_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
@@ -667,7 +672,7 @@ impl Handler {
                                  stats: StatCollector::default(),
                                  faults: faults::FaultCollector::default(),
                                  layout_playing_since: None,
-                                 criteria: CriteriaStore::default(),
+                                 criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, fault_rx, overlay_expiry: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
@@ -1177,6 +1182,14 @@ impl Handler {
                             self.override_revert_on_completion = false;
                             self.schedule_check();
                         } else if self.override_layout.is_none() {
+                            // Cycle Playback (see schedule::ScheduleEntry's
+                            // own doc comment): counts this playthrough
+                            // towards the currently-showing layout's own
+                            // cycle group, if it belongs to one at all --
+                            // a no-op otherwise. May advance the group to
+                            // its next member.
+                            self.schedule.record_cycle_group_completion(
+                                self.current_layout, &self.criteria, &mut self.cycle_state);
                             // Confirmed real from a difference with the
                             // Windows client: when a layout completes
                             // its own natural cycle and is still the
@@ -1189,7 +1202,7 @@ impl Handler {
                             // by design, for every other -- much more
                             // frequent -- caller), so this needs its
                             // own explicit check here instead.
-                            let resolved = self.schedule.layouts_now(&self.criteria);
+                            let resolved = self.schedule.layouts_now(&self.criteria, &mut self.cycle_state);
                             let available: Vec<_> = resolved.iter().copied()
                                 .filter(|&id| self.cache.get_layout(id).is_some())
                                 .collect();
@@ -1198,6 +1211,15 @@ impl Handler {
                                             still the only one scheduled -- reloading it fresh",
                                            available[0]);
                                 self.to_gui.send(ToGui::ForceReloadLayout(available[0])).unwrap();
+                            } else if available != self.layouts {
+                                // A cycle group just advanced to a
+                                // genuinely different member (its own
+                                // play_count was reached above) -- let
+                                // schedule_check() pick up the change and
+                                // switch normally, the same as it already
+                                // does for every other resolved-schedule
+                                // change.
+                                self.schedule_check();
                             }
                         }
                     }
@@ -2073,7 +2095,7 @@ impl Handler {
             // An active changeLayout override completely replaces the
             // normal CMS schedule -- see the `override_layout` field doc.
             Some(id) => vec![id],
-            None => self.schedule.layouts_now(&self.criteria),
+            None => self.schedule.layouts_now(&self.criteria, &mut self.cycle_state),
         };
         // Filter out scheduled layouts not yet cached (download window
         // or a transient failure can leave one absent on disk) --
@@ -4546,7 +4568,7 @@ mod handle_trigger_code_tests {
             handler.override_revert_on_completion = false;
             handler.schedule_check();
         } else if handler.override_layout.is_none() {
-            let resolved = handler.schedule.layouts_now(&handler.criteria);
+            let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
             let available: Vec<_> = resolved.iter().copied()
                 .filter(|&id| handler.cache.get_layout(id).is_some())
                 .collect();
