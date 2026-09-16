@@ -4,6 +4,9 @@
 #include <QMainWindow>
 #include <QScreen>
 #include <QMap>
+#include <QVector>
+#include <QRect>
+#include <QEvent>
 #include <QtWebEngineWidgets/QWebEngineView>
 #include <QtWebEngineCore/QWebEnginePage>
 #include <QtWebEngineCore/QWebEngineScript>
@@ -159,10 +162,52 @@ private:
     // exactly its own without touching the main layout's.
     QMap<int, QWebEngineView*> overlay_native_views;
 
+    // Touch/click passthrough for an active Overlay Layout (found from
+    // a real report, compared directly against the Windows client's own
+    // WH_MOUSE_LL global hook): the overlay's own real content zones (one
+    // rectangle per region that has at least one widget in it), parsed
+    // from the JSON jsLayoutInit's own overlay call carries (see
+    // JSInterface::jsLayoutInit and layout.rs's own region_geometry doc
+    // comment for where this comes from) -- consumed by eventFilter()
+    // below to decide whether a click/tap lands on real overlay content
+    // (let it through to Chromium normally) or an empty area (forward it
+    // to the main layout underneath instead). Deliberately NOT fixing the
+    // separate native-view stacking-order bug (see this codebase's own
+    // status notes) without this passthrough existing first -- doing so
+    // alone would make an Overlay Layout block the entire main layout
+    // underneath even where it draws nothing, a real regression risk
+    // flagged before starting this.
+    QVector<QRect> overlay_region_rects;
+    // Whether a click/tap that started in an empty overlay area is
+    // currently being forwarded to `view` -- see eventFilter's own doc
+    // comment for why its own move/release events need this to keep
+    // being forwarded too, not just the initial press.
+    bool overlay_forwarding_active = false;
+    // Whether the event filter has already been installed on this
+    // overlay_view instance's own focusProxy -- see its own
+    // installation point in overlayShowImpl for why this guard exists.
+    bool overlay_filter_installed = false;
+    void forwardMouseEventToView(QEvent::Type type, QPoint pos);
+
     void ensureOverlayView();
 
     void adjustScale(int, int);
     void adjustOverlayScale(int, int);
+
+protected:
+    // Installed on overlay_view->focusProxy() (NOT overlay_view itself --
+    // confirmed via research, QTBUG-43602: QWebEngineView overrides
+    // event() and delegates internally to Chromium, bypassing Qt's own
+    // event filter dispatch entirely for the view itself). Compiles
+    // cleanly against real Qt6 6.4.2 headers (-Wall -pedantic, zero
+    // warnings from this code) -- but that only confirms the API usage
+    // is syntactically/type-correct, not the actual runtime behavior on
+    // a real touchscreen (whether focusProxy() is genuinely non-null
+    // this early, whether overlay_view and view truly share one
+    // coordinate space at click time, etc.) -- still needs real
+    // hardware testing before trusting it, same as the rest of this
+    // feature.
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 public:
     // `overlay` selects which view/geometry/native-view-map a call
@@ -213,7 +258,7 @@ private:
     bool is_overlay;
 
 public slots:
-    void jsLayoutInit(int, int, int);
+    void jsLayoutInit(int, int, int, QString);
     void jsLayoutDone(int);
     void jsLayoutPrev(int);
     void jsLayoutJump(int, int);

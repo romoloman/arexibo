@@ -654,7 +654,7 @@ pollRegistrationCode();
 <script>
 new QWebChannel(qt.webChannelTransport, function(channel) {{
   window.arexiboGui = channel.objects.arexibo;
-  window.arexiboGui.jsLayoutInit(0, 1920, 1080);
+  window.arexiboGui.jsLayoutInit(0, 1920, 1080, "[]");
 }});
 </script>
 </head>
@@ -1059,7 +1059,7 @@ mod splash_html_tests {
         // and QWebChannel setup -- this is an *addition*, not a
         // replacement of the pre-existing splash content.
         assert!(html.contains("LOADING..."));
-        assert!(html.contains("jsLayoutInit(0, 1920, 1080)"));
+        assert!(html.contains("jsLayoutInit(0, 1920, 1080, \"[]\")"));
     }
 
     #[test]

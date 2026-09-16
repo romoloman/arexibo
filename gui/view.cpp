@@ -1,6 +1,11 @@
 #include <QApplication>
 #include <QIODevice>
 #include <QBuffer>
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QMouseEvent>
+#include <QTouchEvent>
 
 #include "view.h"
 
@@ -78,6 +83,26 @@ void Window::screenShotImpl(int max_width)
     // can be null (no `--screen` given) -- same fallback already relied
     // on in setSizeImpl() above.
     QPixmap pixmap = screen()->grabWindow(0);
+    // Confirmed real from a live report (tested against Fedora GNOME
+    // Kiosk Wayland, Weston, and WSLg): under Wayland, compositors
+    // deliberately block grabWindow(0)'s own X11-era "grab the root
+    // window" model for security reasons -- it comes back null
+    // (0x0), and saving a null QPixmap silently writes zero bytes,
+    // which the CMS then can't even display (crashes its own
+    // screenshot viewer on the resulting empty file). Falls back to
+    // grabbing this window's own widget hierarchy client-side instead
+    // (QWidget::grab(), Qt's own paint engine -- entirely bypasses
+    // the compositor's desktop-capture restriction), `view` itself as
+    // a last resort if even that somehow comes back null too.
+    if (pixmap.isNull()) {
+        pixmap = this->grab();
+    }
+    if (pixmap.isNull() && view) {
+        pixmap = view->grab();
+    }
+    std::cout << "INFO : [arexibo::qt] screenshot capture: (" << pixmap.width() << "x" \
+               << pixmap.height() << "), isNull=" << (pixmap.isNull() ? "true" : "false") \
+               << std::endl;
     // Respect the CMS's configured ScreenShotSize (PlayerSettings::
     // screenshot_size in Rust) -- previously ignored entirely, always
     // submitting the full captured resolution regardless of what was
@@ -90,8 +115,17 @@ void Window::screenShotImpl(int max_width)
     QByteArray array;
     QBuffer buffer(&array);
     buffer.open(QIODevice::WriteOnly);
-    pixmap.save(&buffer, "PNG");
-    cb(cb_ptr, CB_SCREENSHOT, (intptr_t)(const char *)array, array.size(), 0);
+    // The CMS itself stores/expects screenshots as .jpg (confirmed
+    // real: "{displayId}_screenshot.jpg") -- JPEG (quality 85) also
+    // shrinks a typical capture from ~2MB (lossless PNG) down to
+    // roughly 75KB. PNG only as a fallback, if the JPEG plugin
+    // somehow isn't available.
+    if (!pixmap.save(&buffer, "JPEG", 85)) {
+        pixmap.save(&buffer, "PNG");
+    }
+    std::cout << "INFO : [arexibo::qt] screenshot buffer size: " << array.size() << " bytes" \
+              << std::endl;
+    cb(cb_ptr, CB_SCREENSHOT, (intptr_t)array.constData(), array.size(), 0);
 }
 
 void Window::setSizeImpl(int pos_x, int pos_y, int size_x, int size_y)
@@ -336,6 +370,31 @@ void Window::overlayShowImpl(QString file)
     adjustOverlayScale(overlay_layout_width, overlay_layout_height);
     overlay_view->show();
     overlay_view->raise();
+
+    // Touch/click passthrough -- see overlay_region_rects's own doc
+    // comment in view.h. Installed on focusProxy(), not overlay_view
+    // itself (confirmed via research: installing on the view directly
+    // doesn't work at all, QTBUG-43602). Installed HERE, after show(),
+    // not in ensureOverlayView() (right after construction) -- found
+    // from a real report/log that focusProxy() is genuinely still null
+    // that early, confirming the contingency this comment used to only
+    // flag as a possibility. `overlay_filter_installed` guards against
+    // installing more than once on the same overlay_view instance
+    // (overlayShowImpl can run again for the same instance, e.g. the
+    // overlay's own content refreshing, without a full hide/show
+    // teardown in between).
+    if (!overlay_filter_installed) {
+        if (auto *proxy = overlay_view->focusProxy()) {
+            proxy->installEventFilter(this);
+            overlay_filter_installed = true;
+            std::cout << "DEBUG: [arexibo::qt] touch/click passthrough event filter " \
+                         "installed on overlay focusProxy" << std::endl;
+        } else {
+            std::cout << "WARN : [arexibo::qt] overlay_view->focusProxy() was still null " \
+                         "after show() -- touch/click passthrough will not work for " \
+                         "this overlay" << std::endl;
+        }
+    }
 }
 
 void Window::overlayHideImpl()
@@ -351,6 +410,133 @@ void Window::overlayHideImpl()
     overlay_view = nullptr;
     overlay_channel->deleteLater();
     overlay_channel = nullptr;
+    overlay_region_rects.clear();
+    overlay_filter_installed = false;
+}
+
+bool Window::eventFilter(QObject *watched, QEvent *event)
+{
+    // Touch/click passthrough for an active Overlay Layout -- see
+    // overlay_region_rects's own doc comment in view.h for the full
+    // story, and its own installation point in ensureOverlayView().
+    // Compiles cleanly against real Qt6 6.4.2 headers, but that's not
+    // the same as verified runtime behavior on a real touchscreen --
+    // needs real hardware testing before trusting it.
+    if (!overlay_view || watched != overlay_view->focusProxy()) {
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    // A forwarded gesture is already in progress (started on a press
+    // that landed in an empty area) -- its own move/release events must
+    // ALSO be forwarded to `view`, not just the initial press. Found
+    // from a real report: forwarding only the press left `view` with a
+    // mousedown but no matching mouseup, so a button's own click never
+    // actually registered there at all (a DOM click needs both on the
+    // same element). Consumed here either way, so the overlay's own
+    // page never sees any part of a gesture that isn't its own.
+    if (overlay_forwarding_active) {
+        QEvent::Type t = event->type();
+        if (t == QEvent::MouseMove || t == QEvent::MouseButtonRelease) {
+            forwardMouseEventToView(t, static_cast<QMouseEvent*>(event)->position().toPoint());
+            if (t == QEvent::MouseButtonRelease) overlay_forwarding_active = false;
+            return true;
+        }
+        if (t == QEvent::TouchUpdate || t == QEvent::TouchEnd) {
+            auto *te = static_cast<QTouchEvent*>(event);
+            if (!te->points().isEmpty()) {
+                QEvent::Type mouseType = (t == QEvent::TouchEnd)
+                    ? QEvent::MouseButtonRelease : QEvent::MouseMove;
+                forwardMouseEventToView(mouseType, te->points().first().position().toPoint());
+            }
+            if (t == QEvent::TouchEnd) overlay_forwarding_active = false;
+            return true;
+        }
+        // Some other, unrelated event type arriving mid-gesture --
+        // leave it alone.
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    // Only a *press* starts a new decision -- see above for why its
+    // own follow-up events are then tracked via overlay_forwarding_active
+    // instead of being independently re-decided here.
+    QPoint pos;
+    if (event->type() == QEvent::MouseButtonPress) {
+        pos = static_cast<QMouseEvent*>(event)->position().toPoint();
+    } else if (event->type() == QEvent::TouchBegin) {
+        auto *te = static_cast<QTouchEvent*>(event);
+        if (te->points().isEmpty()) {
+            return QMainWindow::eventFilter(watched, event);
+        }
+        pos = te->points().first().position().toPoint();
+    } else {
+        return QMainWindow::eventFilter(watched, event);
+    }
+    std::cout << "DEBUG: [arexibo::qt] overlay press/touch at (" << pos.x() << "," \
+               << pos.y() << ")" << std::endl;
+
+    for (const QRect &r : overlay_region_rects) {
+        if (r.contains(pos)) {
+            // Real overlay content at this exact point -- let Chromium
+            // handle it completely normally, as if this filter didn't
+            // exist at all.
+            std::cout << "DEBUG: [arexibo::qt] -> inside known overlay content rect (" \
+                       << r.x() << "," << r.y() << " " << r.width() << "x" << r.height() \
+                       << "), letting Chromium handle it normally" << std::endl;
+            return QMainWindow::eventFilter(watched, event);
+        }
+    }
+
+    // An empty area of the overlay -- forward the whole gesture (this
+    // press, and its own move/release above) to the main layout
+    // underneath instead of letting the overlay silently absorb it doing
+    // nothing. `overlay_view` and `view` share the exact same on-screen
+    // geometry (see overlayShowImpl's own setGeometry call, matching
+    // `view`'s own), so the same local point applies to both unchanged.
+    // Deliberately simplified to synthesized *mouse* events even for a
+    // touch gesture -- faithfully reconstructing Qt's own full
+    // multi-point touch event machinery here is considerably more
+    // involved, and a plain click/drag already achieves the practical
+    // outcome a kiosk touchscreen needs (activating/dragging whatever's
+    // underneath).
+    std::cout << "DEBUG: [arexibo::qt] -> outside every known overlay content rect, " \
+                 "forwarding to the main layout" << std::endl;
+    overlay_forwarding_active = true;
+    forwardMouseEventToView(QEvent::MouseButtonPress, pos);
+    return true; // consume the original event -- the overlay must not also react to it
+}
+
+// Builds and posts a single synthesized mouse event of the given type,
+// at `pos` (already in `view`'s own local coordinates -- see
+// eventFilter's own doc comment for why no translation is needed), to
+// the main layout. Shared by every step of a forwarded gesture
+// (press/move/release) so they all agree on the same button/modifier
+// state a real gesture would have throughout.
+//
+// Posted to `view->focusProxy()`, NOT `view` itself -- confirmed from
+// the real Qt6 header (qwebengineview.h): QWebEngineView overrides only
+// the generic `event(QEvent*)`, never mousePressEvent/mouseMoveEvent/
+// mouseReleaseEvent specifically, delegating real mouse handling
+// entirely to its own internal focusProxy() child widget instead (the
+// exact same QTBUG-43602 mechanism already confirmed for *installing*
+// the event filter on the overlay's own side -- missed here at first,
+// applied inconsistently, until a real report showed the forwarded
+// click simply never registering on `view`'s own page at all).
+void Window::forwardMouseEventToView(QEvent::Type type, QPoint pos)
+{
+    if (!view) {
+        std::cout << "WARN : [arexibo::qt] forwardMouseEventToView: no `view` to forward to" \
+                  << std::endl;
+        return;
+    }
+    QWidget *target = view->focusProxy();
+    if (!target) target = view;
+    std::cout << "DEBUG: [arexibo::qt] forwarding event type " << type << " at (" \
+               << pos.x() << "," << pos.y() << ") to " \
+               << (target == view ? "view (focusProxy was null)" : "view->focusProxy()") \
+               << std::endl;
+    auto *forwarded = new QMouseEvent(type, QPointF(pos), target->mapToGlobal(pos),
+                                       Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QCoreApplication::postEvent(target, forwarded);
 }
 
 void Window::jsNativeWebShowImpl(bool overlay, int mediaId, QString url, int x, int y, int w, int h)
@@ -424,11 +610,37 @@ void Window::jsNativeWebHideImpl(bool overlay, int mediaId)
 
 // Callbacks from JavaScript
 
-void JSInterface::jsLayoutInit(int id, int width, int height)
+void JSInterface::jsLayoutInit(int id, int width, int height, QString region_geometry_json)
 {
     if (is_overlay) {
         std::cout << "INFO : [arexibo::qt] overlay layout " << id << " initialized" << std::endl;
         wnd->adjustOverlayScale(width, height);
+        // Touch/click passthrough -- see overlay_region_rects's own doc
+        // comment in view.h. Parsed here (not at HTML-generation time,
+        // Rust side) since this is the C++-side data structure the
+        // event filter actually reads from at click-time.
+        wnd->overlay_region_rects.clear();
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(region_geometry_json.toUtf8(), &err);
+        if (err.error == QJsonParseError::NoError && doc.isArray()) {
+            for (const QJsonValue &v : doc.array()) {
+                QJsonObject o = v.toObject();
+                wnd->overlay_region_rects.append(QRect(
+                    o.value("x").toInt(), o.value("y").toInt(),
+                    o.value("w").toInt(), o.value("h").toInt()));
+            }
+        } else {
+            std::cout << "WARN : [arexibo::qt] failed to parse overlay region geometry -- " \
+                         "touch/click passthrough will treat this whole overlay as empty" \
+                      << std::endl;
+        }
+        std::cout << "DEBUG: [arexibo::qt] overlay_region_rects now has " \
+                  << wnd->overlay_region_rects.size() << " rect(s):";
+        for (const QRect &r : wnd->overlay_region_rects) {
+            std::cout << " (" << r.x() << "," << r.y() << " " << r.width() << "x" \
+                       << r.height() << ")";
+        }
+        std::cout << std::endl;
         wnd->cb(wnd->cb_ptr, CB_OVERLAY_LAYOUT_INIT, id, width, height);
         return;
     }

@@ -98,7 +98,8 @@ const SCRIPT: &str = r##"
 new QWebChannel(qt.webChannelTransport, function(channel) {
   window.arexiboGui = channel.objects.arexibo;
   window.arexiboGui.jsLayoutInit(window.arexibo.id,
-                                 window.arexibo.width, window.arexibo.height);
+                                 window.arexibo.width, window.arexibo.height,
+                                 JSON.stringify(window.arexibo.region_geometry || []));
 });
 
 window.arexibo = {
@@ -109,6 +110,18 @@ window.arexibo = {
   regions_total: 0,
   triggers: {},
   regions: {},
+  // Overwritten immediately below, in this exact same synchronous
+  // script block, right alongside id/width/height -- an array of
+  // {x, y, w, h} rectangles, one per region that actually has at
+  // least one widget in it, in layout pixel coordinates. Used only
+  // for touch/click passthrough on an active Overlay Layout
+  // (gui/view.cpp's own event filter on overlay_view's focusProxy).
+  // Deliberately NOT assigned later (e.g. in write_footer) -- found
+  // from a real report that jsLayoutInit's own QWebChannel callback
+  // routinely fires *before* a later <script> tag further down the
+  // page has run at all, so a later assignment was read as still
+  // empty every time.
+  region_geometry: [],
 
   region_switch: function(rid, next, first) {
     let {cur, total, timeoutid, media, loop} = this.regions[rid];
@@ -613,7 +626,27 @@ impl<'a> Translator<'a> {
             }
             if self.has_pdf { break; }
         }
-        self.write_header(&tree)?;
+        // Pre-scan for region geometry too -- needed by write_header
+        // itself (see its own doc comment for why this must be
+        // computed *before* write_header runs, not later via
+        // write_footer as an earlier version of this code did). One
+        // rectangle per region that has at least one widget in it, in
+        // the same document order.
+        let mut region_geometry_json = String::new();
+        for region in tree.find_all("region") {
+            if region.find("media").is_none() {
+                continue;
+            }
+            let x: i32 = region.parse_attr("left")?;
+            let y: i32 = region.parse_attr("top")?;
+            let w: i32 = region.parse_attr("width")?;
+            let h: i32 = region.parse_attr("height")?;
+            if !region_geometry_json.is_empty() {
+                region_geometry_json.push(',');
+            }
+            region_geometry_json.push_str(&format!("{{\"x\":{x},\"y\":{y},\"w\":{w},\"h\":{h}}}"));
+        }
+        self.write_header(&tree, &region_geometry_json)?;
 
         // Actions can appear at any nesting level: directly under
         // <layout> (layout-scoped), under <region> (region-scoped), or
@@ -801,7 +834,7 @@ impl<'a> Translator<'a> {
         Ok(())
     }
 
-    fn write_header(&mut self, el: &Element) -> Result<()> {
+    fn write_header(&mut self, el: &Element, region_geometry_json: &str) -> Result<()> {
         self.size = (el.parse_attr("width")?, el.parse_attr("height")?);
         // Defaults to enabled if absent -- per Xibo's documented Proof
         // of Play convention ("stats ... 0 or 1 ... default 1 if not
@@ -813,10 +846,24 @@ impl<'a> Translator<'a> {
         writeln!(self.out, "<html><head>")?;
         writeln!(self.out, "<meta charset='utf-8'>")?;
         writeln!(self.out, "<script src='qrc:///qtwebchannel/qwebchannel.js'></script>")?;
+        // region_geometry assigned HERE, in the exact same synchronous
+        // script block as id/width/height below -- NOT later, e.g. in
+        // write_footer, as an earlier version of this code did. Found
+        // from a real report: jsLayoutInit's own QWebChannel callback
+        // routinely fires *before* a later <script> tag further down
+        // the page has run at all (the earlier assumption that an
+        // async WebChannel handshake is always slower than parsing the
+        // rest of an already-loaded document was simply wrong) --
+        // confirmed from a real log showing "overlay_region_rects now
+        // has 0 rect(s)" every time, on every single load. id/width/
+        // height already worked correctly precisely because they're
+        // set this same synchronous way, not later -- region_geometry
+        // now follows the exact same working pattern.
         writeln!(self.out, "<script type='text/javascript'>{SCRIPT}\
                             window.arexibo.id = {};\n\
                             window.arexibo.width = {};\n\
                             window.arexibo.height = {};\n\
+                            window.arexibo.region_geometry = [{region_geometry_json}];\n\
                             </script>", self.id, self.size.0, self.size.1)?;
         writeln!(self.out, "<style type='text/css'>{LAYOUT_CSS}")?;
 
@@ -2682,6 +2729,31 @@ style='position: fixed"),
         assert!(html.contains("id='m2' src='192.mp4'"),
                 "a normal (non-file://) video URI must be left completely unchanged -- \
                  got:\n{html}");
+    }
+
+    #[test]
+    fn region_geometry_is_emitted_for_the_c_plus_plus_side_click_passthrough() {
+        // Consumed by gui/view.cpp's own event filter on an Overlay
+        // Layout's focusProxy -- a click landing outside every one of
+        // these rectangles falls through to the main layout underneath
+        // instead of being silently absorbed by an empty overlay area.
+        let xlf = r#"<layout width="1080" height="1920">
+            <region id="5" left="10" top="20" width="100" height="50">
+                <media id="1" type="image" duration="5"><options><uri>a.png</uri></options></media>
+            </region>
+            <region id="6" left="200" top="300" width="80" height="60">
+                <media id="2" type="image" duration="5"><options><uri>b.png</uri></options></media>
+            </region>
+        </layout>"#;
+        let html = translate_xlf(xlf);
+        assert!(html.contains(
+            "window.arexibo.region_geometry = [{\"x\":10,\"y\":20,\"w\":100,\"h\":50},\
+             {\"x\":200,\"y\":300,\"w\":80,\"h\":60}];"),
+            "must emit exactly one rectangle per region, in the same order they were \
+             written -- got:\n{html}");
+        assert!(html.contains("JSON.stringify(window.arexibo.region_geometry || [])"),
+                "jsLayoutInit must be called with the region geometry as its 4th \
+                 argument -- got:\n{html}");
     }
 
     #[test]
