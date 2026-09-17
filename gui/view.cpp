@@ -9,29 +9,9 @@
 
 #include "view.h"
 
-// Lazily created, kept alive for the whole process -- a genuinely
-// separate QWebEngineProfile (its own network stack: connection pool,
-// DNS cache, cookies) from QWebEngineProfile::defaultProfile(), used
-// only for `webpage render="native"` widgets (see jsNativeWebShowImplNow).
-// Found from a real report: `view`, `overlay_view` and every native
-// widget previously all shared the one default profile -- meaning a
-// stuck/hung connection for a native widget's own external URL (e.g.
-// one that accepts a TCP SYN but never replies, tying up a shared
-// connection or DNS-resolution slot for as long as the OS's own
-// underlying TCP timeout takes, commonly on the order of minutes)
-// plausibly delayed or blocked otherwise-unrelated network activity
-// for `view` itself, including its own purely-local requests to
-// arexibo's embedded HTTP server -- even though `view` and the native
-// widget are, in Chromium's own multi-process architecture, otherwise
-// separate renderer processes. A named (not off-the-record) profile,
-// so this widget's own cache/cookies still persist normally across
-// restarts, just under a separate storage location from the default
-// profile's own.
-static QWebEngineProfile *nativeWebpageProfile()
-{
-    static QWebEngineProfile *profile = new QWebEngineProfile("native-webpage");
-    return profile;
-}
+// (Separate QWebEngineProfile for native webpage widgets: tried and
+// reverted, see status doc -- didn't fix the freeze and broke
+// unrelated sites.)
 
 Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void *cb_ptr) :
     QMainWindow(),
@@ -800,7 +780,9 @@ void Window::jsNativeWebShowImpl(bool overlay, int mediaId, QString url, int x, 
     pending_native_web_shows.append({overlay, mediaId, url, x, y, w, h});
     if (!native_web_show_stagger_active) {
         native_web_show_stagger_active = true;
-        processNextPendingNativeWebShow();
+        // 3s delay before the first native widget navigation, so it
+        // doesn't compete with the initial page-load burst (see status doc).
+        QTimer::singleShot(3000, this, [this]() { processNextPendingNativeWebShow(); });
     }
 }
 
@@ -824,7 +806,7 @@ void Window::jsNativeWebShowImplNow(bool overlay, int mediaId, QString url, int 
     if (!nview) {
         nview = new QWebEngineView(this);
         nview->setContextMenuPolicy(Qt::NoContextMenu);
-        nview->setPage(new LoggingPage(nview, nativeWebpageProfile(), /*hang_watchdog_secs=*/15));
+        nview->setPage(new LoggingPage(nview, /*profile=*/nullptr, /*hang_watchdog_secs=*/15));
         // BUG fix (found from a real report: an overlay's own native
         // widget -- a `webpage render="native"`/interactive-button
         // *inside* the Overlay Layout itself -- wasn't visible, hidden

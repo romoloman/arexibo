@@ -51,30 +51,10 @@ class LoggingPage : public QWebEnginePage
 {
     Q_OBJECT
 public:
-    // `profile`, when given, is used explicitly instead of the shared
-    // QWebEngineProfile::defaultProfile() implied by the one-argument
-    // QWebEnginePage(parent) constructor -- see native_webpage_profile()
-    // in view.cpp for why a `webpage render="native"` widget's own page
-    // gets a separate profile of its own instead. `view`/`overlay_view`
-    // keep using the default profile (pass nullptr, or omit) exactly as
-    // before.
-    //
-    // `hang_watchdog_secs`, when non-zero, forcibly stops (rather than
-    // waits out) a navigation that hasn't finished within that many
-    // seconds -- found from a real report: a `webpage render="native"`
-    // widget's own external URL that accepts a TCP connection attempt
-    // but never actually replies can leave loadFinished() simply never
-    // firing at all, for as long as the underlying OS/Chromium network
-    // stack's own timeout takes (observed: multiple minutes) -- with no
-    // recovery of its own in that state (the existing loadFinished(ok=
-    // false) retry below never gets a chance to run, since loadFinished
-    // never fires while genuinely hung, as opposed to an outright
-    // failure). Forcibly triggering Stop makes Chromium finish the
-    // navigation as a failure immediately, letting that same retry
-    // logic take over from there -- capping how long any single hang
-    // can last, regardless of the exact underlying reason. Left at 0
-    // (disabled) for `view`/`overlay_view`, which only ever load from
-    // arexibo's own fast local server and shouldn't need it.
+    // `profile`: explicit profile override (unused currently; see
+    // status doc). `hang_watchdog_secs`: forces a stuck navigation to
+    // stop (and retry) after this many seconds with no progress; 0
+    // disables it (see status doc for why/where it's used).
     LoggingPage(QObject *parent = nullptr, QWebEngineProfile *profile = nullptr,
                 int hang_watchdog_secs = 0)
         : QWebEnginePage(profile ? profile : QWebEngineProfile::defaultProfile(), parent)
@@ -134,40 +114,24 @@ public:
         });
 
         if (hang_watchdog_secs > 0) {
-            // `generation` distinguishes the current armed timer from a
-            // stale one that already fired or was superseded -- bumped
-            // every time the watchdog is (re)armed, so a timer whose
-            // captured generation no longer matches the current one
-            // knows it's obsolete and does nothing when it fires.
+            // generation: distinguishes the current timer from a stale
+            // one already superseded by a newer arm.
             auto generation = std::make_shared<int>(0);
             auto arm_watchdog = std::make_shared<std::function<void()>>();
             *arm_watchdog = [this, generation, hang_watchdog_secs, arm_watchdog]() {
                 int my_generation = ++(*generation);
                 QTimer::singleShot(hang_watchdog_secs * 1000, this,
                                     [this, generation, my_generation, hang_watchdog_secs]() {
-                    if (*generation != my_generation) return;  // superseded already
+                    if (*generation != my_generation) return;
                     std::cout << "WARN : [arexibo::qt] page still loading (" \
                                << url().toString().toStdString() << ") with no progress for " \
-                               << hang_watchdog_secs << "s -- forcing it to stop (letting the " \
-                                  "existing failed-load retry take over)" << std::endl;
+                               << hang_watchdog_secs << "s -- forcing it to stop" << std::endl;
                     triggerAction(QWebEnginePage::Stop);
                 });
             };
             connect(this, &QWebEnginePage::loadStarted, this, [arm_watchdog]() { (*arm_watchdog)(); });
-            // Found from a real report: a flat "kill after N seconds no
-            // matter what" would also cut off a page that's genuinely
-            // loading, just slowly (e.g. a heavy page or a slow but
-            // working server) -- every retry would then hit the exact
-            // same cutoff again, so it could never actually finish.
-            // loadProgress fires repeatedly as real data actually
-            // arrives (confirmed distinct from a connection that never
-            // gets anywhere: that case never progresses past 0% at
-            // all, since Chromium only reports progress once bytes are
-            // genuinely flowing) -- re-arming the watchdog here means
-            // it only ever fires after hang_watchdog_secs of *no*
-            // progress at all, not from total elapsed time, so a slow
-            // but actively-loading page can take as long as it
-            // genuinely needs.
+            // Re-arm on progress too, so a slow-but-working page isn't
+            // killed -- only a genuine stall (no progress at all) is.
             connect(this, &QWebEnginePage::loadProgress, this,
                     [arm_watchdog](int) { (*arm_watchdog)(); });
         }
