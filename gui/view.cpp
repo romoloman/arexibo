@@ -9,6 +9,30 @@
 
 #include "view.h"
 
+// Lazily created, kept alive for the whole process -- a genuinely
+// separate QWebEngineProfile (its own network stack: connection pool,
+// DNS cache, cookies) from QWebEngineProfile::defaultProfile(), used
+// only for `webpage render="native"` widgets (see jsNativeWebShowImplNow).
+// Found from a real report: `view`, `overlay_view` and every native
+// widget previously all shared the one default profile -- meaning a
+// stuck/hung connection for a native widget's own external URL (e.g.
+// one that accepts a TCP SYN but never replies, tying up a shared
+// connection or DNS-resolution slot for as long as the OS's own
+// underlying TCP timeout takes, commonly on the order of minutes)
+// plausibly delayed or blocked otherwise-unrelated network activity
+// for `view` itself, including its own purely-local requests to
+// arexibo's embedded HTTP server -- even though `view` and the native
+// widget are, in Chromium's own multi-process architecture, otherwise
+// separate renderer processes. A named (not off-the-record) profile,
+// so this widget's own cache/cookies still persist normally across
+// restarts, just under a separate storage location from the default
+// profile's own.
+static QWebEngineProfile *nativeWebpageProfile()
+{
+    static QWebEngineProfile *profile = new QWebEngineProfile("native-webpage");
+    return profile;
+}
+
 Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void *cb_ptr) :
     QMainWindow(),
     base_uri(base_uri),
@@ -742,14 +766,65 @@ void Window::forwardMouseEventToView(QEvent::Type type, QPoint pos)
     QCoreApplication::postEvent(target, forwarded);
 }
 
+// Found from a real report, backed by a real timing comparison
+// between a successful and a failed run: creating several
+// QWebEngineView widgets back-to-back within a few tens of
+// milliseconds (as happens whenever a layout with several native
+// widgets first loads, doubly so with an Overlay Layout ALSO doing
+// the same at the same time) appears to occasionally overwhelm
+// Chromium's own compositor, leaving the *entire* main layout
+// unrendered (a plain background-colour screen) for that whole
+// session -- the failed run's own native widgets were created
+// measurably more tightly clustered together (as little as 3ms
+// between the last two) than the successful run's (54ms). Spreading
+// genuinely *new* widget creation out over time (existing widgets
+// simply being updated -- a new URL/geometry for an already-created
+// one -- are NOT staggered at all, since no new QWebEngineView is
+// being created for those) trades a small, likely imperceptible delay
+// (native widgets appearing one after another rather than all at
+// once) for -- hopefully -- materially more reliable rendering.
 void Window::jsNativeWebShowImpl(bool overlay, int mediaId, QString url, int x, int y, int w, int h)
+{
+    auto &views = overlay ? overlay_native_views : native_views;
+    bool already_exists = views.contains(mediaId);
+    std::cout << "DEBUG: [arexibo::qt] jsNativeWebShowImpl mediaId=" << mediaId \
+               << " overlay=" << overlay << " already_exists=" << already_exists \
+               << " queue_size=" << pending_native_web_shows.size() \
+               << " stagger_active=" << native_web_show_stagger_active << std::endl;
+    if (already_exists) {
+        // Already exists -- no new QWebEngineView is being created, so
+        // there's nothing to stagger; apply the update immediately.
+        jsNativeWebShowImplNow(overlay, mediaId, url, x, y, w, h);
+        return;
+    }
+    pending_native_web_shows.append({overlay, mediaId, url, x, y, w, h});
+    if (!native_web_show_stagger_active) {
+        native_web_show_stagger_active = true;
+        processNextPendingNativeWebShow();
+    }
+}
+
+void Window::processNextPendingNativeWebShow()
+{
+    if (pending_native_web_shows.isEmpty()) {
+        native_web_show_stagger_active = false;
+        return;
+    }
+    auto item = pending_native_web_shows.takeFirst();
+    std::cout << "DEBUG: [arexibo::qt] creating staggered native widget " << item.mediaId \
+               << " (" << pending_native_web_shows.size() << " more queued)" << std::endl;
+    jsNativeWebShowImplNow(item.overlay, item.mediaId, item.url, item.x, item.y, item.w, item.h);
+    QTimer::singleShot(20, this, [this]() { processNextPendingNativeWebShow(); });
+}
+
+void Window::jsNativeWebShowImplNow(bool overlay, int mediaId, QString url, int x, int y, int w, int h)
 {
     auto &views = overlay ? overlay_native_views : native_views;
     QWebEngineView *nview = views.value(mediaId, nullptr);
     if (!nview) {
         nview = new QWebEngineView(this);
         nview->setContextMenuPolicy(Qt::NoContextMenu);
-        nview->setPage(new LoggingPage(nview));
+        nview->setPage(new LoggingPage(nview, nativeWebpageProfile(), /*hang_watchdog_secs=*/15));
         // BUG fix (found from a real report: an overlay's own native
         // widget -- a `webpage render="native"`/interactive-button
         // *inside* the Overlay Layout itself -- wasn't visible, hidden

@@ -1025,8 +1025,29 @@ impl Handler {
                         // failure here doesn't block the resource
                         // reload below, which must proceed regardless.
                         if self.cache.is_tracked_data_widget(widget_id) {
-                            if let Err(e) = self.cache.refresh_data_widget(
-                                widget_id, &mut self.xmds, std::time::Instant::now()) {
+                            let started = std::time::Instant::now();
+                            let result = self.cache.refresh_data_widget(
+                                widget_id, &mut self.xmds, std::time::Instant::now());
+                            // Diagnostic only, for a real report of the
+                            // whole mainloop freezing for extended
+                            // periods (minutes) with nothing else in it
+                            // able to run meanwhile -- every network
+                            // call here runs synchronously on this same
+                            // single thread (see make_agent's own doc
+                            // comment on timeout_global), so a slow
+                            // widget resource (suspected: one that
+                            // itself depends on a slow/unresponsive
+                            // external site) could plausibly explain it
+                            // even while eventually succeeding (thus
+                            // never hitting the Err branch below, which
+                            // was the only thing previously logged) --
+                            // logs elapsed time regardless of outcome so
+                            // a slow call is visible even when it
+                            // doesn't fail outright.
+                            let elapsed = started.elapsed();
+                            log::debug!("refresh_data_widget for widget {widget_id} took \
+                                        {elapsed:?}");
+                            if let Err(e) = result {
                                 log::warn!("refreshing data widget {widget_id} \
                                             after dataUpdate: {e:#}");
                             }
@@ -1038,7 +1059,13 @@ impl Handler {
                         // the same content again if the CMS has since
                         // bumped it; that's a harmless redundant fetch,
                         // not a correctness issue.
-                        match self.cache.refresh_resource(widget_id, &mut self.xmds) {
+                        let started = std::time::Instant::now();
+                        let result = self.cache.refresh_resource(widget_id, &mut self.xmds);
+                        // Diagnostic only -- see the same-purpose log
+                        // just above for refresh_data_widget.
+                        let elapsed = started.elapsed();
+                        log::debug!("refresh_resource for widget {widget_id} took {elapsed:?}");
+                        match result {
                             // Reload the *returned* id, not widget_id --
                             // they differ for a widget nested inside
                             // another resource's combined HTML, where
@@ -2476,7 +2503,12 @@ impl Handler {
                 crate::resource::ReqFile::Resource { id, .. } => Some(*id),
                 _ => None,
             };
-            match self.cache.download(file.clone(), &mut self.xmds) {
+            let started = std::time::Instant::now();
+            let result = self.cache.download(file.clone(), &mut self.xmds);
+            // Diagnostic only -- see the DataUpdate handler's own
+            // same-purpose log for the full story.
+            log::debug!("retry download for {desc} took {:?}", started.elapsed());
+            match result {
                 Ok(()) => {
                     log::info!("retry succeeded for {desc}");
                     if let Some(widget_id) = widget_id {
@@ -2502,7 +2534,13 @@ impl Handler {
         // exactly as the original DataUpdate handler did).
         let dataupdate_queue = std::mem::take(&mut self.dataupdate_retry_queue);
         for (widget_id, attempts) in dataupdate_queue {
-            match self.cache.refresh_resource(widget_id, &mut self.xmds) {
+            let started = std::time::Instant::now();
+            let result = self.cache.refresh_resource(widget_id, &mut self.xmds);
+            // Diagnostic only -- see the DataUpdate handler's own
+            // same-purpose log for the full story.
+            log::debug!("retry refresh_resource for widget {widget_id} took {:?}",
+                        started.elapsed());
+            match result {
                 Ok(fetch_id) => {
                     log::info!("retry succeeded for dataUpdate widget {widget_id}");
                     self.to_gui.send(ToGui::ReloadWidget(fetch_id)).unwrap();

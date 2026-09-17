@@ -1,6 +1,8 @@
 #ifndef AREXIBO_VIEW_H
 #define AREXIBO_VIEW_H
 
+#include <functional>
+#include <memory>
 #include <QMainWindow>
 #include <QScreen>
 #include <QMap>
@@ -9,6 +11,7 @@
 #include <QEvent>
 #include <QtWebEngineWidgets/QWebEngineView>
 #include <QtWebEngineCore/QWebEnginePage>
+#include <QtWebEngineCore/QWebEngineProfile>
 #include <QtWebEngineCore/QWebEngineScript>
 #include <QtWebEngineCore/QWebEngineScriptCollection>
 #include <QtWebChannel/QWebChannel>
@@ -48,7 +51,33 @@ class LoggingPage : public QWebEnginePage
 {
     Q_OBJECT
 public:
-    LoggingPage(QObject *parent = nullptr) : QWebEnginePage(parent)
+    // `profile`, when given, is used explicitly instead of the shared
+    // QWebEngineProfile::defaultProfile() implied by the one-argument
+    // QWebEnginePage(parent) constructor -- see native_webpage_profile()
+    // in view.cpp for why a `webpage render="native"` widget's own page
+    // gets a separate profile of its own instead. `view`/`overlay_view`
+    // keep using the default profile (pass nullptr, or omit) exactly as
+    // before.
+    //
+    // `hang_watchdog_secs`, when non-zero, forcibly stops (rather than
+    // waits out) a navigation that hasn't finished within that many
+    // seconds -- found from a real report: a `webpage render="native"`
+    // widget's own external URL that accepts a TCP connection attempt
+    // but never actually replies can leave loadFinished() simply never
+    // firing at all, for as long as the underlying OS/Chromium network
+    // stack's own timeout takes (observed: multiple minutes) -- with no
+    // recovery of its own in that state (the existing loadFinished(ok=
+    // false) retry below never gets a chance to run, since loadFinished
+    // never fires while genuinely hung, as opposed to an outright
+    // failure). Forcibly triggering Stop makes Chromium finish the
+    // navigation as a failure immediately, letting that same retry
+    // logic take over from there -- capping how long any single hang
+    // can last, regardless of the exact underlying reason. Left at 0
+    // (disabled) for `view`/`overlay_view`, which only ever load from
+    // arexibo's own fast local server and shouldn't need it.
+    LoggingPage(QObject *parent = nullptr, QWebEngineProfile *profile = nullptr,
+                int hang_watchdog_secs = 0)
+        : QWebEnginePage(profile ? profile : QWebEngineProfile::defaultProfile(), parent)
     {
         // BUG fix (found from a real report: a touch controller
         // intermittently reporting more simultaneous touch points than
@@ -103,6 +132,45 @@ public:
                 triggerAction(QWebEnginePage::Reload);
             });
         });
+
+        if (hang_watchdog_secs > 0) {
+            // `generation` distinguishes the current armed timer from a
+            // stale one that already fired or was superseded -- bumped
+            // every time the watchdog is (re)armed, so a timer whose
+            // captured generation no longer matches the current one
+            // knows it's obsolete and does nothing when it fires.
+            auto generation = std::make_shared<int>(0);
+            auto arm_watchdog = std::make_shared<std::function<void()>>();
+            *arm_watchdog = [this, generation, hang_watchdog_secs, arm_watchdog]() {
+                int my_generation = ++(*generation);
+                QTimer::singleShot(hang_watchdog_secs * 1000, this,
+                                    [this, generation, my_generation, hang_watchdog_secs]() {
+                    if (*generation != my_generation) return;  // superseded already
+                    std::cout << "WARN : [arexibo::qt] page still loading (" \
+                               << url().toString().toStdString() << ") with no progress for " \
+                               << hang_watchdog_secs << "s -- forcing it to stop (letting the " \
+                                  "existing failed-load retry take over)" << std::endl;
+                    triggerAction(QWebEnginePage::Stop);
+                });
+            };
+            connect(this, &QWebEnginePage::loadStarted, this, [arm_watchdog]() { (*arm_watchdog)(); });
+            // Found from a real report: a flat "kill after N seconds no
+            // matter what" would also cut off a page that's genuinely
+            // loading, just slowly (e.g. a heavy page or a slow but
+            // working server) -- every retry would then hit the exact
+            // same cutoff again, so it could never actually finish.
+            // loadProgress fires repeatedly as real data actually
+            // arrives (confirmed distinct from a connection that never
+            // gets anywhere: that case never progresses past 0% at
+            // all, since Chromium only reports progress once bytes are
+            // genuinely flowing) -- re-arming the watchdog here means
+            // it only ever fires after hang_watchdog_secs of *no*
+            // progress at all, not from total elapsed time, so a slow
+            // but actively-loading page can take as long as it
+            // genuinely needs.
+            connect(this, &QWebEnginePage::loadProgress, this,
+                    [arm_watchdog](int) { (*arm_watchdog)(); });
+        }
     }
 
 protected:
@@ -164,6 +232,23 @@ private:
     // parallel ones caused real, observed redundant re-application of
     // the same geometry.
     bool overlay_scale_retry_pending = false;
+
+    // One genuinely *new* native widget waiting to be created -- see
+    // jsNativeWebShowImpl's own doc comment for why this is queued
+    // instead of created immediately. Plain data, not a std::function,
+    // so the queue itself stays simple to inspect/reason about.
+    struct PendingNativeWebShow {
+        bool overlay;
+        int mediaId;
+        QString url;
+        int x, y, w, h;
+    };
+    QVector<PendingNativeWebShow> pending_native_web_shows;
+    // Whether processNextPendingNativeWebShow's own 20ms-spaced chain
+    // is currently running -- guards against starting a second,
+    // parallel chain if jsNativeWebShowImpl is called again while one
+    // is already in progress.
+    bool native_web_show_stagger_active = false;
     // Whether adjustOverlayScale has already successfully applied
     // geometry once since the overlay was last (re)shown or the base
     // layout last changed -- lets a still-pending, now-redundant retry
@@ -255,6 +340,12 @@ public:
     // which is itself bound to a specific view via its own `is_overlay`
     // flag and passes it straight through.
     void jsNativeWebShowImpl(bool overlay, int, QString, int, int, int, int);
+    // The actual, previously-inline body of jsNativeWebShowImpl -- see
+    // its own doc comment for why creating a genuinely *new* native
+    // widget is now staggered through pending_native_web_shows instead
+    // of calling this directly every time.
+    void jsNativeWebShowImplNow(bool overlay, int, QString, int, int, int, int);
+    void processNextPendingNativeWebShow();
     void jsNativeWebHideImpl(bool overlay, int);
     // Destroys any native_views left over from the *previous* layout --
     // called before navigating to a new one, since those widgets don't
