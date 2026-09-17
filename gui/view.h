@@ -156,6 +156,35 @@ private:
     QWebChannel *overlay_channel = nullptr;
     int overlay_layout_width = 1920;
     int overlay_layout_height = 1080;
+    // Bounds adjustOverlayScale's own retry when `view` isn't sized
+    // yet -- see its own doc comment for the full story.
+    int overlay_scale_retry_count = 0;
+    // At most one retry timer in flight at a time -- see
+    // adjustOverlayScale's own doc comment on this for why multiple
+    // parallel ones caused real, observed redundant re-application of
+    // the same geometry.
+    bool overlay_scale_retry_pending = false;
+    // Whether adjustOverlayScale has already successfully applied
+    // geometry once since the overlay was last (re)shown or the base
+    // layout last changed -- lets a still-pending, now-redundant retry
+    // skip itself instead of unnecessarily calling
+    // setGeometry()/setZoomFactor() on overlay_view again for no
+    // reason (found from a real report: even on a run where scaling
+    // ultimately succeeded, a stale retry firing afterward still
+    // reapplied the same geometry a second time, one more
+    // GPU-compositor-affecting call in an already busy window).
+    bool overlay_scale_applied_this_cycle = false;
+    // Whether the *current* base layout has had its own real
+    // jsLayoutInit-reported dimensions applied to `view` yet (see
+    // adjustOverlayScale's own doc comment for why this, not just
+    // checking view's area is non-zero, is what's actually needed --
+    // a real report showed `view` non-zero but still sized from an
+    // earlier generic/default resize, not this layout's own real
+    // size, at the exact moment this was checked). Reset to false in
+    // navigateToImpl (a new layout is about to load, so `view`'s
+    // current sizing is now stale for it), set true at the end of
+    // jsLayoutInit's own non-overlay branch.
+    bool base_layout_scaled = false;
     // Own set of native_views for `webpage render="native"` widgets that
     // happen to be inside the overlay layout itself -- kept separate
     // from the main view's `native_views` so overlayHideImpl() tears down
@@ -187,6 +216,17 @@ private:
     // overlay_view instance's own focusProxy -- see its own
     // installation point in overlayShowImpl for why this guard exists.
     bool overlay_filter_installed = false;
+    // Debounces the "re-raise the overlay after a main-layout native
+    // widget shows/refreshes" remedy (see jsNativeWebShowImpl) --
+    // found from a real report: firing it unconditionally on every
+    // single native widget shown, during the initial burst where a
+    // layout's own several native widgets are all created back-to-back
+    // (at the same time an Overlay Layout's own several native widgets
+    // are ALSO being created), produced dozens of raise() calls within
+    // a few hundred milliseconds and broke rendering of most of the
+    // main layout. Coalesces that whole burst into a single deferred
+    // re-raise instead.
+    bool overlay_reraise_scheduled = false;
     void forwardMouseEventToView(QEvent::Type type, QPoint pos);
 
     void ensureOverlayView();

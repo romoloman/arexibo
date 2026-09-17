@@ -22,6 +22,32 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
     setWindowIcon(QIcon(":/assets/logo.png"));
     setStyleSheet("background-color: black;");
 
+    // Diagnostic only, for the ongoing Overlay Layout focus
+    // investigation -- logs every focus transition in the whole
+    // application, identifying which of view/overlay_view/native
+    // widget it belongs to. `this->` members accessed inside the
+    // lambda are read at call time (when the signal actually fires),
+    // not at connection time, so it's safe that view/overlay_view
+    // don't exist yet on this exact line.
+    connect(qApp, &QApplication::focusChanged, this, [this](QWidget *old, QWidget *now) {
+        auto owner = [this](QWidget *w) -> const char* {
+            for (QWidget *p = w; p; p = p->parentWidget()) {
+                if (p == view) return "view (main layout)";
+                if (p == overlay_view) return "overlay_view";
+                for (auto nview : native_views) if (p == nview) return "a native_views widget";
+                for (auto nview : overlay_native_views) if (p == nview) return "an overlay_native_views widget";
+            }
+            return "unknown";
+        };
+        std::cout << "DEBUG: [arexibo::qt] focus changed: " \
+                   << (old ? old->metaObject()->className() : "(null)") \
+                   << " [" << (old ? owner(old) : "n/a") << "]" \
+                   << " -> " \
+                   << (now ? now->metaObject()->className() : "(null)") \
+                   << " [" << (now ? owner(now) : "n/a") << "]" \
+                   << std::endl;
+    });
+
     view = new QWebEngineView(this);
     // Kiosk display: suppress the default context menu entirely --
     // QWebEngineView derives from QWidget and checks this policy inside
@@ -68,6 +94,16 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
 
 void Window::navigateToImpl(QString file) {
     clearNativeViews(false);
+    // A new layout is about to load into `view` -- its own real
+    // dimensions won't be known/applied again until its own
+    // jsLayoutInit fires (see adjustOverlayScale's own doc comment on
+    // base_layout_scaled for why this matters).
+    base_layout_scaled = false;
+    // `view`'s own geometry is about to change (or at least might) --
+    // any previously-applied overlay scaling needs redoing against
+    // whatever it ends up being for the new layout.
+    overlay_scale_applied_this_cycle = false;
+    overlay_scale_retry_pending = false;
     view->setUrl(QUrl(base_uri + file));
 }
 
@@ -237,12 +273,95 @@ void Window::adjustOverlayScale(int layout_w, int layout_h)
     int area_w = view->width();
     int area_h = view->height();
 
-    if (area_w == 0 || area_h == 0 || layout_h == 0 || layout_w == 0)
+    std::cout << "DEBUG: [arexibo::qt] adjustOverlayScale(" << layout_w << "x" << layout_h \
+               << "), view area is (" << area_w << "x" << area_h << "), base_layout_scaled=" \
+               << (base_layout_scaled ? "true" : "false") << ", retry_count=" \
+               << overlay_scale_retry_count << std::endl;
+
+    // Found from a real report: with every file already cached (so
+    // every page loads near-instantly), this can genuinely be called
+    // -- both from overlayShowImpl (with the last-known/default
+    // dimensions, right as the overlay's own page starts loading) and
+    // later from jsLayoutInit's own overlay branch (with the real
+    // ones, once that page reports it) -- before `view` itself
+    // (the *main* layout) has applied its own *current* layout's real
+    // dimensions yet. Checking area_w/area_h alone isn't enough on its
+    // own -- a real report showed `view` genuinely non-zero at the
+    // exact moment this ran, but still sized from an earlier generic/
+    // default resize event (before any real layout had reported its
+    // own size at all), not this specific layout's own real
+    // dimensions -- `base_layout_scaled` (see its own doc comment in
+    // view.h) tracks that distinction directly instead. Previously
+    // this returned silently when unready and nothing ever retried
+    // it, leaving the overlay sized wrong (or not at all) for its
+    // entire lifetime -- with `--clear` (real downloads, always some
+    // delay), the base layout's own real sizing was in practice
+    // already applied by the time this ran, so the race went
+    // unnoticed. Retries shortly afterward instead, bounded so a
+    // genuinely pathological case (no main layout at all) can't retry
+    // forever.
+    if (area_w == 0 || area_h == 0 || !base_layout_scaled) {
+        // At most one retry timer in flight at a time -- found from a
+        // real report: every single failed call (whether from this
+        // retry lambda itself, or from a *different* call site like
+        // jsLayoutInit's own overlay branch, which calls this directly
+        // with no guard of its own at all) used to schedule its own
+        // brand new timer, regardless of whether one was already
+        // pending from an earlier failed call. With several callers
+        // failing in quick succession (a real, confirmed sequence:
+        // overlayShowImpl's own initial call, several of this
+        // function's own retries, and jsLayoutInit's own direct call,
+        // all within the same ~200ms base-layout-loading window),
+        // multiple independent timers ended up in flight
+        // simultaneously -- and since nothing stopped them once one
+        // eventually succeeded, the other, still-pending ones fired
+        // afterward too, redundantly reapplying the exact same
+        // geometry a second (or third) time regardless of the
+        // overlay_scale_applied_this_cycle guard, since none of THEM
+        // needed a fresh schedule at all, just a chance to fire once.
+        if (!overlay_scale_retry_pending && overlay_scale_retry_count < 20) {
+            overlay_scale_retry_count++;
+            overlay_scale_retry_pending = true;
+            std::cout << "DEBUG: [arexibo::qt] adjustOverlayScale: base layout not (yet) " \
+                         "sized for real, scheduling retry " << overlay_scale_retry_count \
+                      << "/20" << std::endl;
+            // Deliberately reads overlay_layout_width/height fresh
+            // inside the lambda body at *fire* time, NOT captured by
+            // value here at schedule time -- found from a real report:
+            // capturing by value meant that if the overlay's own real
+            // dimensions arrived (via jsLayoutInit) *after* this retry
+            // was scheduled but *before* it fired, the retry still
+            // fired with the original, stale target dimensions this
+            // call started with (e.g. still the generic 1920x1080
+            // default from before the overlay's own page had reported
+            // anything), briefly applying a wrong, letterboxed
+            // geometry moments before the real call corrected it again
+            // -- two full setGeometry()/setZoomFactor() calls on
+            // overlay_view within a few milliseconds where one, with
+            // the right values from the start, would do.
+            QTimer::singleShot(50, this, [this]() {
+                overlay_scale_retry_pending = false;
+                if (overlay_view && !overlay_scale_applied_this_cycle) {
+                    adjustOverlayScale(overlay_layout_width, overlay_layout_height);
+                }
+            });
+        } else if (overlay_scale_retry_count >= 20) {
+            std::cout << "WARN : [arexibo::qt] adjustOverlayScale: giving up after 20 " \
+                         "retries, base layout still not sized for real" << std::endl;
+        }
+        return;
+    }
+    overlay_scale_retry_count = 0;
+
+    if (layout_h == 0 || layout_w == 0)
         return;
 
     if (area_w == layout_w && area_h == layout_h) {
+        std::cout << "DEBUG: [arexibo::qt] adjustOverlayScale: exact match, no scaling needed" \
+                   << std::endl;
         overlay_view->setGeometry(view->x(), view->y(), layout_w, layout_h);
         overlay_view->setZoomFactor(1.0);
+        overlay_scale_applied_this_cycle = true;
         return;
     }
 
@@ -263,8 +382,12 @@ void Window::adjustOverlayScale(int layout_w, int layout_h)
         ov_x = view->x();
         ov_y = view->y() + (area_h - ov_h) / 2;
     }
+    std::cout << "DEBUG: [arexibo::qt] adjustOverlayScale: applying geometry (" << ov_x << "," \
+               << ov_y << " " << ov_w << "x" << ov_h << ") with zoom " << scale_factor \
+               << std::endl;
     overlay_view->setGeometry(ov_x, ov_y, ov_w, ov_h);
     overlay_view->setZoomFactor(scale_factor);
+    overlay_scale_applied_this_cycle = true;
 }
 
 void Window::runJavascriptImpl(QString js)
@@ -367,6 +490,11 @@ void Window::overlayShowImpl(QString file)
     ensureOverlayView();
     clearNativeViews(/*overlay=*/true);
     overlay_view->setUrl(QUrl(base_uri + file));
+    // A fresh overlay show cycle -- any earlier successful scaling no
+    // longer applies (see overlay_scale_applied_this_cycle's own doc
+    // comment in view.h).
+    overlay_scale_applied_this_cycle = false;
+    overlay_scale_retry_pending = false;
     adjustOverlayScale(overlay_layout_width, overlay_layout_height);
     overlay_view->show();
     overlay_view->raise();
@@ -412,10 +540,52 @@ void Window::overlayHideImpl()
     overlay_channel = nullptr;
     overlay_region_rects.clear();
     overlay_filter_installed = false;
+    overlay_reraise_scheduled = false;
+    overlay_scale_retry_count = 0;
 }
 
 bool Window::eventFilter(QObject *watched, QEvent *event)
 {
+    // "Focus follows touch" for every native widget (both the main
+    // layout's own native_views and the overlay's own
+    // overlay_native_views) -- see jsNativeWebShowImpl's own doc
+    // comment on installEventFilter for the full story. Deliberately
+    // observes only -- calls setFocus() as a side effect and always
+    // falls through to normal handling afterward (never returns true
+    // here), so gesture recognition (drag, pinch, double-tap-to-zoom)
+    // proceeds exactly as it would without this filter; setFocus()
+    // itself doesn't consume or alter the event in any way.
+    if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::TouchBegin) {
+        // Diagnostic only, for the ongoing investigation into why a
+        // real report contradicts the assumption that
+        // WA_AlwaysStackOnTop also guarantees which widget *receives*
+        // a touch, not just which one paints on top -- identifies
+        // exactly which widget `watched` corresponds to, since a
+        // wrong answer here means the touch itself is reaching the
+        // wrong widget at the OS/compositor level, which no amount of
+        // setFocus() afterward could fix.
+        const char *which = "UNKNOWN (none of view/overlay_view/any native view)";
+        if (view && watched == view->focusProxy()) which = "view (main layout)";
+        else if (overlay_view && watched == overlay_view->focusProxy()) which = "overlay_view";
+        else {
+            for (auto nview : native_views) {
+                if (watched == nview->focusProxy()) { which = "a native_views widget"; break; }
+            }
+            for (auto nview : overlay_native_views) {
+                if (watched == nview->focusProxy()) { which = "an overlay_native_views widget"; break; }
+            }
+        }
+        std::cout << "DEBUG: [arexibo::qt] press/touch actually delivered to: " << which \
+                  << std::endl;
+
+        for (auto nview : native_views) {
+            if (watched == nview->focusProxy()) { nview->setFocus(); break; }
+        }
+        for (auto nview : overlay_native_views) {
+            if (watched == nview->focusProxy()) { nview->setFocus(); break; }
+        }
+    }
+
     // Touch/click passthrough for an active Overlay Layout -- see
     // overlay_region_rects's own doc comment in view.h for the full
     // story, and its own installation point in ensureOverlayView().
@@ -476,9 +646,12 @@ bool Window::eventFilter(QObject *watched, QEvent *event)
 
     for (const QRect &r : overlay_region_rects) {
         if (r.contains(pos)) {
-            // Real overlay content at this exact point -- let Chromium
-            // handle it completely normally, as if this filter didn't
-            // exist at all.
+            // Real overlay content at this exact point -- give the
+            // overlay's own main view focus (same "focus follows
+            // touch" reasoning as above, just for overlay_view itself
+            // rather than one of its native widgets), then let
+            // Chromium handle the event completely normally.
+            overlay_view->setFocus();
             std::cout << "DEBUG: [arexibo::qt] -> inside known overlay content rect (" \
                        << r.x() << "," << r.y() << " " << r.width() << "x" << r.height() \
                        << "), letting Chromium handle it normally" << std::endl;
@@ -512,15 +685,27 @@ bool Window::eventFilter(QObject *watched, QEvent *event)
 // (press/move/release) so they all agree on the same button/modifier
 // state a real gesture would have throughout.
 //
-// Posted to `view->focusProxy()`, NOT `view` itself -- confirmed from
-// the real Qt6 header (qwebengineview.h): QWebEngineView overrides only
-// the generic `event(QEvent*)`, never mousePressEvent/mouseMoveEvent/
-// mouseReleaseEvent specifically, delegating real mouse handling
-// entirely to its own internal focusProxy() child widget instead (the
-// exact same QTBUG-43602 mechanism already confirmed for *installing*
-// the event filter on the overlay's own side -- missed here at first,
-// applied inconsistently, until a real report showed the forwarded
-// click simply never registering on `view`'s own page at all).
+// Posted to whichever *actual* widget occupies this exact point --
+// NOT unconditionally `view` itself. Found from a real report: a
+// point outside every known overlay content rect was being forwarded
+// straight to `view->focusProxy()`, even when that exact spot is
+// really occupied by one of the main layout's own *native* widgets
+// (`webpage render="native"`, e.g. an embedded page) -- a separate
+// sibling QWebEngineView in `native_views`, not part of `view`'s own
+// content at all, so the forwarded event never reached it. Checks
+// each native_views widget's own (window-relative) geometry first;
+// falls back to `view` only if none of them contains this point.
+//
+// Posted to that widget's own focusProxy(), NOT the widget itself --
+// confirmed from the real Qt6 header (qwebengineview.h):
+// QWebEngineView overrides only the generic `event(QEvent*)`, never
+// mousePressEvent/mouseMoveEvent/mouseReleaseEvent specifically,
+// delegating real mouse handling entirely to its own internal
+// focusProxy() child widget instead (the exact same QTBUG-43602
+// mechanism already confirmed for *installing* the event filter on
+// the overlay's own side -- missed here at first, applied
+// inconsistently, until a real report showed the forwarded click
+// simply never registering on `view`'s own page at all).
 void Window::forwardMouseEventToView(QEvent::Type type, QPoint pos)
 {
     if (!view) {
@@ -528,13 +713,31 @@ void Window::forwardMouseEventToView(QEvent::Type type, QPoint pos)
                   << std::endl;
         return;
     }
-    QWidget *target = view->focusProxy();
-    if (!target) target = view;
+    // `pos` arrives in the same local coordinate space as
+    // overlay_view/view themselves (see eventFilter's own doc
+    // comment on why no translation is needed there) -- converted to
+    // a window-relative point here, since native_views' own geometry
+    // (set in jsNativeWebShowImpl, `base->x() + ...`) is
+    // window-relative too.
+    QPoint windowPos = view->pos() + pos;
+
+    QWebEngineView *target_view = view;
+    for (auto nview : native_views) {
+        if (nview->geometry().contains(windowPos)) {
+            target_view = nview;
+            break;
+        }
+    }
+
+    QWidget *target = target_view->focusProxy();
+    if (!target) target = target_view;
+    QPoint localPos = windowPos - target_view->pos();
     std::cout << "DEBUG: [arexibo::qt] forwarding event type " << type << " at (" \
-               << pos.x() << "," << pos.y() << ") to " \
-               << (target == view ? "view (focusProxy was null)" : "view->focusProxy()") \
+               << localPos.x() << "," << localPos.y() << ") to " \
+               << (target_view == view ? "view" : "a native_views widget") \
+               << (target == target_view ? " (focusProxy was null)" : "->focusProxy()") \
                << std::endl;
-    auto *forwarded = new QMouseEvent(type, QPointF(pos), target->mapToGlobal(pos),
+    auto *forwarded = new QMouseEvent(type, QPointF(localPos), target->mapToGlobal(localPos),
                                        Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
     QCoreApplication::postEvent(target, forwarded);
 }
@@ -568,10 +771,17 @@ void Window::jsNativeWebShowImpl(bool overlay, int mediaId, QString url, int x, 
         // page has already loaded and started running its own widgets,
         // by which point `overlay_view->raise()` has already happened
         // (see overlayShowImpl), this widget's own `raise()` below
-        // correctly ends up on top. Not needed for `native_views` (the
-        // main layout's own native widgets): `view` itself has no
-        // AlwaysStackOnTop attribute, so ordinary raise()-order already
-        // puts them above it with no special handling.
+        // correctly ends up on top. WA_AlwaysStackOnTop is NOT set for
+        // `native_views` (the main layout's own native widgets) --
+        // this was originally reasoned to be unnecessary ("ordinary
+        // raise()-order already puts them above it with no special
+        // handling"), but a real report and its own diagnostic
+        // logging directly contradicted that: WA_AlwaysStackOnTop
+        // evidently does not reliably guarantee which widget actually
+        // *receives* touch/click input over another, at least not
+        // consistently on its own. See this function's own explicit
+        // re-raise of the overlay after a main-layout native widget's
+        // own raise() below, added because of exactly this.
         if (overlay) {
             nview->setAttribute(Qt::WA_AlwaysStackOnTop);
         }
@@ -598,6 +808,65 @@ void Window::jsNativeWebShowImpl(bool overlay, int mediaId, QString url, int x, 
     }
     nview->show();
     nview->raise();
+    // Found from a real report, confirmed directly via diagnostic
+    // logging that a touch on the overlay's own area was genuinely
+    // delivered to this *main-layout* native widget instead: contrary
+    // to this function's own earlier assumption above ("ordinary
+    // raise()-order already puts them above it with no special
+    // handling" for the overlay), Qt::WA_AlwaysStackOnTop evidently
+    // does not reliably guarantee which widget actually *receives*
+    // touch/click input, at least not on its own -- only, at best,
+    // paint order. A main-layout native widget being shown or
+    // refreshed (e.g. a periodically-updating dataset widget) calls
+    // raise() on itself here, which can apparently still let it
+    // receive input over the overlay's own content in the same
+    // screen area. Explicitly re-raising the overlay (and its own
+    // native widgets) again right afterward, whenever one is
+    // currently active, restores it -- the same remedy
+    // navigateToImpl already applies after a full layout switch,
+    // extended here to cover this other, previously-missed path.
+    //
+    // Debounced (see overlay_reraise_scheduled's own doc comment in
+    // view.h) -- found from a real report: doing this unconditionally
+    // on every single call broke rendering of most of the main layout
+    // during its own initial load, when several of its own native
+    // widgets are created back-to-back (at the same time an Overlay
+    // Layout's own several native widgets are ALSO being created),
+    // producing dozens of raise() calls within a few hundred
+    // milliseconds. A single deferred re-raise, 150ms after the last
+    // of a whole burst of calls, still restores the overlay's own
+    // stacking (the periodically-refreshing-widget case this was
+    // written for is far slower than 150ms between occurrences, so it
+    // still gets its own individual re-raise each time) without
+    // disrupting the initial simultaneous-creation window.
+    if (!overlay && overlay_view && !overlay_reraise_scheduled) {
+        overlay_reraise_scheduled = true;
+        QTimer::singleShot(150, this, [this]() {
+            overlay_reraise_scheduled = false;
+            if (overlay_view) {
+                overlay_view->raise();
+                for (auto onview : overlay_native_views) {
+                    onview->raise();
+                }
+            }
+        });
+    }
+    // "Focus follows touch" -- see eventFilter's own doc comment for
+    // the full story (a real report: several native widgets created
+    // back-to-back in one Overlay Layout left whichever one was shown
+    // *last* holding focus indefinitely, with a genuine subsequent
+    // touch on a different one, e.g. a map, never registering at
+    // all). Installed after show() rather than right after
+    // construction -- focusProxy() has been confirmed genuinely null
+    // that early elsewhere in this file (ensureOverlayView). Qt
+    // tolerates installing the same filter on the same object more
+    // than once (this runs on every call, not just first creation --
+    // e.g. a dataset widget refreshing periodically calls this again
+    // with the same nview) -- harmless here, since the filter's own
+    // handling (setFocus(), never consuming) is naturally idempotent.
+    if (auto *proxy = nview->focusProxy()) {
+        proxy->installEventFilter(this);
+    }
 }
 
 void Window::jsNativeWebHideImpl(bool overlay, int mediaId)
@@ -656,6 +925,14 @@ void JSInterface::jsLayoutInit(int id, int width, int height, QString region_geo
     }
     std::cout << "INFO : [arexibo::qt] layout " << id << " initialized" << std::endl;
     wnd->adjustScale(width, height);
+    // `view` now genuinely reflects this layout's own real dimensions
+    // -- see adjustOverlayScale's own doc comment on base_layout_scaled
+    // for why this distinct signal is needed (view's own area being
+    // merely non-zero isn't enough on its own: a real report showed it
+    // non-zero but still sized from an earlier generic/default resize
+    // event, not this specific layout's own real size, at the exact
+    // moment an overlay's own scaling read it).
+    wnd->base_layout_scaled = true;
     wnd->cb(wnd->cb_ptr, CB_LAYOUT_INIT, id, width, height);
 }
 
