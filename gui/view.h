@@ -115,25 +115,36 @@ public:
 
         if (hang_watchdog_secs > 0) {
             // generation: distinguishes the current timer from a stale
-            // one already superseded by a newer arm.
+            // one already superseded by a newer arm. last_progress:
+            // skip forcing a stop if we're already mostly loaded (a
+            // slow trailing subresource, not a genuine stall).
             auto generation = std::make_shared<int>(0);
+            auto last_progress = std::make_shared<int>(0);
             auto arm_watchdog = std::make_shared<std::function<void()>>();
-            *arm_watchdog = [this, generation, hang_watchdog_secs, arm_watchdog]() {
+            *arm_watchdog = [this, generation, last_progress, hang_watchdog_secs, arm_watchdog]() {
                 int my_generation = ++(*generation);
                 QTimer::singleShot(hang_watchdog_secs * 1000, this,
-                                    [this, generation, my_generation, hang_watchdog_secs]() {
+                                    [this, generation, my_generation, last_progress,
+                                     hang_watchdog_secs]() {
                     if (*generation != my_generation) return;
+                    if (*last_progress >= 80) return;
                     std::cout << "WARN : [arexibo::qt] page still loading (" \
                                << url().toString().toStdString() << ") with no progress for " \
                                << hang_watchdog_secs << "s -- forcing it to stop" << std::endl;
                     triggerAction(QWebEnginePage::Stop);
                 });
             };
-            connect(this, &QWebEnginePage::loadStarted, this, [arm_watchdog]() { (*arm_watchdog)(); });
+            connect(this, &QWebEnginePage::loadStarted, this, [arm_watchdog, last_progress]() {
+                *last_progress = 0;
+                (*arm_watchdog)();
+            });
             // Re-arm on progress too, so a slow-but-working page isn't
             // killed -- only a genuine stall (no progress at all) is.
             connect(this, &QWebEnginePage::loadProgress, this,
-                    [arm_watchdog](int) { (*arm_watchdog)(); });
+                    [arm_watchdog, last_progress](int progress) {
+                *last_progress = progress;
+                (*arm_watchdog)();
+            });
         }
     }
 
