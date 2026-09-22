@@ -105,12 +105,16 @@ public:
         // `this` in singleShot cancels the retry if the page is
         // destroyed first (e.g. widget removed from layout).
         connect(this, &QWebEnginePage::loadFinished, this, [this](bool ok) {
-            if (ok) return;
-            std::cout << "WARN : [arexibo::qt] page failed to load (" << url().toString().toStdString()
-                       << ") -- retrying in 2.5s" << std::endl;
-            QTimer::singleShot(2500, this, [this]() {
-                triggerAction(QWebEnginePage::Reload);
-            });
+            if (!ok) {
+                std::cout << "WARN : [arexibo::qt] page failed to load (" \
+                           << url().toString().toStdString() << ") -- retrying in 2.5s" << std::endl;
+                QTimer::singleShot(2500, this, [this]() {
+                    triggerAction(QWebEnginePage::Reload);
+                });
+                return;
+            }
+            std::cout << "DEBUG: [arexibo::qt] page finished loading (" \
+                       << url().toString().toStdString() << ")" << std::endl;
         });
 
         if (hang_watchdog_secs > 0) {

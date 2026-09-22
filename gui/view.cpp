@@ -780,9 +780,9 @@ void Window::jsNativeWebShowImpl(bool overlay, int mediaId, QString url, int x, 
     pending_native_web_shows.append({overlay, mediaId, url, x, y, w, h});
     if (!native_web_show_stagger_active) {
         native_web_show_stagger_active = true;
-        // 3s delay before the first native widget navigation, so it
+        // 1s delay before the first native widget navigation, so it
         // doesn't compete with the initial page-load burst (see status doc).
-        QTimer::singleShot(3000, this, [this]() { processNextPendingNativeWebShow(); });
+        QTimer::singleShot(1000, this, [this]() { processNextPendingNativeWebShow(); });
     }
 }
 
@@ -930,6 +930,8 @@ void Window::jsNativeWebHideImpl(bool overlay, int mediaId)
 {
     auto &views = overlay ? overlay_native_views : native_views;
     if (auto nview = views.value(mediaId, nullptr)) {
+        std::cout << "DEBUG: [arexibo::qt] jsNativeWebHideImpl mediaId=" << mediaId \
+                   << " overlay=" << overlay << std::endl;
         nview->hide();
     }
 }

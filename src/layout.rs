@@ -1365,6 +1365,13 @@ impl<'a> Translator<'a> {
                                     height: {h}px;'></iframe>")?;
             }
             (_, Some("webpage")) => {
+                // 0 or unset both mean "as long as the layout" for a
+                // webpage widget -- override the shared 10s-default/
+                // literal-0 duration set above.
+                let raw_duration = media.def_attr("duration", "");
+                if raw_duration.is_empty() || raw_duration.parse::<i32>() == Ok(0) {
+                    duration = "() => 86400".to_string();
+                }
                 let url = percent_decode(opts.find("uri").context("no web uri")?.text());
                 // Xibo's webpage widget has 3 embed modes (modeid):
                 // "Open Natively"/1, "Manual Position"/2, "Best Fit"/3.
@@ -2088,6 +2095,35 @@ mod native_webpage_tests {
         // this widget type isn't exempt from that part of the fix.
         assert!(html.contains("style='left: 0px; top: 0px; width: 400px; height: 300px;'></div>"),
                 "the placeholder div itself must still use wrapper-relative (0,0) CSS -- got:\n{html}");
+    }
+
+    #[test]
+    fn webpage_widget_duration_zero_or_unset_lasts_as_long_as_the_layout() {
+        // A webpage widget's duration=0, or an unset duration, both
+        // mean "as long as the layout" -- not the shared 10s-default/
+        // literal-0 (which JS then treats as 1s via `|| 1`) that other
+        // widget types get.
+        for xlf in [
+            r#"<layout width="1920" height="1080">
+                <region id="7" left="0" top="0" width="400" height="300">
+                    <media id="9001" type="webpage" render="native" duration="0">
+                        <options><uri>https://example.com</uri><modeid>1</modeid></options>
+                    </media>
+                </region>
+            </layout>"#,
+            r#"<layout width="1920" height="1080">
+                <region id="7" left="0" top="0" width="400" height="300">
+                    <media id="9001" type="webpage" render="native">
+                        <options><uri>https://example.com</uri><modeid>1</modeid></options>
+                    </media>
+                </region>
+            </layout>"#,
+        ] {
+            let html = translate_xlf(xlf);
+            assert!(html.contains(", () => 86400, 9001],"),
+                    "webpage widget with duration=0 or unset must use the 86400s \
+                     as-long-as-the-layout duration -- got:\n{html}");
+        }
     }
 
     #[test]

@@ -221,6 +221,7 @@ impl Server {
         let widget_id = json.get("id").and_then(|v| v.as_i64())
             .context("duration request missing numeric id")?;
         let duration = json.get("duration").and_then(|v| v.as_i64());
+        log::debug!("duration request: widget {widget_id} action={action:?} duration={duration:?}");
         // Best-effort: if the mainloop's receiving end has gone away
         // (shutting down), still ACK the HTTP request rather than
         // erroring the widget's own JS out over something it can't fix.
