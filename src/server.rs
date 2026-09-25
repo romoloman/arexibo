@@ -566,11 +566,15 @@ fn splash_html(awaiting_registration: bool) -> Vec<u8> {
         let hostname = crate::util::get_display_name();
         let ips = crate::util::get_local_ips();
         let ips_display = if ips.is_empty() {
-            "(no network address found)".to_string()
+            "<div>(no network address found)</div>".to_string()
         } else {
-            ips.join(", ")
+            // One <div> per address (not comma-joined on one line): an
+            // IPv6 address is long enough that a joined list can
+            // overflow the screen width, especially with more than one
+            // address.
+            ips.iter().map(|ip| format!("<div>{ip}</div>")).collect()
         };
-        format!("{hostname} &middot; {ips_display}")
+        format!("<div>{hostname}</div>{ips_display}")
     });
     let registration_section = if awaiting_registration {
         r#"<div id="registration-code-section" style="display: none; margin-top: 16px;
