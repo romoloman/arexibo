@@ -127,15 +127,27 @@ pub type LocalDataStore = Arc<Mutex<HashMap<String, String>>>;
 /// endpoint, polled client-side from the splash screen.
 pub type RegistrationCodeStore = Arc<Mutex<Option<String>>>;
 
-/// Live mirror of `mainloop::Handler`'s own `pending_auth` -- unlike
-/// `awaiting_registration` below (decided once, at startup), this
-/// changes over the session: true whenever the display is registered
-/// but the CMS hasn't authorized it (yet, or anymore -- this isn't
-/// limited to the very first boot; a previously-authorized display can
-/// go back to pending if de-authorized later). Read by splash_html to
-/// show a distinct "waiting for authorization" message instead of a
-/// generic "loading" one.
-pub type AuthorizationStore = Arc<Mutex<bool>>;
+/// Live mirror of `mainloop::Handler`'s own connection/authorization
+/// state -- unlike `awaiting_registration` below (decided once, at
+/// startup), this changes over the session. Read by splash_html to
+/// show a status distinct from the generic "loading" one; not
+/// meaningful at all while `awaiting_registration` is true (the
+/// registration form takes over the whole splash in that case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplashState {
+    /// Registered and authorized, normal startup/collection under way.
+    Loading,
+    /// Registered (known to the CMS) but not yet authorized there --
+    /// can happen on first-ever registration, or later if a
+    /// previously-authorized display gets de-authorized.
+    AwaitingAuthorization,
+    /// Can't currently reach the CMS at all, and there's nothing else
+    /// to fall back on (no cached schedule, or `--disallow-offline`)
+    /// -- retrying quietly in the background.
+    AwaitingConnection,
+}
+
+pub type SplashStateStore = Arc<Mutex<SplashState>>;
 
 pub struct Server {
     dir: PathBuf,
@@ -160,8 +172,8 @@ pub struct Server {
     /// on every single normal boot -- a real report asked about this
     /// exact line. Gating the whole section on this instead.
     awaiting_registration: bool,
-    /// See `AuthorizationStore`'s own doc comment.
-    awaiting_authorization: AuthorizationStore,
+    /// See `SplashStateStore`'s own doc comment.
+    splash_state: SplashStateStore,
 }
 
 impl Server {
@@ -174,13 +186,13 @@ impl Server {
                duration_tx: Sender<DurationRequest>, trigger_tx: Sender<TriggerRequest>,
                fault_tx: Sender<FaultRequest>, manual_register_tx: Sender<ManualRegisterRequest>,
                local_data: LocalDataStore, registration_code: RegistrationCodeStore,
-               awaiting_registration: bool, awaiting_authorization: AuthorizationStore)
+               awaiting_registration: bool, splash_state: SplashStateStore)
                -> Result<Self> {
         let server = tiny_http::Server::http((bind_addr, port))
             .map_err(|e| anyhow!(e))?;
         let dir = dir.canonicalize().context("getting canonical server dir name")?;
         Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, manual_register_tx,
-                  local_data, registration_code, awaiting_registration, awaiting_authorization })
+                  local_data, registration_code, awaiting_registration, splash_state })
     }
 
     pub fn port(&self) -> u16 {
@@ -199,13 +211,13 @@ impl Server {
             let local_data = self.local_data.clone();
             let registration_code = self.registration_code.clone();
             let awaiting_registration = self.awaiting_registration;
-            let awaiting_authorization = self.awaiting_authorization.clone();
+            let splash_state = self.splash_state.clone();
             thread::spawn(move || {
                 loop {
                     let mut req = server.recv().unwrap();
                     match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx,
                                        &manual_register_tx, &local_data, &registration_code,
-                                       awaiting_registration, &awaiting_authorization) {
+                                       awaiting_registration, &splash_state) {
                         Ok(resp) => {  let _ = req.respond(resp); }
                         Err(e) => {
                             log::warn!("processing HTTP req {}: {:#}", req.url(), e);
@@ -321,11 +333,11 @@ impl Server {
              trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
              manual_register_tx: &Sender<ManualRegisterRequest>,
              local_data: &LocalDataStore, registration_code: &RegistrationCodeStore,
-             awaiting_registration: bool, awaiting_authorization: &AuthorizationStore)
+             awaiting_registration: bool, splash_state: &SplashStateStore)
              -> Result<ResponseBox> {
         let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, manual_register_tx,
                                       local_data, registration_code, awaiting_registration,
-                                      awaiting_authorization)?;
+                                      splash_state)?;
         Ok(resp.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()))
     }
 
@@ -334,7 +346,7 @@ impl Server {
                     trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
                     manual_register_tx: &Sender<ManualRegisterRequest>,
                     local_data: &LocalDataStore, registration_code: &RegistrationCodeStore,
-                    awaiting_registration: bool, awaiting_authorization: &AuthorizationStore)
+                    awaiting_registration: bool, splash_state: &SplashStateStore)
                     -> Result<ResponseBox> {
         log::debug!("HTTP request: {}", req.url());
         let url = req.url();
@@ -346,7 +358,7 @@ impl Server {
                 .with_header(Header::from_bytes(b"Content-Type", b"image/png").unwrap())
                 .boxed(),
             "/0.xlf.html" => Response::from_data(
-                splash_html(awaiting_registration, *awaiting_authorization.lock().unwrap())).boxed(),
+                splash_html(awaiting_registration, *splash_state.lock().unwrap())).boxed(),
 
             // Serves a "Local Video" widget's own file:// URI (a path
             // already present on the display's own disk, outside the
@@ -578,7 +590,7 @@ impl Server {
 // `awaiting_registration` value, but a *test* binary calling it with
 // both in the same run must see each one reflected correctly, which
 // whole-page OnceLock caching would have broken.
-fn splash_html(awaiting_registration: bool, awaiting_authorization: bool) -> Vec<u8> {
+fn splash_html(awaiting_registration: bool, splash_state: SplashState) -> Vec<u8> {
     static HOSTNAME_LINE: OnceLock<String> = OnceLock::new();
     let hostname_line = HOSTNAME_LINE.get_or_init(|| {
         let hostname = crate::util::get_display_name();
@@ -672,10 +684,10 @@ pollRegistrationCode();
     } else {
         ""
     };
-    let status_line = if awaiting_authorization {
-        "REGISTERING TO CMS..."
-    } else {
-        "LOADING..."
+    let status_line = match splash_state {
+        SplashState::Loading => "LOADING...",
+        SplashState::AwaitingAuthorization => "REGISTERING TO CMS...",
+        SplashState::AwaitingConnection => "WAITING FOR CMS CONNECTION...",
     };
     format!(r#"<!DOCTYPE html>
 <html>
@@ -696,8 +708,8 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
 <!-- Separate HTML text element (the old splash.jpg had "LOADING..."
      baked into its pixels, lost when replaced with branding.png) --
      stays readable regardless of whatever logo is configured. Text
-     itself varies with awaiting_authorization -- see its own doc
-     comment on AuthorizationStore for what it distinguishes. -->
+     itself varies with splash_state -- see its own doc
+     comment on SplashStateStore for what it distinguishes. -->
 <div style="margin-top: 24px; font-family: sans-serif; font-size: 28px;
             font-weight: 600; color: #333333; letter-spacing: 0.05em;">
   {status_line}
@@ -751,7 +763,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         (port, local_data)
@@ -793,7 +805,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -816,7 +828,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -840,7 +852,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -894,7 +906,7 @@ mod stable_port_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", EMBEDDED_SERVER_PORT, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         assert_eq!(server.port(), EMBEDDED_SERVER_PORT,
                    "the embedded server must use the fixed, stable port constant, \
                     not a randomly OS-assigned one -- otherwise cached widget iframe \
@@ -920,7 +932,7 @@ mod no_cache_header_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -1001,7 +1013,7 @@ mod json_content_type_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -1030,7 +1042,7 @@ mod manual_register_tests {
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
                                   manual_register_tx, local_data,
-                                  Arc::new(Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+                                  Arc::new(Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         (port, manual_register_rx)
@@ -1074,7 +1086,7 @@ mod splash_html_tests {
         // own hostname/IP directly on the splash screen, useful during
         // initial setup and while waiting for CMS authorization,
         // instead of requiring a separate SSH session to check).
-        let html = String::from_utf8(splash_html(true, false)).unwrap();
+        let html = String::from_utf8(splash_html(true, SplashState::Loading)).unwrap();
         // The real hostname will vary by machine/CI environment, but it
         // must appear verbatim somewhere in the output.
         let hostname = crate::util::get_display_name();
@@ -1096,7 +1108,7 @@ mod splash_html_tests {
 
     #[test]
     fn splash_html_includes_the_manual_registration_form_and_code_poller_when_awaiting_registration() {
-        let html = String::from_utf8(splash_html(true, false)).unwrap();
+        let html = String::from_utf8(splash_html(true, SplashState::Loading)).unwrap();
         assert!(html.contains("id=\"cms-address\"") && html.contains("id=\"cms-key\""),
                 "the manual entry fields must be present -- got:\n{html}");
         assert!(html.contains("fetch('/register'"),
@@ -1124,7 +1136,7 @@ mod splash_html_tests {
         // harmless in practice (the page navigates away before it ever
         // matters), but confusing log noise on every single normal
         // boot.
-        let html = String::from_utf8(splash_html(false, false)).unwrap();
+        let html = String::from_utf8(splash_html(false, SplashState::Loading)).unwrap();
         assert!(!html.contains("registration-code") && !html.contains("cms-address")
                 && !html.contains("/register"),
                 "an already-configured display's own splash must not poll/reference \
@@ -1136,13 +1148,13 @@ mod splash_html_tests {
 
     #[test]
     fn splash_html_shows_a_distinct_message_while_awaiting_cms_authorization() {
-        // awaiting_authorization is a live state (mirrors
+        // splash_state is a live state (mirrors
         // mainloop::Handler's own pending_auth), separate from
         // awaiting_registration (decided once, at startup) -- can be
         // true together with awaiting_registration (a brand new
         // display, first ever registration) or on its own (a
         // previously-authorized display that lost authorization later).
-        let html = String::from_utf8(splash_html(false, true)).unwrap();
+        let html = String::from_utf8(splash_html(false, SplashState::AwaitingAuthorization)).unwrap();
         assert!(html.contains("REGISTERING TO CMS"),
                 "must show a distinct status while awaiting CMS authorization -- got:\n{html}");
         // Checks the actual displayed status div, not the whole page --
@@ -1157,6 +1169,21 @@ mod splash_html_tests {
         assert!(!html.contains("registration-code") && !html.contains("cms-address"),
                 "no manual-entry form here -- this display is already registered, only \
                  not yet authorized -- got:\n{html}");
+    }
+
+    #[test]
+    fn splash_html_shows_a_distinct_message_while_awaiting_cms_connection() {
+        // Distinct from AwaitingAuthorization: this is a *failed*
+        // connection attempt (network/CMS unreachable at all), not a
+        // successful one that got an "unauthorized" answer.
+        let html = String::from_utf8(splash_html(false, SplashState::AwaitingConnection)).unwrap();
+        assert!(html.contains("WAITING FOR CMS CONNECTION"),
+                "must show a distinct status while unable to reach the CMS -- got:\n{html}");
+        assert!(!html.contains("  LOADING...\n") && !html.contains("REGISTERING TO CMS"),
+                "neither other status text must be the one displayed -- got:\n{html}");
+        assert!(!html.contains("registration-code") && !html.contains("cms-address"),
+                "no manual-entry form here -- this display is already registered, just \
+                 currently unreachable -- got:\n{html}");
     }
 }
 
@@ -1180,7 +1207,7 @@ mod registration_code_endpoint_tests {
         let registration_code: RegistrationCodeStore =
             Arc::new(Mutex::new(initial_code.map(str::to_string)));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
-                                  manual_register_tx, local_data, registration_code, false, Arc::new(Mutex::new(false))).unwrap();
+                                  manual_register_tx, local_data, registration_code, false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -1222,7 +1249,7 @@ mod local_file_tests {
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
                                   manual_register_tx, local_data,
-                                  std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(false))).unwrap();
+                                  std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         port

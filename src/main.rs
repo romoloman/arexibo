@@ -75,10 +75,23 @@ struct Args {
     /// Disable HTTPS certificate verification.
     #[arg(long)]
     no_verify: bool,
-    /// Allow starting and running without connection to the CMS,
-    /// showing the last cached schedule.
+    /// Deprecated, no longer does anything: starting/running without a
+    /// CMS connection (showing the last cached schedule, or a "waiting
+    /// for CMS connection" splash if there's no cache) is now the
+    /// default -- see --disallow-offline for the opposite. Kept, doing
+    /// nothing, only so existing scripts/services passing this flag
+    /// don't break.
     #[arg(long)]
     allow_offline: bool,
+    /// Require a live CMS connection at startup: don't fall back to a
+    /// cached schedule (even if one exists) when the CMS can't be
+    /// reached, show a "waiting for CMS connection" splash and keep
+    /// retrying instead. This is the old, pre-0.7 default behavior
+    /// (which used to exit outright instead of retrying) for whoever
+    /// specifically wants a live check gating playback. If both this
+    /// and the now-inert --allow-offline are given, this one wins.
+    #[arg(long)]
+    disallow_offline: bool,
 }
 
 fn main() {
@@ -146,9 +159,16 @@ fn main_inner() -> anyhow::Result<()> {
     if !awaiting_code {
         cms.to_file(&cmscfg).context("writing new CMS config")?;
     }
+    if args.allow_offline {
+        log::warn!("--allow-offline no longer does anything (its behavior is now the \
+                    default) -- safe to remove from how this is started");
+    }
     // Forces Handler::new's own "CMS unreachable, no cache, show
-    // splash and retry quietly" path instead of bailing.
-    let allow_offline = args.allow_offline || awaiting_code;
+    // splash and retry quietly" path instead of requiring a cache or
+    // a live connection. awaiting_code (no CMS address at all yet)
+    // always forces this regardless of --disallow-offline -- there's
+    // no CMS address to even try reaching yet, let alone gate on.
+    let allow_offline = !args.disallow_offline || awaiting_code;
 
     // create the backend handler and required channels
     let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
@@ -167,16 +187,16 @@ fn main_inner() -> anyhow::Result<()> {
     // FaultRequest).
     let (fault_tx, fault_rx) = crossbeam_channel::bounded(20);
 
-    // Live "awaiting CMS authorization" state -- written by the
-    // Handler as its own pending_auth changes, read by the splash
-    // screen (see server::AuthorizationStore's own doc comment).
-    let awaiting_authorization: server::AuthorizationStore =
-        std::sync::Arc::new(std::sync::Mutex::new(false));
+    // Live splash-screen status -- written by the Handler as its own
+    // pending_auth/pending_network change, read by the splash screen
+    // (see server::SplashState's own doc comment).
+    let splash_state: server::SplashStateStore =
+        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading));
 
     let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
                                               allow_offline, args.debug,
                                               togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
-                                              awaiting_authorization.clone())
+                                              splash_state.clone())
         .context("creating backend handler")?;
     let mut settings = handler.player_settings();
 
@@ -217,7 +237,7 @@ fn main_inner() -> anyhow::Result<()> {
     let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
     let port = server::effective_port(settings.embedded_server_port);
     let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
-                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, awaiting_authorization.clone())
+                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, splash_state.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
     let shard_port = webserver.port();
@@ -244,7 +264,7 @@ fn main_inner() -> anyhow::Result<()> {
         for shard in 2..=server::HTML_SHARD_COUNT {
             let addr = format!("127.0.0.{shard}");
             let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
-                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, awaiting_authorization.clone())
+                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, splash_state.clone())
                 .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
             shard_server.start_pool();
         }
