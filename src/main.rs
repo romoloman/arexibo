@@ -167,9 +167,16 @@ fn main_inner() -> anyhow::Result<()> {
     // FaultRequest).
     let (fault_tx, fault_rx) = crossbeam_channel::bounded(20);
 
+    // Live "awaiting CMS authorization" state -- written by the
+    // Handler as its own pending_auth changes, read by the splash
+    // screen (see server::AuthorizationStore's own doc comment).
+    let awaiting_authorization: server::AuthorizationStore =
+        std::sync::Arc::new(std::sync::Mutex::new(false));
+
     let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
                                               allow_offline, args.debug,
-                                              togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx)
+                                              togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                              awaiting_authorization.clone())
         .context("creating backend handler")?;
     let mut settings = handler.player_settings();
 
@@ -210,7 +217,7 @@ fn main_inner() -> anyhow::Result<()> {
     let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
     let port = server::effective_port(settings.embedded_server_port);
     let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
-                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code)
+                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, awaiting_authorization.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
     let shard_port = webserver.port();
@@ -237,7 +244,7 @@ fn main_inner() -> anyhow::Result<()> {
         for shard in 2..=server::HTML_SHARD_COUNT {
             let addr = format!("127.0.0.{shard}");
             let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
-                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code)
+                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, awaiting_authorization.clone())
                 .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
             shard_server.start_pool();
         }
