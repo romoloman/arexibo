@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crossbeam_channel::{Sender, Receiver};
 use parking_lot::Mutex;
 use crate::config::PlayerSettings;
-use crate::mainloop::{ToGui, FromGui, Kill};
+use crate::mainloop::{ToGui, FromGui, Kill, ForceReloadReason};
 use crate::resource::LayoutId;
 use crate::server;
 
@@ -79,7 +79,7 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                         }
                     }
                 }
-                ToGui::ForceReloadLayout(layout_id) => {
+                ToGui::ForceReloadLayout(layout_id, reason) => {
                     // update() also correctly syncs Schedule<T>'s own
                     // internal state (index/layouts/single_done) to
                     // reflect this as current -- its own return value
@@ -90,8 +90,15 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                     // exactly the one case update()'s own return value
                     // would otherwise say "nothing to do" for.
                     schedule.lock().update(vec![layout_id]);
-                    log::info!("Sync Group: force-reloading layout {layout_id} to \
-                                restart its own timers in lockstep with the group");
+                    let why = match reason {
+                        ForceReloadReason::SyncGroup =>
+                            "Sync Group: restarting its own timers in lockstep with the group",
+                        ForceReloadReason::PurgeTriggered =>
+                            "purge-triggered reload",
+                        ForceReloadReason::CycleGroupOfOne =>
+                            "Cycle Playback group of one completed its own natural cycle",
+                    };
+                    log::info!("force-reloading layout {layout_id} ({why})");
                     let file = CString::new(format!("{layout_id}.xlf.html")).unwrap();
                     unsafe {
                         cpp::navigate(file.as_ptr());

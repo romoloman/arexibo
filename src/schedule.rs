@@ -463,7 +463,7 @@ impl Schedule {
     /// incrementing once a decision to advance had *already* been made,
     /// not on every completed cycle. Deliberately not replicated here.
     pub fn record_cycle_group_completion(&self, layout_id: LayoutId,
-                                          criteria: &CriteriaStore, state: &mut CycleState) {
+                                          criteria: &CriteriaStore, state: &mut CycleState) -> bool {
         let now = OffsetDateTime::now_local().unwrap();
         for (group_key, members) in self.active_cycle_groups(now, criteria) {
             let (idx, plays) = state.positions.entry(group_key).or_insert((0, 0));
@@ -479,8 +479,9 @@ impl Schedule {
             } else {
                 *idx = idx_clamped;
             }
-            return;
+            return true;
         }
+        false
     }
 
     /// Layouts that should be showing right now. Without any active

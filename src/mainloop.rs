@@ -96,7 +96,29 @@ pub enum ToGui {
     /// `layout_id` is passed explicitly because deriving it from
     /// `Schedule<T>::current()` yields stale data on the initial
     /// session switch.
-    ForceReloadLayout(i64),
+    ///
+    /// The reason is carried alongside so gui.rs's own log message can
+    /// be specific about which real cause triggered this -- confirmed
+    /// real from a report (GitHub issue #1): a single shared "Sync
+    /// Group: force-reloading..." message, sent for all causes, misled
+    /// readers into thinking Sync Groups were involved even when
+    /// `sync_role` was `None`.
+    ForceReloadLayout(i64, ForceReloadReason),
+}
+
+/// See `ToGui::ForceReloadLayout`'s own doc comment for why this exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceReloadReason {
+    /// A genuine Sync Group layout switch, or restarting an
+    /// already-showing layout's own timers in lockstep for a
+    /// (re)connecting peer.
+    SyncGroup,
+    /// The `Purge` XMR handler's own next-collection reload.
+    PurgeTriggered,
+    /// An ordinary single-layout schedule that's also a Cycle Playback
+    /// group of exactly one member -- its own play count still needs
+    /// this signal to advance, even with nowhere else to advance to.
+    CycleGroupOfOne,
 }
 
 pub enum Kill {
@@ -891,7 +913,8 @@ impl Handler {
                                 // region/playlist timers in lockstep
                                 // with the rest of the group, which
                                 // only a genuine reload achieves.
-                                self.to_gui.send(ToGui::ForceReloadLayout(layout_id)).unwrap();
+                                self.to_gui.send(ToGui::ForceReloadLayout(
+                                    layout_id, ForceReloadReason::SyncGroup)).unwrap();
                                 // Recorded only now (once actually
                                 // committed, never while merely
                                 // staged) -- see
@@ -1215,7 +1238,7 @@ impl Handler {
                             // cycle group, if it belongs to one at all --
                             // a no-op otherwise. May advance the group to
                             // its next member.
-                            self.schedule.record_cycle_group_completion(
+                            let was_cycle_member = self.schedule.record_cycle_group_completion(
                                 self.current_layout, &self.criteria, &mut self.cycle_state);
                             // Confirmed real from a difference with the
                             // Windows client: when a layout completes
@@ -1229,15 +1252,35 @@ impl Handler {
                             // by design, for every other -- much more
                             // frequent -- caller), so this needs its
                             // own explicit check here instead.
+                            //
+                            // Real report (GitHub issue #1): this used
+                            // to fire for *every* single-layout
+                            // schedule, not just Cycle Playback/Sync
+                            // Group ones -- forcing a full page
+                            // navigation (and re-fetch of every asset)
+                            // on every ordinary loop, when 0.6.0's own
+                            // behavior (and the actual need for a
+                            // reload signal at all) was to let the
+                            // layout keep looping seamlessly via its
+                            // own GUI-side timers. Only Cycle Playback
+                            // (this playthrough just counted towards an
+                            // active group above) and Sync Group
+                            // displays (need their timers restarted in
+                            // lockstep) genuinely need this signal.
+                            let in_sync_group = self.settings.sync_role != SyncRole::None;
                             let resolved = self.schedule.layouts_now(&self.criteria, &mut self.cycle_state);
                             let available: Vec<_> = resolved.iter().copied()
                                 .filter(|&id| self.cache.get_layout(id).is_some())
                                 .collect();
-                            if available == self.layouts && available.len() == 1 {
-                                log::info!("layout {} completed its own natural cycle and is \
-                                            still the only one scheduled -- reloading it fresh",
-                                           available[0]);
-                                self.to_gui.send(ToGui::ForceReloadLayout(available[0])).unwrap();
+                            if available == self.layouts && available.len() == 1
+                               && (was_cycle_member || in_sync_group) {
+                                log::info!("layout {} completed its own natural cycle -- \
+                                            reloading it fresh ({})", available[0],
+                                           if was_cycle_member { "Cycle Playback group of one" }
+                                           else { "Sync Group" });
+                                self.to_gui.send(ToGui::ForceReloadLayout(available[0],
+                                    if was_cycle_member { ForceReloadReason::CycleGroupOfOne }
+                                    else { ForceReloadReason::SyncGroup })).unwrap();
                             } else if available != self.layouts {
                                 // A cycle group just advanced to a
                                 // genuinely different member (its own
@@ -2637,7 +2680,8 @@ impl Handler {
                 return;
             }
             self.force_reload_after_collect = false;
-            self.to_gui.send(ToGui::ForceReloadLayout(self.current_layout)).unwrap();
+            self.to_gui.send(ToGui::ForceReloadLayout(
+                self.current_layout, ForceReloadReason::PurgeTriggered)).unwrap();
         }
     }
 
@@ -4569,16 +4613,13 @@ mod handle_trigger_code_tests {
     }
 
     #[test]
-    fn layout_completed_reloads_a_single_still_scheduled_layout() {
-        // Confirmed real difference from the Windows client: when a
-        // layout completes its own natural cycle and is still the
-        // only one scheduled, Windows moves on to "the next layout" --
-        // which, with only one, means reloading it fresh.
-        // schedule_check() alone never does this on its own (it only
-        // reloads when the resolved layout set actually changes), so
-        // this needs its own explicit check in the real
-        // FromGui::LayoutCompleted handler -- simulated here the same
-        // way the other tests in this module already do.
+    fn layout_completed_does_not_reload_an_ordinary_single_layout_schedule() {
+        // Real report (GitHub issue #1): an ordinary single-layout
+        // schedule (no Cycle Playback, no Sync Group) must keep
+        // looping seamlessly via its own GUI-side timers, exactly like
+        // 0.6.0 -- no forced page reload/re-fetch of every asset on
+        // every completed cycle. Simulated here the same way the other
+        // tests in this module already do.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -4598,6 +4639,8 @@ mod handle_trigger_code_tests {
         handler.schedule = Schedule::parse(&tree).unwrap();
         handler.cache.insert_fake_layout_for_test(913);
         handler.layouts = vec![913];
+        assert_eq!(handler.settings.sync_role, SyncRole::None,
+                   "this scenario only makes sense with no active Sync Group");
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
 
         // Same simulated FromGui::LayoutCompleted logic the real
@@ -4606,18 +4649,73 @@ mod handle_trigger_code_tests {
             handler.override_revert_on_completion = false;
             handler.schedule_check();
         } else if handler.override_layout.is_none() {
+            let was_cycle_member = handler.schedule.record_cycle_group_completion(
+                handler.current_layout, &handler.criteria, &mut handler.cycle_state);
+            let in_sync_group = handler.settings.sync_role != SyncRole::None;
             let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
             let available: Vec<_> = resolved.iter().copied()
                 .filter(|&id| handler.cache.get_layout(id).is_some())
                 .collect();
-            if available == handler.layouts && available.len() == 1 {
-                handler.to_gui.send(ToGui::ForceReloadLayout(available[0])).unwrap();
+            if available == handler.layouts && available.len() == 1
+               && (was_cycle_member || in_sync_group) {
+                handler.to_gui.send(ToGui::ForceReloadLayout(
+                    available[0], ForceReloadReason::CycleGroupOfOne)).unwrap();
             }
         }
 
-        let msg = togui_rx.try_recv().expect("a reload must have been sent");
-        assert!(matches!(msg, ToGui::ForceReloadLayout(913)),
-                "the single still-scheduled layout must be force-reloaded");
+        assert!(togui_rx.try_recv().is_err(),
+                "an ordinary single-layout schedule must not be force-reloaded");
+    }
+
+    #[test]
+    fn layout_completed_reloads_a_cycle_playback_group_of_one() {
+        // Unlike the ordinary case above, a Cycle Playback group still
+        // needs this signal even with only one (currently eligible)
+        // member -- its own play count has to advance regardless (see
+        // record_cycle_group_completion's own doc comment).
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx).unwrap();
+
+        let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="1" groupKey="42" playCount="0" maxPlaysPerHour="0"/>
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
+        handler.schedule = Schedule::parse(&tree).unwrap();
+        handler.cache.insert_fake_layout_for_test(913);
+        handler.layouts = vec![913];
+        handler.current_layout = 913;
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+            handler.schedule_check();
+        } else if handler.override_layout.is_none() {
+            let was_cycle_member = handler.schedule.record_cycle_group_completion(
+                handler.current_layout, &handler.criteria, &mut handler.cycle_state);
+            let in_sync_group = handler.settings.sync_role != SyncRole::None;
+            let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
+            let available: Vec<_> = resolved.iter().copied()
+                .filter(|&id| handler.cache.get_layout(id).is_some())
+                .collect();
+            if available == handler.layouts && available.len() == 1
+               && (was_cycle_member || in_sync_group) {
+                handler.to_gui.send(ToGui::ForceReloadLayout(
+                    available[0], ForceReloadReason::CycleGroupOfOne)).unwrap();
+            }
+        }
+
+        let msg = togui_rx.try_recv().expect("a Cycle Playback group of one must still reload");
+        assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::CycleGroupOfOne)),
+                "must be force-reloaded with the CycleGroupOfOne reason");
     }
 }
 
@@ -5519,7 +5617,7 @@ mod data_refresh_timer_tests {
         handler.maybe_force_reload_after_purge();
         let msg = togui_rx.recv_timeout(Duration::from_millis(500))
             .expect("must force a reload when the flag was set");
-        assert!(matches!(msg, ToGui::ForceReloadLayout(4242)),
+        assert!(matches!(msg, ToGui::ForceReloadLayout(4242, ForceReloadReason::PurgeTriggered)),
                 "must reload the *current* layout specifically, not an ordinary \
                  ToGui::Layouts (which the GUI's own Schedule<T>::update would silently \
                  no-op on an unchanged id -- see ForceReloadLayout's own doc comment)");
@@ -6209,7 +6307,8 @@ mod sync_group_schedule_check_tests {
                 handler.override_layout = Some(layout_id);
                 handler.sync_layout_active = true;
                 handler.layouts = vec![layout_id];
-                handler.to_gui.send(ToGui::ForceReloadLayout(layout_id)).unwrap();
+                handler.to_gui.send(ToGui::ForceReloadLayout(
+                    layout_id, ForceReloadReason::SyncGroup)).unwrap();
             }
             handler.sync_apply_timer = never();
             handler.schedule_check();
@@ -6225,7 +6324,7 @@ mod sync_group_schedule_check_tests {
         // message on the channel -- check it appears *somewhere* among
         // what's queued, not that it's first.
         assert!(std::iter::from_fn(|| togui_rx.try_recv().ok())
-                    .any(|m| matches!(m, ToGui::ForceReloadLayout(_))),
+                    .any(|m| matches!(m, ToGui::ForceReloadLayout(..))),
                 "applying a synchronized switch must always force a real page reload");
     }
 
@@ -6258,14 +6357,15 @@ mod sync_group_schedule_check_tests {
                 handler.override_layout = Some(layout_id);
                 handler.sync_layout_active = true;
                 handler.layouts = vec![layout_id];
-                handler.to_gui.send(ToGui::ForceReloadLayout(layout_id)).unwrap();
+                handler.to_gui.send(ToGui::ForceReloadLayout(
+                    layout_id, ForceReloadReason::SyncGroup)).unwrap();
             }
             handler.sync_apply_timer = never();
             handler.schedule_check();
         }
 
         assert!(std::iter::from_fn(|| togui_rx.try_recv().ok())
-                    .any(|m| matches!(m, ToGui::ForceReloadLayout(_))),
+                    .any(|m| matches!(m, ToGui::ForceReloadLayout(..))),
                 "re-synchronizing an already-showing layout must still force a real \
                  reload -- an ordinary ToGui::Layouts would be silently ignored by the \
                  GUI's own unchanged-id no-op check, leaving region/playlist timers \
@@ -6757,7 +6857,8 @@ mod sync_group_schedule_check_tests {
                 handler.override_layout = Some(layout_id);
                 handler.sync_layout_active = true;
                 handler.layouts = vec![layout_id];
-                handler.to_gui.send(ToGui::ForceReloadLayout(layout_id)).unwrap();
+                handler.to_gui.send(ToGui::ForceReloadLayout(
+                    layout_id, ForceReloadReason::SyncGroup)).unwrap();
             }
             handler.sync_apply_timer = never();
             handler.schedule_check();
@@ -6767,7 +6868,7 @@ mod sync_group_schedule_check_tests {
                 "no override must be committed when sync_keys don't match anything of mine");
         assert!(!handler.sync_layout_active);
         assert!(!std::iter::from_fn(|| togui_rx.try_recv().ok())
-                    .any(|m| matches!(m, ToGui::ForceReloadLayout(_))),
+                    .any(|m| matches!(m, ToGui::ForceReloadLayout(..))),
                 "must never force a reload for a synchronized event this display isn't \
                  actually part of");
     }
