@@ -568,11 +568,13 @@ fn splash_html(awaiting_registration: bool) -> Vec<u8> {
         let ips_display = if ips.is_empty() {
             "<div>(no network address found)</div>".to_string()
         } else {
-            // One <div> per address (not comma-joined on one line): an
-            // IPv6 address is long enough that a joined list can
-            // overflow the screen width, especially with more than one
-            // address.
-            ips.iter().map(|ip| format!("<div>{ip}</div>")).collect()
+            // One <div> per address (IPv6 can overflow one joined
+            // line) -- fold+write!, not map(format!).collect(), per
+            // clippy's format_collect lint.
+            ips.iter().fold(String::new(), |mut acc, ip| {
+                let _ = std::fmt::Write::write_fmt(&mut acc, format_args!("<div>{ip}</div>"));
+                acc
+            })
         };
         format!("<div>{hostname}</div>{ips_display}")
     });
