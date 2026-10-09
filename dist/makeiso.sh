@@ -61,29 +61,29 @@ done
 TOTEM_PASSWORD_HASH=$(openssl passwd -6 -stdin <<< "$TOTEM_PASSWORD")
 unset TOTEM_PASSWORD TOTEM_PASSWORD_CONFIRM
 
-# ==== 3a. Optional "tecnici" support account (network config only, no ====
+# ==== 3a. Optional support account (network config only, no ====
 # ====     other sudo access -- see the sudoers rule this generates) ====
 read -rp "Create a separate support account for network configuration \
-(limited sudo, no other access)? [Y/n]: " TECNICI_ANSWER
-ENABLE_TECNICI=1
-[[ "$TECNICI_ANSWER" =~ ^[nN] ]] && ENABLE_TECNICI=0
+(limited sudo, no other access)? [Y/n]: " SUPPORT_ANSWER
+ENABLE_SUPPORT=1
+[[ "$SUPPORT_ANSWER" =~ ^[nN] ]] && ENABLE_SUPPORT=0
 
-if [ "$ENABLE_TECNICI" -eq 1 ]; then
-  read -rp "Support account username [default: tecnici]: " TECNICI_USERNAME
-  TECNICI_USERNAME="${TECNICI_USERNAME:-tecnici}"
-  [[ "$TECNICI_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
+if [ "$ENABLE_SUPPORT" -eq 1 ]; then
+  read -rp "Support account username [default: support]: " SUPPORT_USERNAME
+  SUPPORT_USERNAME="${SUPPORT_USERNAME:-support}"
+  [[ "$SUPPORT_USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
     echo "ERROR: invalid username (lowercase letters/digits/-/_ only, can't start with a digit)."
     exit 1
   }
 
   while true; do
-    read -rsp "Support account password: " TECNICI_PASSWORD; echo
-    read -rsp "Confirm password: " TECNICI_PASSWORD_CONFIRM; echo
-    [ "$TECNICI_PASSWORD" = "$TECNICI_PASSWORD_CONFIRM" ] && break
+    read -rsp "Support account password: " SUPPORT_PASSWORD; echo
+    read -rsp "Confirm password: " SUPPORT_PASSWORD_CONFIRM; echo
+    [ "$SUPPORT_PASSWORD" = "$SUPPORT_PASSWORD_CONFIRM" ] && break
     echo "The two passwords don't match, try again."
   done
-  TECNICI_PASSWORD_HASH=$(openssl passwd -6 -stdin <<< "$TECNICI_PASSWORD")
-  unset TECNICI_PASSWORD TECNICI_PASSWORD_CONFIRM
+  SUPPORT_PASSWORD_HASH=$(openssl passwd -6 -stdin <<< "$SUPPORT_PASSWORD")
+  unset SUPPORT_PASSWORD SUPPORT_PASSWORD_CONFIRM
 fi
 
 # ==== 3b. Keyboard layout, timezone, screen orientation ====
@@ -476,10 +476,10 @@ autoinstall:
       EOF
     - chmod 755 /target/usr/local/sbin/totem-net-config
 
-    # TECNICI_BLOCK_START -- makeiso.sh removes everything between
-    # here and TECNICI_BLOCK_END if this support account was declined.
+    # SUPPORT_BLOCK_START -- makeiso.sh removes everything between
+    # here and SUPPORT_BLOCK_END if this support account was declined.
     #
-    # "__TECNICI_USERNAME__" user: SSH access for network configuration
+    # "__SUPPORT_USERNAME__" user: SSH access for network configuration
     # only. Can run in sudo EXCLUSIVELY /usr/local/sbin/totem-net-config,
     # no other command. Not added to the sudo/admin group: the
     # permission comes solely from the dedicated sudoers rule below, so
@@ -494,24 +494,24 @@ autoinstall:
     # the filesystem and run unprivileged commands. If tighter confinement
     # is needed (e.g. a login that only runs the script then disconnects),
     # it needs to be added separately by changing the login shell.
-    - curtin in-target -- useradd -m -s /bin/bash -p '__TECNICI_PASSWORD_HASH__' __TECNICI_USERNAME__
+    - curtin in-target -- useradd -m -s /bin/bash -p '__SUPPORT_PASSWORD_HASH__' __SUPPORT_USERNAME__
     - |
-      cat << 'EOF' > /target/etc/sudoers.d/tecnici-totem-net
+      cat << 'EOF' > /target/etc/sudoers.d/support-totem-net
       # Sudo commands allowed for this support account (contracted
       # maintainers). Each line is one specific command, not generic
       # sudo. Do not add "ALL" or overly broad wildcards without
       # evaluating the implications: each line below was chosen because
       # it's limited to one precise action, even where it uses a
       # trailing asterisk.
-      __TECNICI_USERNAME__ ALL=(root) /usr/local/sbin/totem-net-config
-      __TECNICI_USERNAME__ ALL=(root) /usr/sbin/reboot
-      __TECNICI_USERNAME__ ALL=(root) /usr/bin/systemctl restart arexibo.service
-      __TECNICI_USERNAME__ ALL=(root) /usr/bin/systemctl status arexibo.service
-      __TECNICI_USERNAME__ ALL=(root) /usr/bin/journalctl -u arexibo.service *
+      __SUPPORT_USERNAME__ ALL=(root) /usr/local/sbin/totem-net-config
+      __SUPPORT_USERNAME__ ALL=(root) /usr/sbin/reboot
+      __SUPPORT_USERNAME__ ALL=(root) /usr/bin/systemctl restart arexibo.service
+      __SUPPORT_USERNAME__ ALL=(root) /usr/bin/systemctl status arexibo.service
+      __SUPPORT_USERNAME__ ALL=(root) /usr/bin/journalctl -u arexibo.service *
       EOF
-    - chmod 440 /target/etc/sudoers.d/tecnici-totem-net
-    - curtin in-target -- visudo -cf /etc/sudoers.d/tecnici-totem-net
-    # TECNICI_BLOCK_END
+    - chmod 440 /target/etc/sudoers.d/support-totem-net
+    - curtin in-target -- visudo -cf /etc/sudoers.d/support-totem-net
+    # SUPPORT_BLOCK_END
 
     # XORG CONFIGURATION (detected GPU driver + TearFree where supported)
     - mkdir -p /target/etc/X11/xorg.conf.d
@@ -1030,6 +1030,8 @@ autoinstall:
         usb-modeswitch \
         network-manager \
         whiptail \
+        fonts-noto-core \
+        fonts-noto-mono \
         fonts-noto-color-emoji \
         fonts-montserrat \
         libqmi-utils \
@@ -1072,6 +1074,20 @@ autoinstall:
     - curtin in-target -- dpkg-reconfigure -f noninteractive fontconfig-config || true
     - curtin in-target -- dpkg-reconfigure -f noninteractive fontconfig || true
     - curtin in-target -- fc-cache -fv || true
+
+    # Noto come font predefiniti: senza questo file monospace resta DejaVu
+    - mkdir -p /target/etc/fonts/conf.d
+    - |
+      cat << 'EOF' > /target/etc/fonts/conf.d/10-prefer-noto.conf
+      <?xml version="1.0"?>
+      <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+      <fontconfig>
+        <alias binding="same"><family>sans-serif</family><prefer><family>Noto Sans</family></prefer></alias>
+        <alias binding="same"><family>serif</family><prefer><family>Noto Serif</family></prefer></alias>
+        <alias binding="same"><family>monospace</family><prefer><family>Noto Sans Mono</family></prefer></alias>
+      </fontconfig>
+      EOF
+    - chmod 644 /target/etc/fonts/conf.d/10-prefer-noto.conf
 
     # Full package upgrade -- the ISO image is built at a fixed point in
     # time, but the repositories keep updating in the meantime: without
@@ -1161,12 +1177,12 @@ if [ "$ENABLE_WIREGUARD" -eq 0 ]; then
   sed -i '/^[[:space:]]*wireguard \\$/d; /^[[:space:]]*jq \\$/d' "$GENERATED_USER_DATA"
 fi
 
-if [ "$ENABLE_TECNICI" -eq 1 ]; then
-  sed -i "s|__TECNICI_USERNAME__|${TECNICI_USERNAME}|g" "$GENERATED_USER_DATA"
-  sed -i "s|__TECNICI_PASSWORD_HASH__|${TECNICI_PASSWORD_HASH}|" "$GENERATED_USER_DATA"
+if [ "$ENABLE_SUPPORT" -eq 1 ]; then
+  sed -i "s|__SUPPORT_USERNAME__|${SUPPORT_USERNAME}|g" "$GENERATED_USER_DATA"
+  sed -i "s|__SUPPORT_PASSWORD_HASH__|${SUPPORT_PASSWORD_HASH}|" "$GENERATED_USER_DATA"
 else
   echo "=== Support account declined: removing its block from user-data ==="
-  sed -i '/# TECNICI_BLOCK_START/,/# TECNICI_BLOCK_END/d' "$GENERATED_USER_DATA"
+  sed -i '/# SUPPORT_BLOCK_START/,/# SUPPORT_BLOCK_END/d' "$GENERATED_USER_DATA"
 fi
 
 # ==== 6. Remaster the ISO ====
@@ -1230,6 +1246,6 @@ xorriso -as mkisofs -r \
 
 echo "ISO created: $ISO_OUT"
 echo "User: $TOTEM_USERNAME  WireGuard VPN: $([ "$ENABLE_WIREGUARD" -eq 1 ] && echo enabled || echo disabled)"
-echo "Support account: $([ "$ENABLE_TECNICI" -eq 1 ] && echo "$TECNICI_USERNAME" || echo "none")"
+echo "Support account: $([ "$ENABLE_SUPPORT" -eq 1 ] && echo "$SUPPORT_USERNAME" || echo "none")"
 echo "Keyboard: $KEYBOARD_LAYOUT  Timezone: $TIMEZONE  Orientation: $([ -n "$SCREEN_ROTATE_OPTION" ] && echo portrait || echo landscape)"
 echo "Xibo registration: $([ -n "$XIBO_REGISTER_LINE" ] && echo "automatic on $XIBO_HOST" || echo "Register via Code (no URL/key provided)")"
