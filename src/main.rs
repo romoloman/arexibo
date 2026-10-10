@@ -21,6 +21,7 @@ pub mod faults;
 pub mod adspace;
 pub mod syncgroup;
 pub mod authcode;
+mod tls;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

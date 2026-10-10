@@ -38,6 +38,7 @@ fn make_agent(proxy: Option<&str>) -> Result<ureq::Agent> {
     Ok(ureq::config::Config::builder()
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_global(Some(Duration::from_secs(15)))
+        .tls_config(crate::tls::http_config(false))
         .proxy(proxy)
         .build().into())
 }

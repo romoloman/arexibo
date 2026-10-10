@@ -101,6 +101,12 @@ display is authorized.
 * `--allow-offline`: deprecated and ignored (falling back to the cache is now the default); kept so existing scripts don't break.
 * `--no-verify`: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
 
+## TLS certificates
+
+Rust HTTPS requests (including CMS communication and media downloads) and XMR
+WebSocket connections trust both the bundled Mozilla roots and the Linux system
+CA store. Install your internal root CA in the system trust store and restart
+Arexibo
 
 ## Webpage widgets in "Open Natively" mode
 

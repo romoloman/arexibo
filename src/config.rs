@@ -563,9 +563,7 @@ impl CmsSettings {
     }
 
     pub fn make_agent(&self, no_verify: bool) -> Result<ureq::Agent> {
-        let tls_config = ureq::tls::TlsConfig::builder()
-            .disable_verification(no_verify)
-            .build();
+        let tls_config = crate::tls::http_config(no_verify);
         let proxy = if let Some(proxy) = &self.proxy {
             Some(ureq::Proxy::new(proxy)?)
         } else {
@@ -593,7 +591,7 @@ impl CmsSettings {
         let _ = aws_lc_rs::default_provider().install_default();
         let mut root_store = rustls::RootCertStore::empty();
         if !no_verify {
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            root_store = crate::tls::root_store();
         }
         let mut builder = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)

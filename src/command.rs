@@ -76,6 +76,7 @@ impl Command {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(TIMEOUT))
+            .tls_config(crate::tls::http_config(false))
             .build().into();
         let result = agent.run(request).context("making HTTP request")?;
 
