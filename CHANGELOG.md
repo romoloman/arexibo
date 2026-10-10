@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The player's own HTTPS requests (CMS, media downloads) and the XMR
+  WebSocket now also trust the Linux system CA store, besides the bundled
+  Mozilla roots, so a CMS behind an internal CA no longer needs `--no-verify`.
+
 ## 0.6.6 - Oct 2026
 
 - Fix image and video alignment being ignored: the CMS writes it as
@@ -20,6 +26,13 @@
 - The translator version is bumped, so cached layouts are re-downloaded and
   retranslated once at the first start after upgrading and pick up the
   fixes above without needing `--clear`.
+- Fix widgets that the CMS scales up with a CSS transform (e.g. the flip
+  clock) being cut off at their unscaled height: the shrink-to-fit script
+  forced `overflow: hidden` on `<html>`, which made `<body>`'s own overflow
+  clip at its untransformed box instead of the viewport.
+- Embedded widgets are shown at their authored size, as in the Xibo player:
+  content larger than the region is clipped instead of being shrunk to fit.
+  The shrink-to-fit fallback now skips modules declaring `scaleContent`.
 
 ## 0.6.5 - Oct 2026
 

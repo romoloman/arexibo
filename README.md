@@ -105,8 +105,11 @@ display is authorized.
 
 Rust HTTPS requests (including CMS communication and media downloads) and XMR
 WebSocket connections trust both the bundled Mozilla roots and the Linux system
-CA store. Install your internal root CA in the system trust store and restart
-Arexibo
+CA store, so a CMS behind an internal CA works without `--no-verify`. Install
+the root CA in the system trust store (on Debian/Ubuntu: copy it as a `.crt`
+file to `/usr/local/share/ca-certificates/` and run `update-ca-certificates`)
+and restart Arexibo. This applies to the player's own requests only, not to
+pages loaded by the embedded browser.
 
 ## Webpage widgets in "Open Natively" mode
 
