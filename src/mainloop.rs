@@ -395,9 +395,12 @@ pub struct Handler {
     /// not folded into pending_auth's.
     pending_network: bool,
     /// Consecutive register_display() connection failures (not
-    /// "unauthorized" -- that's pending_auth's own path). Threshold
-    /// triggers AwaitingConnection (see status doc).
+    /// "unauthorized" -- that's pending_auth's own path). With
+    /// `--disallow-offline`, the threshold triggers AwaitingConnection.
     consecutive_connection_failures: u32,
+    /// Offline mode (default; off with `--disallow-offline`): keep
+    /// playing the cached schedule while the CMS is unreachable.
+    allow_offline: bool,
     /// Set once GetWeather fails with "not present" (v6/v7-only on our
     /// v5 endpoint) -- avoids retrying every cycle once known.
     weather_unsupported: bool,
@@ -569,6 +572,7 @@ impl Handler {
 
         // try initial register call
         let mut network_pending = false;
+        let mut started_from_cache = false;
         let res = match xmds.register_display() {
             Err(e) => {
                 log::warn!("CMS not reachable or call failed: {e:#}");
@@ -586,6 +590,7 @@ impl Handler {
                         if let Ok(cached_sched) = Schedule::from_file(sched_file) {
                             log::info!("using cached schedule, experience may be degraded");
                             schedule = cached_sched;
+                            started_from_cache = true;
                         }
 
                         Some(settings)
@@ -704,6 +709,7 @@ impl Handler {
                                  splash_state: splash_state.clone(),
                                  pending_network: false,
                                  consecutive_connection_failures: 0,
+                                 allow_offline,
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
@@ -716,6 +722,12 @@ impl Handler {
                 slf.retranslate_cached_layouts();
             }
             slf.schedule_check();  // only useful in case of cached schedule
+            if started_from_cache {
+                // The cache already holds the schedule: join the Sync
+                // Group without waiting for a successful collection.
+                slf.first_collection_done = true;
+                slf.update_sync_group();
+            }
             Ok(slf)
         } else {
             // See pending_auth's/pending_network's own doc comments.
@@ -759,6 +771,7 @@ impl Handler {
                                  splash_state: splash_state.clone(),
                                  pending_network: network_pending,
                                  consecutive_connection_failures: 0,
+                                 allow_offline,
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
@@ -768,6 +781,19 @@ impl Handler {
             slf.sync_splash_state();
             slf.update_settings()?;
             Ok(slf)
+        }
+    }
+
+    /// Delay before the next collection cycle: short while waiting for
+    /// authorization or the network, and after repeated connection
+    /// failures, so a returning CMS is noticed promptly even while the
+    /// cached schedule keeps playing.
+    fn next_collect_interval(&self) -> Duration {
+        if self.pending_auth || self.pending_network
+            || self.consecutive_connection_failures >= MAX_CONSECUTIVE_CONNECTION_FAILURES {
+            PENDING_AUTH_RETRY_INTERVAL
+        } else {
+            Duration::from_secs(self.settings.collect_interval)
         }
     }
 
@@ -863,11 +889,7 @@ impl Handler {
                     // actively watching a freshly-set-up display come
                     // online, or for a totem whose WiFi just needs a
                     // few more seconds).
-                    let interval = if self.pending_auth || self.pending_network {
-                        PENDING_AUTH_RETRY_INTERVAL
-                    } else {
-                        Duration::from_secs(self.settings.collect_interval)
-                    };
+                    let interval = self.next_collect_interval();
                     collect = after(interval);
                 },
                 // timer channel that fires when screenshot is needed
@@ -1537,7 +1559,14 @@ impl Handler {
                 r
             }
             Err(e) => {
-                self.consecutive_connection_failures += 1;
+                self.consecutive_connection_failures =
+                    self.consecutive_connection_failures.saturating_add(1);
+                if self.allow_offline {
+                    log::warn!("register_display failed ({} consecutive): {e:#} -- CMS \
+                                unreachable, continuing with the cached schedule and \
+                                retrying", self.consecutive_connection_failures);
+                    return Ok(());
+                }
                 if self.consecutive_connection_failures < MAX_CONSECUTIVE_CONNECTION_FAILURES {
                     log::warn!("register_display failed ({}/{} consecutive): {e:#} -- \
                                 will retry next cycle without interrupting playback",
@@ -3757,7 +3786,7 @@ mod pending_network_tests {
     }
 
     #[test]
-    fn collect_once_only_reverts_to_the_splash_after_three_consecutive_failures() {
+    fn collect_once_with_disallow_offline_reverts_to_the_splash_after_three_consecutive_failures() {
         // Fields reset post-construction to simulate an already-
         // running, previously-healthy display (not Handler::new's own
         // startup-pending path, covered by the tests above).
@@ -3787,6 +3816,7 @@ mod pending_network_tests {
         // (which never had one to begin with).
         handler.pending_network = false;
         handler.consecutive_connection_failures = 0;
+        handler.allow_offline = false;  // strict mode (--disallow-offline)
         handler.layouts = vec![42];
         handler.sync_splash_state();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
@@ -3807,6 +3837,120 @@ mod pending_network_tests {
                 "must revert to the splash once the threshold is reached");
         assert!(togui_rx.try_recv().is_ok(),
                 "must push an empty-schedule update to the GUI once the threshold is reached");
+    }
+
+    struct Fixture {
+        handler: Handler,
+        togui_rx: crossbeam_channel::Receiver<ToGui>,
+        _senders: (crossbeam_channel::Sender<FromGui>,
+                   crossbeam_channel::Sender<server::DurationRequest>,
+                   crossbeam_channel::Sender<server::TriggerRequest>,
+                   crossbeam_channel::Sender<server::FaultRequest>),
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A Handler whose CMS is unreachable (nothing listens on its port).
+    fn offline_fixture(envdir: &Path, allow_offline: bool) -> Fixture {
+        let cms = CmsSettings {
+            address: format!("http://127.0.0.1:{}", free_port()),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let handler = Handler::new(&cms, false, envdir, true, allow_offline, false,
+                                   togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                   std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+            .expect("must construct successfully with an unreachable CMS");
+        Fixture { handler, togui_rx, _senders: (fromgui_tx, duration_tx, trigger_tx, fault_tx) }
+    }
+
+    fn write_cached_state(envdir: &Path, role: SyncRole, port: u16, with_schedule: bool) {
+        let settings = PlayerSettings { sync_role: role, sync_publisher_port: port,
+                                        ..PlayerSettings::default() };
+        settings.to_file(envdir.join("settings.json")).unwrap();
+        if with_schedule {
+            Schedule::default().to_file(envdir.join("sched.json")).unwrap();
+        }
+    }
+
+    #[test]
+    fn collect_once_with_offline_allowed_keeps_the_cached_schedule_playing() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        let h = &mut f.handler;
+        h.pending_network = false;
+        h.consecutive_connection_failures = 0;
+        h.layouts = vec![42];
+        h.sync_splash_state();
+        while f.togui_rx.try_recv().is_ok() {}
+        for n in 1..=6u32 {
+            h.collect_once().expect("a failed collection must not error");
+            assert_eq!(h.consecutive_connection_failures, n);
+            assert!(!h.pending_network, "must never revert to the splash (failure {n})");
+            assert_eq!(h.layouts, vec![42], "must keep the playing layouts (failure {n})");
+            assert!(f.togui_rx.try_recv().is_err(), "must not disrupt the display (failure {n})");
+        }
+    }
+
+    #[test]
+    fn next_collect_interval_is_short_after_repeated_failures_even_with_offline_allowed() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        let h = &mut f.handler;
+        h.pending_network = false;
+        h.pending_auth = false;
+        h.settings.collect_interval = 900;
+        h.consecutive_connection_failures = 0;
+        assert_eq!(h.next_collect_interval(), Duration::from_secs(900));
+        h.consecutive_connection_failures = MAX_CONSECUTIVE_CONNECTION_FAILURES - 1;
+        assert_eq!(h.next_collect_interval(), Duration::from_secs(900));
+        h.consecutive_connection_failures = MAX_CONSECUTIVE_CONNECTION_FAILURES;
+        assert_eq!(h.next_collect_interval(), PENDING_AUTH_RETRY_INTERVAL);
+        h.consecutive_connection_failures = 0;
+        assert_eq!(h.next_collect_interval(), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn offline_start_from_a_cached_schedule_starts_the_sync_lead() {
+        let envdir = test_envdir();
+        write_cached_state(&envdir, SyncRole::Lead, free_port(), true);
+        let f = offline_fixture(&envdir, true);
+        assert!(f.handler.first_collection_done, "a valid cache is enough to start syncing");
+        assert!(f.handler.sync_group.is_some(), "the Lead must be listening without a CMS");
+        assert!(matches!(f.handler.sync_group_role, SyncRole::Lead));
+    }
+
+    #[test]
+    fn offline_start_from_a_cached_schedule_connects_the_sync_follower() {
+        let envdir = test_envdir();
+        let port = free_port();
+        let _lead = syncgroup::SyncGroup::start_lead(port, std::time::Duration::ZERO)
+            .expect("starting a real Lead to connect to");
+        write_cached_state(&envdir, SyncRole::Follower { lead_addr: "127.0.0.1".into() }, port, true);
+        let f = offline_fixture(&envdir, true);
+        assert!(f.handler.first_collection_done);
+        assert!(f.handler.sync_group.is_some(), "the Follower must connect without a CMS");
+        assert!(matches!(f.handler.sync_group_role, SyncRole::Follower { .. }));
+    }
+
+    #[test]
+    fn offline_start_without_a_cached_schedule_does_not_start_the_sync_group() {
+        // The original guard stays: with nothing cached, wait for a
+        // successful collection before joining a Sync Group.
+        let envdir = test_envdir();
+        write_cached_state(&envdir, SyncRole::Lead, free_port(), false);
+        let f = offline_fixture(&envdir, true);
+        assert!(!f.handler.first_collection_done);
+        assert!(f.handler.sync_group.is_none());
     }
 }
 
