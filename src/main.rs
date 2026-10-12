@@ -22,6 +22,7 @@ pub mod adspace;
 pub mod syncgroup;
 pub mod authcode;
 mod tls;
+pub mod videowall;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -180,6 +181,23 @@ fn main_inner() -> anyhow::Result<()> {
     // FaultRequest).
     let (fault_tx, fault_rx) = crossbeam_channel::bounded(20);
 
+    // Video wall (Sync Group Phase 5): the same underlying channels/Arc,
+    // split into the sending half (given to Server, further down) and
+    // the receiving half (given to Handler, right below).
+    let video_command_store: server::VideoCommandStore =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let (video_ready_tx, video_ready_rx) = crossbeam_channel::unbounded();
+    let (video_position_tx, video_position_rx) = crossbeam_channel::unbounded();
+    let (video_item_tx, video_item_rx) = crossbeam_channel::unbounded();
+    let video_sync = server::VideoSyncHandles {
+        command_store: video_command_store.clone(),
+        ready_tx: video_ready_tx, position_tx: video_position_tx, item_tx: video_item_tx,
+    };
+    let video_sync_receivers = server::VideoSyncReceivers {
+        command_store: video_command_store, ready_rx: video_ready_rx,
+        position_rx: video_position_rx, item_rx: video_item_rx,
+    };
+
     // Live splash-screen status -- written by the Handler as its own
     // pending_auth/pending_network change, read by the splash screen
     // (see server::SplashState's own doc comment).
@@ -189,7 +207,7 @@ fn main_inner() -> anyhow::Result<()> {
     let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
                                               allow_offline, args.debug,
                                               togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
-                                              splash_state.clone())
+                                              video_sync_receivers, splash_state.clone())
         .context("creating backend handler")?;
     let mut settings = handler.player_settings();
 
@@ -230,7 +248,7 @@ fn main_inner() -> anyhow::Result<()> {
     let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
     let port = server::effective_port(settings.embedded_server_port);
     let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
-                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, splash_state.clone())
+                                         duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), video_sync.clone(), awaiting_code, splash_state.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
     let shard_port = webserver.port();
@@ -257,7 +275,7 @@ fn main_inner() -> anyhow::Result<()> {
         for shard in 2..=server::HTML_SHARD_COUNT {
             let addr = format!("127.0.0.{shard}");
             let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
-                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, splash_state.clone())
+                                                     duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), video_sync.clone(), awaiting_code, splash_state.clone())
                 .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
             shard_server.start_pool();
         }

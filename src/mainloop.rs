@@ -12,7 +12,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::{DecodePrivateKey, EncodePrivateKe
 use subprocess::Popen;
 use time::OffsetDateTime;
 use crate::config::{ArexiboMeta, CmsSettings, PlayerSettings, SyncRole};
-use crate::{logger, schedule, server, syncgroup, util, xmds, xmr};
+use crate::{logger, schedule, server, syncgroup, util, videowall, xmds, xmr};
 use crate::resource::{Cache, FetchedContent, ReqFile};
 use crate::faults;
 use crate::schedule::{Schedule, CycleState};
@@ -313,6 +313,41 @@ pub struct Handler {
     /// first-time connection, and resync_for_new_peer's own doc
     /// comment for what happens in response.
     sync_peer_connected: Receiver<()>,
+    /// Video wall (Sync Group Phase 5): shared with server.rs's own
+    /// embedded webserver -- written here (the widget's own JS polls
+    /// it), read there.
+    video_command_store: server::VideoCommandStore,
+    /// A page's JS reporting it has buffered enough to play (see
+    /// server::VideoReadyRequest) -- Follower: relayed to the real Lead
+    /// over the network. Lead: this machine's own local readiness,
+    /// tracked per round in `video_rounds` (a remote Follower's
+    /// readiness arrives via `video_ready_reports`).
+    video_ready_rx: Receiver<server::VideoReadyRequest>,
+    /// (Only ever sent by the Lead's own page -- a Follower's page only
+    /// receives Position broadcasts.) Relayed to every connected
+    /// Follower via sync_group's own broadcast.
+    video_position_rx: Receiver<server::VideoPositionRequest>,
+    /// A page telling its own mainloop that a video item should be
+    /// prepared, or has become the active one (see
+    /// server::VideoItemRequest). Only a Lead acts on these.
+    video_item_rx: Receiver<server::VideoItemRequest>,
+    /// Incoming video-wall messages from this display's own Lead (see
+    /// syncgroup::VideoCommand) -- `never()` whenever this display
+    /// isn't currently a Sync Group Follower, matching sync_commands.
+    video_commands: Receiver<syncgroup::VideoCommand>,
+    /// (Lead only; `never()` otherwise.) "Ready" reports from remote
+    /// Followers -- recorded into the matching round.
+    video_ready_reports: Receiver<syncgroup::VideoReadyReport>,
+    /// (Lead only.) In-flight video-wall rounds, one per video item: the
+    /// current item's (until everyone is ready and it is played) and,
+    /// thanks to lookahead, the next item's.
+    video_rounds: Vec<VideoRound>,
+    /// Id of the next round. Starts from the clock so ids differ across
+    /// restarts (a Follower may still hold ids from a previous Lead run).
+    next_video_round: u32,
+    /// Fires periodically while video_rounds is non-empty -- never()
+    /// otherwise, matching every other "currently inactive" timer here.
+    video_round_tick: Receiver<std::time::Instant>,
     /// Proof of Play accumulator (layout-level records only, see
     /// stats.rs). Flushed to the CMS at the end of every collection.
     stats: StatCollector,
@@ -382,12 +417,10 @@ pub struct Handler {
     /// registration every cycle, same as the "was authorized, lost it"
     /// case, just with a faster interval and a clearer log message.
     pending_auth: bool,
-    /// Live mirror of `pending_auth`/`pending_network` combined, shared
-    /// with the HTTP server's own splash screen (see
-    /// `server::SplashState`'s own doc comment) -- kept in sync via
-    /// `sync_splash_state` after changing either field, rather than
-    /// writing `pending_auth`/`pending_network` and expecting the
-    /// splash to somehow notice on its own.
+    /// Live mirror of `pending_auth`, shared with the HTTP server's own
+    /// splash screen (see `server::SplashStateStore`'s own doc
+    /// comment) -- kept in sync via `set_pending_auth` rather than
+    /// writing `pending_auth` directly.
     splash_state: server::SplashStateStore,
     /// Same pattern as `pending_auth`, for a different cause: no cache
     /// to fall back to, or `--disallow-offline` set (skips the cache
@@ -482,6 +515,40 @@ const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// See `Handler::consecutive_connection_failures`'s own doc comment.
 const MAX_CONSECUTIVE_CONNECTION_FAILURES: u32 = 3;
 
+/// Sync Group Phase 5 (video wall) -- see videowall::Round's own doc
+/// comment for what these mean. Not values confirmed with the user
+/// (only the qualitative design was) -- reasonable starting points,
+/// adjustable later without changing videowall::Round itself (it
+/// takes these as plain parameters, agnostic to their actual values).
+/// One video-wall round (Lead only): the handshake for one video item --
+/// Preload broadcast, wait until everyone is ready, then Play once the
+/// item is also actually the active one.
+struct VideoRound {
+    id: u32,
+    sync_key: String,
+    item: u32,
+    round: videowall::Round,
+    started: std::time::Instant,
+    /// This machine's own page has reported ready.
+    lead_ready: bool,
+    /// This machine's own page has made the item the active one.
+    start_requested: bool,
+}
+
+/// First round id of this run: the clock in seconds, so ids differ
+/// across restarts.
+fn initial_video_round() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32).unwrap_or(1).max(1)
+}
+
+/// Most rounds kept in flight; the oldest is dropped beyond this.
+const MAX_VIDEO_ROUNDS: usize = 8;
+
+const VIDEO_WALL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(10);
+const VIDEO_WALL_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const VIDEO_WALL_TICK_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Whether any *media*, *layout*, or *dependency* file in a collection
 /// cycle's own per-file download results failed -- used by
 /// `maybe_force_reload_after_purge` (see its own doc comment) to avoid
@@ -523,7 +590,12 @@ impl Handler {
                duration_rx: Receiver<server::DurationRequest>,
                trigger_rx: Receiver<server::TriggerRequest>,
                fault_rx: Receiver<server::FaultRequest>,
+               video_sync: server::VideoSyncReceivers,
                splash_state: server::SplashStateStore) -> Result<Self> {
+        let server::VideoSyncReceivers { command_store: video_command_store,
+                                          ready_rx: video_ready_rx,
+                                          position_rx: video_position_rx,
+                                          item_rx: video_item_rx } = video_sync;
         let (privkey, pubkey) = load_or_create_keypair(envdir)?;
         let mut cache = Cache::new(cms, envdir.join("res"), clear_cache, no_verify)
             .context("creating cache")?;
@@ -696,6 +768,10 @@ impl Handler {
                                  criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, fault_rx, overlay_expiry: never(),
+                                 video_command_store, video_ready_rx, video_position_rx, video_item_rx,
+                                 video_commands: never(), video_ready_reports: never(),
+                                 video_rounds: Vec::new(), next_video_round: initial_video_round(),
+                                 video_round_tick: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
                                  sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None, suppress_local_discovery_of: None,
@@ -758,6 +834,10 @@ impl Handler {
                                  criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
                                  shell_process: None, last_command_success: None,
                                  duration_rx, trigger_rx, fault_rx, overlay_expiry: never(),
+                                 video_command_store, video_ready_rx, video_position_rx, video_item_rx,
+                                 video_commands: never(), video_ready_reports: never(),
+                                 video_rounds: Vec::new(), next_video_round: initial_video_round(),
+                                 video_round_tick: never(),
                                  override_expiry: never(), override_revert_on_completion: false,
                                  sync_group: None, sync_group_role: SyncRole::None, first_collection_done: false,
                                  sync_commands: never(), pending_sync_keys: None, pending_sync_layout_id: None, suppress_local_discovery_of: None,
@@ -1008,6 +1088,11 @@ impl Handler {
                                 // only a genuine reload achieves.
                                 self.to_gui.send(ToGui::ForceReloadLayout(
                                     layout_id, ForceReloadReason::SyncGroup)).unwrap();
+                                // A new synchronized layout starts from
+                                // scratch: forget old video-wall state (the
+                                // pages reload; the Lead's own page starts
+                                // the next handshake itself).
+                                self.reset_video_wall();
                                 // Recorded only now (once actually
                                 // committed, never while merely
                                 // staged) -- see
@@ -1084,6 +1169,27 @@ impl Handler {
                         }
                     }
                 },
+                // Video wall: messages from this display's own Lead, a page's
+                // own JS, and the Lead's round tick -- see the matching
+                // on_* methods.
+                recv(self.video_commands) -> cmd => if let Ok(cmd) = cmd {
+                    self.on_video_command(cmd);
+                },
+                recv(self.video_ready_rx) -> req => if let Ok(req) = req {
+                    self.on_local_video_ready(req);
+                },
+                recv(self.video_ready_reports) -> report => if let Ok(report) = report {
+                    self.on_remote_video_ready(report);
+                },
+                recv(self.video_position_rx) -> req => if let Ok(req) = req {
+                    if let Some(sync_group) = &self.sync_group {
+                        sync_group.publish_video_position(req.sync_key, req.round, req.position_ms);
+                    }
+                },
+                recv(self.video_item_rx) -> req => if let Ok(req) = req {
+                    self.on_video_item(req);
+                },
+                recv(self.video_round_tick) -> _ => self.evaluate_video_rounds(),
                 // timer channel that fires to retry resources whose
                 // download failed during a normal collection -- see
                 // `resource_retry_queue`'s own doc comment.
@@ -1141,29 +1247,8 @@ impl Handler {
                         // failure here doesn't block the resource
                         // reload below, which must proceed regardless.
                         if self.cache.is_tracked_data_widget(widget_id) {
-                            let started = std::time::Instant::now();
-                            let result = self.cache.refresh_data_widget(
-                                widget_id, &mut self.xmds, std::time::Instant::now());
-                            // Diagnostic only, for a real report of the
-                            // whole mainloop freezing for extended
-                            // periods (minutes) with nothing else in it
-                            // able to run meanwhile -- every network
-                            // call here runs synchronously on this same
-                            // single thread (see make_agent's own doc
-                            // comment on timeout_global), so a slow
-                            // widget resource (suspected: one that
-                            // itself depends on a slow/unresponsive
-                            // external site) could plausibly explain it
-                            // even while eventually succeeding (thus
-                            // never hitting the Err branch below, which
-                            // was the only thing previously logged) --
-                            // logs elapsed time regardless of outcome so
-                            // a slow call is visible even when it
-                            // doesn't fail outright.
-                            let elapsed = started.elapsed();
-                            log::debug!("refresh_data_widget for widget {widget_id} took \
-                                        {elapsed:?}");
-                            if let Err(e) = result {
+                            if let Err(e) = self.cache.refresh_data_widget(
+                                widget_id, &mut self.xmds, std::time::Instant::now()) {
                                 log::warn!("refreshing data widget {widget_id} \
                                             after dataUpdate: {e:#}");
                             }
@@ -1175,13 +1260,7 @@ impl Handler {
                         // the same content again if the CMS has since
                         // bumped it; that's a harmless redundant fetch,
                         // not a correctness issue.
-                        let started = std::time::Instant::now();
-                        let result = self.cache.refresh_resource(widget_id, &mut self.xmds);
-                        // Diagnostic only -- see the same-purpose log
-                        // just above for refresh_data_widget.
-                        let elapsed = started.elapsed();
-                        log::debug!("refresh_resource for widget {widget_id} took {elapsed:?}");
-                        match result {
+                        match self.cache.refresh_resource(widget_id, &mut self.xmds) {
                             // Reload the *returned* id, not widget_id --
                             // they differ for a widget nested inside
                             // another resource's combined HTML, where
@@ -2199,6 +2278,175 @@ impl Handler {
         self.sync_apply_timer = after(delay);
     }
 
+    /// Forgets every video-wall round and any state the pages could
+    /// still pick up (stale ids from before).
+    fn reset_video_wall(&mut self) {
+        self.video_rounds.clear();
+        self.video_round_tick = never();
+        self.video_command_store.lock().expect("poisoned lock").clear();
+    }
+
+    /// (Follower.) Relays a message from the Lead into the state the
+    /// page polls.
+    fn on_video_command(&mut self, cmd: syncgroup::VideoCommand) {
+        let mut store = self.video_command_store.lock().expect("poisoned lock");
+        match cmd {
+            syncgroup::VideoCommand::Preload { sync_key, target, item, round } => {
+                store.entry(sync_key).or_default()
+                    .push_preload(server::VideoPreload { round, item, target });
+            }
+            syncgroup::VideoCommand::Play { sync_key, round } => {
+                store.entry(sync_key).or_default().play = Some(server::VideoPlay { round });
+            }
+            syncgroup::VideoCommand::Position { sync_key, position_ms, round } => {
+                store.entry(sync_key).or_default().position =
+                    Some(server::VideoPosition { round, position_ms });
+            }
+        }
+    }
+
+    /// This machine's own page is ready for `req.round`.
+    fn on_local_video_ready(&mut self, req: server::VideoReadyRequest) {
+        match &self.settings.sync_role {
+            SyncRole::Lead => {
+                if let Some(r) = self.video_rounds.iter_mut()
+                    .find(|r| r.id == req.round && r.sync_key == req.sync_key) {
+                    r.lead_ready = true;
+                }
+                self.evaluate_video_rounds();
+            }
+            SyncRole::Follower { .. } => {
+                if let Some(sync_group) = &self.sync_group {
+                    sync_group.report_video_ready(&req.sync_key, req.round);
+                }
+            }
+            SyncRole::None => {}
+        }
+    }
+
+    /// (Lead.) A remote Follower's "ready" report.
+    fn on_remote_video_ready(&mut self, report: syncgroup::VideoReadyReport) {
+        if let Some(r) = self.video_rounds.iter_mut()
+            .find(|r| r.id == report.round && r.sync_key == report.sync_key) {
+            r.round.record_ready(&report.follower_addr);
+        }
+        self.evaluate_video_rounds();
+    }
+
+    /// (Lead only; ignored otherwise.) The page asks to prepare an item
+    /// (lookahead) or says it has become the active one.
+    fn on_video_item(&mut self, req: server::VideoItemRequest) {
+        if !matches!(self.settings.sync_role, SyncRole::Lead) || self.sync_group.is_none() {
+            return;
+        }
+        let idx = self.prepare_video_round(&req.sync_key, req.item, &req.target);
+        if req.phase == server::VideoItemPhase::Start {
+            self.video_rounds[idx].start_requested = true;
+            self.evaluate_video_rounds();
+        }
+    }
+
+    /// Returns the index of the round for (`key`, `item`), starting one
+    /// if none is in flight: broadcasts Preload to every connected
+    /// Follower, puts it in this machine's own state too, and arms the
+    /// tick.
+    fn prepare_video_round(&mut self, key: &str, item: u32, target: &str) -> usize {
+        if let Some(i) = self.video_rounds.iter()
+            .position(|r| r.sync_key == key && r.item == item) {
+            return i;
+        }
+        let id = self.next_video_round;
+        self.next_video_round = self.next_video_round.wrapping_add(1).max(1);
+        let connected = self.sync_group.as_ref()
+            .map(|g| g.connected_follower_addrs()).unwrap_or_default();
+        if let Some(sync_group) = &self.sync_group {
+            sync_group.publish_video_preload(key.to_string(), id, item, target.to_string());
+        }
+        self.video_command_store.lock().expect("poisoned lock")
+            .entry(key.to_string()).or_default()
+            .push_preload(server::VideoPreload { round: id, item, target: target.to_string() });
+        let now = std::time::Instant::now();
+        self.video_rounds.push(VideoRound {
+            id, sync_key: key.to_string(), item,
+            round: videowall::Round::new(key.to_string(), connected, VIDEO_WALL_CONFIRM_TIMEOUT,
+                                         VIDEO_WALL_DISCONNECT_TIMEOUT, now),
+            started: now, lead_ready: false, start_requested: false,
+        });
+        if self.video_rounds.len() > MAX_VIDEO_ROUNDS {
+            self.video_rounds.remove(0);
+        }
+        if self.video_rounds.len() == 1 {
+            self.video_round_tick = tick(VIDEO_WALL_TICK_INTERVAL);
+        }
+        self.video_rounds.len() - 1
+    }
+
+    /// (Lead.) Plays every round whose item is active and that is either
+    /// ready everywhere or has waited too long. A Follower that did not
+    /// confirm in time no longer aborts anything: playback goes ahead
+    /// and that display catches up through the Position corrections.
+    fn evaluate_video_rounds(&mut self) {
+        let connected = self.sync_group.as_ref()
+            .map(|g| g.connected_follower_addrs()).unwrap_or_default();
+        let now = std::time::Instant::now();
+        let mut i = 0;
+        while i < self.video_rounds.len() {
+            let r = &mut self.video_rounds[i];
+            let followers = r.round.tick(&connected, now);
+            let everyone_ready = followers == videowall::RoundOutcome::ProceedToPlay && r.lead_ready;
+            let timed_out = followers == videowall::RoundOutcome::SkipToNext
+                || now.duration_since(r.started) >= VIDEO_WALL_CONFIRM_TIMEOUT;
+            if r.start_requested && (everyone_ready || timed_out) {
+                let r = self.video_rounds.remove(i);
+                if !everyone_ready {
+                    log::warn!("Sync Group: video wall round {} (item {} of {:?}) not \
+                                confirmed ready everywhere in time -- playing anyway", r.id,
+                               r.item, r.sync_key);
+                }
+                if let Some(sync_group) = &self.sync_group {
+                    sync_group.publish_video_play(r.sync_key.clone(), r.id);
+                }
+                self.video_command_store.lock().expect("poisoned lock")
+                    .entry(r.sync_key).or_default().play = Some(server::VideoPlay { round: r.id });
+            } else {
+                i += 1;
+            }
+        }
+        if self.video_rounds.is_empty() {
+            self.video_round_tick = never();
+        }
+    }
+
+    /// Ends whatever Sync Group layout override is currently active,
+    /// reverting to normal schedule resolution -- the synchronized
+    /// layout's own scheduled window ending. Also forgets the video-wall
+    /// rounds.
+    fn end_sync_layout_override(&mut self) {
+        self.override_layout = None;
+        self.sync_layout_active = false;
+        self.reset_video_wall();
+        if let Some(sync_group) = &self.sync_group {
+            sync_group.set_current_sync_keys(vec![]);
+        }
+        // (Follower only.) If the CMS swapped which layout a live
+        // Synchronised Event points to (same sync_keys, e.g. visually
+        // similar templates), a Follower whose own schedule.xml hadn't
+        // downloaded that change yet could match the Lead's fresh
+        // Command against its own still-stale schedule, resolving to
+        // the superseded layout. This being called means this
+        // display's own view has genuinely caught up -- reconnecting
+        // the SyncGroup now re-triggers the Lead's own
+        // `sync_peer_connected` reaction (already unconditional there,
+        // no way to tell a first connection from a reconnection apart),
+        // which re-publishes its current sync_keys fresh. Simpler than
+        // a dedicated Follower -> Lead "ready" signal (the existing
+        // connection is one-way, PUB/SUB).
+        if let SyncRole::Follower { lead_addr } = &self.settings.sync_role {
+            let lead_addr = lead_addr.clone();
+            self.connect_as_follower(&lead_addr);
+        }
+    }
+
     /// Resolves a received sync_keys set against this display's own
     /// schedule and cache -- returns the layout id to apply, or None
     /// if this display isn't part of this synchronized grouping right
@@ -2312,31 +2560,7 @@ impl Handler {
                 Some(id) if !self.schedule.is_sync_gated(id, &self.criteria) => {
                     log::info!("Sync Group: synchronized layout {id}'s own scheduled \
                                 window ended -- reverting to normal schedule");
-                    self.override_layout = None;
-                    self.sync_layout_active = false;
-                    if let Some(sync_group) = &self.sync_group {
-                        sync_group.set_current_sync_keys(vec![]);
-                    }
-                    // (Follower only.) If the CMS swapped which layout
-                    // a live Synchronised Event points to (same
-                    // sync_keys, e.g. visually similar templates), a
-                    // Follower whose own schedule.xml hadn't downloaded
-                    // that change yet could match the Lead's fresh
-                    // Command against its own still-stale schedule,
-                    // resolving to the superseded layout. This expiry
-                    // check firing means this display's own view has
-                    // genuinely caught up -- reconnecting the SyncGroup
-                    // now re-triggers the Lead's own
-                    // `sync_peer_connected` reaction (already
-                    // unconditional there, no way to tell a first
-                    // connection from a reconnection apart), which
-                    // re-publishes its current sync_keys fresh. Simpler
-                    // than a dedicated Follower -> Lead "ready" signal
-                    // (the existing connection is one-way, PUB/SUB).
-                    if let SyncRole::Follower { lead_addr } = &self.settings.sync_role {
-                        let lead_addr = lead_addr.clone();
-                        self.connect_as_follower(&lead_addr);
-                    }
+                    self.end_sync_layout_override();
                 }
                 Some(_) => {}
                 // Defensive: shouldn't happen (only ever set alongside
@@ -2603,6 +2827,7 @@ impl Handler {
             return;
         }
         self.sync_group_role = self.settings.sync_role.clone();
+        self.reset_video_wall();
         match &self.settings.sync_role {
             SyncRole::None => {
                 if self.sync_group.take().is_some() {
@@ -2611,6 +2836,8 @@ impl Handler {
                 }
                 self.sync_commands = never();
                 self.sync_peer_connected = never();
+                self.video_commands = never();
+                self.video_ready_reports = never();
             }
             SyncRole::Lead => {
                 let switch_delay = Duration::from_millis(self.settings.sync_switch_delay);
@@ -2619,14 +2846,18 @@ impl Handler {
                     Ok(g) => {
                         self.sync_peer_connected = g.peer_connected()
                             .expect("a Lead's own peer_connected() is always Some").clone();
+                        self.video_ready_reports = g.video_ready()
+                            .expect("a Lead's own video_ready() is always Some").clone();
                         self.sync_group = Some(g);
                     }
                     Err(e) => {
                         log::error!("Sync Group: starting as Lead: {e:#}");
                         self.sync_peer_connected = never();
+                        self.video_ready_reports = never();
                     }
                 }
                 self.sync_commands = never();
+                self.video_commands = never();
             }
             SyncRole::Follower { lead_addr } => {
                 let lead_addr = lead_addr.clone();
@@ -2649,15 +2880,19 @@ impl Handler {
         let addr = format!("{lead_addr}:{}", self.settings.sync_publisher_port);
         log::info!("Sync Group: starting/reconnecting as Follower, Lead at {addr}");
         self.sync_group = None;
+        self.video_ready_reports = never();
         match syncgroup::SyncGroup::start_follower(addr) {
             Ok(g) => {
                 self.sync_commands = g.commands()
                     .expect("a Follower's own commands() is always Some").clone();
+                self.video_commands = g.video_commands()
+                    .expect("a Follower's own video_commands() is always Some").clone();
                 self.sync_group = Some(g);
             }
             Err(e) => {
                 log::error!("Sync Group: starting as Follower: {e:#}");
                 self.sync_commands = never();
+                self.video_commands = never();
             }
         }
         self.sync_peer_connected = never();
@@ -2740,12 +2975,7 @@ impl Handler {
                 crate::resource::ReqFile::Resource { id, .. } => Some(*id),
                 _ => None,
             };
-            let started = std::time::Instant::now();
-            let result = self.cache.download(file.clone(), &mut self.xmds);
-            // Diagnostic only -- see the DataUpdate handler's own
-            // same-purpose log for the full story.
-            log::debug!("retry download for {desc} took {:?}", started.elapsed());
-            match result {
+            match self.cache.download(file.clone(), &mut self.xmds) {
                 Ok(()) => {
                     log::info!("retry succeeded for {desc}");
                     if let Some(widget_id) = widget_id {
@@ -2771,13 +3001,7 @@ impl Handler {
         // exactly as the original DataUpdate handler did).
         let dataupdate_queue = std::mem::take(&mut self.dataupdate_retry_queue);
         for (widget_id, attempts) in dataupdate_queue {
-            let started = std::time::Instant::now();
-            let result = self.cache.refresh_resource(widget_id, &mut self.xmds);
-            // Diagnostic only -- see the DataUpdate handler's own
-            // same-purpose log for the full story.
-            log::debug!("retry refresh_resource for widget {widget_id} took {:?}",
-                        started.elapsed());
-            match result {
+            match self.cache.refresh_resource(widget_id, &mut self.xmds) {
                 Ok(fetch_id) => {
                     log::info!("retry succeeded for dataUpdate widget {widget_id}");
                     self.to_gui.send(ToGui::ReloadWidget(fetch_id)).unwrap();
@@ -3237,6 +3461,17 @@ fn timezone_to_report(cms_display_time_zone: &str, system_timezone: &str) -> Str
     }
 }
 
+
+#[cfg(test)]
+fn test_video_sync_receivers() -> server::VideoSyncReceivers {
+    server::VideoSyncReceivers {
+        command_store: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        ready_rx: crossbeam_channel::unbounded().1,
+        position_rx: crossbeam_channel::unbounded().1,
+        item_rx: crossbeam_channel::unbounded().1,
+    }
+}
+
 #[cfg(test)]
 mod timezone_to_report_tests {
     use super::*;
@@ -3506,7 +3741,8 @@ mod pending_auth_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully, not error out, while pending authorization");
         assert!(handler.pending_auth, "must be marked as pending authorization");
         assert_eq!(handler.player_settings(), PlayerSettings::default(),
@@ -3531,7 +3767,8 @@ mod pending_auth_tests {
 
         // Call 1 (inside Handler::new itself).
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully while pending");
         assert!(handler.pending_auth);
         assert_eq!(mock.call_count(), 1);
@@ -3571,7 +3808,8 @@ mod pending_auth_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully with a blank placeholder address");
         handler.collect_once().expect(
             "must not error on a blank placeholder address, just skip the cycle quietly");
@@ -3651,7 +3889,8 @@ mod deauthorization_tests {
 
         // Call 1 (Handler::new, "READY"): normal, authorized startup.
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert!(!handler.pending_auth);
         // Simulate "already running, showing some real content" --
         // schedule_check() only ever populates this from a real,
@@ -3742,7 +3981,8 @@ mod pending_network_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully, not bail out, when the network/CMS \
                      is unreachable and no cache exists yet");
         assert!(handler.pending_network, "must be marked as pending network specifically");
@@ -3777,6 +4017,7 @@ mod pending_network_tests {
 
         let handler = Handler::new(&cms, false, &envdir, true, false, false,
                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                    test_video_sync_receivers(),
                                     std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully, not bail out, even with --disallow-offline");
         assert!(handler.pending_network,
@@ -3809,6 +4050,7 @@ mod pending_network_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
                                         std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully, not bail out");
         // Simulate "was fine until just now, actually showing a real
@@ -3868,6 +4110,7 @@ mod pending_network_tests {
         let (fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let handler = Handler::new(&cms, false, envdir, true, allow_offline, false,
                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                   test_video_sync_receivers(),
                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully with an unreachable CMS");
         Fixture { handler, togui_rx, _senders: (fromgui_tx, duration_tx, trigger_tx, fault_tx) }
@@ -4040,7 +4283,8 @@ mod sticky_ws_address_tests {
 
         // Call 1 (inside Handler::new): gets the real address.
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         // Call 2 (collect_once): CMS now says zmq/empty -- must NOT
@@ -4069,7 +4313,8 @@ mod sticky_ws_address_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
@@ -4096,7 +4341,8 @@ mod sticky_ws_address_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "");
 
         let _ = handler.collect_once();
@@ -4122,7 +4368,8 @@ mod sticky_ws_address_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:1");
 
         let _ = handler.collect_once();
@@ -4152,7 +4399,8 @@ mod sticky_ws_address_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, "ws://127.0.0.1:8080");
 
         let _ = handler.collect_once();
@@ -4228,6 +4476,7 @@ mod display_rename_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let handler = Handler::new(&cms, false, envdir, true, true, false,
                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                   test_video_sync_receivers(),
                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         (handler, togui_rx)
     }
@@ -4368,7 +4617,8 @@ mod port_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         assert!(!envdir.join("res").join("leftover.html").exists(),
                 "a changed embedded server port must force a full cache purge -- \
@@ -4397,7 +4647,8 @@ mod port_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         assert!(envdir.join("res").join("leftover.html").exists(),
                 "an unchanged effective port must not purge the cache");
@@ -4421,7 +4672,8 @@ mod port_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.embedded_server_port, 9696);
 
         let err = handler.collect_once().expect_err(
@@ -4446,7 +4698,8 @@ mod port_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert!(!handler.settings.embedded_server_allow_wan);
 
         let err = handler.collect_once().expect_err(
@@ -4469,7 +4722,8 @@ mod port_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // May still error further down (e.g. RequiredFiles against
         // this minimal mock) -- what matters is it's not RestartRequired.
@@ -4542,7 +4796,8 @@ mod version_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         assert!(!envdir.join("res").join("leftover.html").exists(),
                 "a changed Arexibo version must force a full cache purge -- cached \
@@ -4572,7 +4827,8 @@ mod version_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         assert!(envdir.join("res").join("leftover.html").exists(),
                 "an unchanged version must not purge the cache");
@@ -4594,7 +4850,8 @@ mod version_change_forces_cache_purge_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let _handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         assert!(envdir.join("res").join("preexisting.html").exists(),
                 "a first-ever run (no prior arexibo.json) must not purge -- nothing \
@@ -4680,7 +4937,8 @@ mod send_status_update_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // Simulate exactly what FromGui::Showing(layout) does in run()'s
         // own select! loop -- without needing to drive that full,
@@ -4714,7 +4972,8 @@ mod send_status_update_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         handler.settings.send_current_layout_as_status_update = false;
 
         handler.current_layout = 4242;
@@ -4745,7 +5004,8 @@ mod send_status_update_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         handler.send_status_update();
 
         let requests = captured.lock().unwrap();
@@ -4806,7 +5066,8 @@ mod sync_role_change_forces_restart_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.sync_role, SyncRole::None);
 
         let err = handler.collect_once().expect_err(
@@ -4826,7 +5087,8 @@ mod sync_role_change_forces_restart_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.sync_role, SyncRole::Lead);
 
         let err = handler.collect_once().expect_err(
@@ -4853,7 +5115,8 @@ mod sync_role_change_forces_restart_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         assert_eq!(handler.settings.sync_role,
                    SyncRole::Follower { lead_addr: "192.168.1.235".into() });
 
@@ -4879,7 +5142,8 @@ mod sync_role_change_forces_restart_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         if let Err(e) = handler.collect_once() {
             assert!(e.root_cause().downcast_ref::<RestartRequired>().is_none(),
@@ -4905,7 +5169,8 @@ mod sync_role_change_forces_restart_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // Handler::new's own initial registration already resolved
         // sync_role to Lead (confirmed by the mock's own "lead" value
@@ -4993,7 +5258,8 @@ mod handle_trigger_code_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         Handler::new(&cms, false, &envdir, true, true, false,
-                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap()
+                     togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap()
     }
 
     /// A minimal <actions> Schedule, matching the real capture's own
@@ -5159,7 +5425,9 @@ mod handle_trigger_code_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
   <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="0" groupKey="0" playCount="0" maxPlaysPerHour="0"/>
@@ -5235,6 +5503,7 @@ mod handle_trigger_code_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
                                         std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
             .expect("must construct successfully even against an unreachable CMS");
 
@@ -5299,57 +5568,6 @@ mod handle_trigger_code_tests {
     }
 
     #[test]
-    fn layout_completed_reloads_a_cycle_playback_group_of_one() {
-        // Unlike the ordinary case above, a Cycle Playback group still
-        // needs this signal even with only one (currently eligible)
-        // member -- its own play count has to advance regardless (see
-        // record_cycle_group_completion's own doc comment).
-        let port = start_mock_ready();
-        let cms = test_cms_settings(port);
-        let envdir = test_envdir();
-        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
-        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
-        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
-        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
-        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
-        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
-
-        let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
-  <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="1" groupKey="42" playCount="0" maxPlaysPerHour="0"/>
-  <default file="913" duration="60"/>
-</schedule>"#;
-        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
-        handler.schedule = Schedule::parse(&tree).unwrap();
-        handler.cache.insert_fake_layout_for_test(913);
-        handler.layouts = vec![913];
-        handler.current_layout = 913;
-        while togui_rx.try_recv().is_ok() {} // drain any startup messages
-
-        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
-            handler.override_revert_on_completion = false;
-            handler.schedule_check();
-        } else if handler.override_layout.is_none() {
-            let was_cycle_member = handler.schedule.record_cycle_group_completion(
-                handler.current_layout, &handler.criteria, &mut handler.cycle_state);
-            let in_sync_group = handler.sync_layout_active;
-            let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
-            let available: Vec<_> = resolved.iter().copied()
-                .filter(|&id| handler.cache.get_layout(id).is_some())
-                .collect();
-            if available == handler.layouts && available.len() == 1
-               && (was_cycle_member || in_sync_group) {
-                handler.to_gui.send(ToGui::ForceReloadLayout(
-                    available[0], ForceReloadReason::CycleGroupOfOne)).unwrap();
-            }
-        }
-
-        let msg = togui_rx.try_recv().expect("a Cycle Playback group of one must still reload");
-        assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::CycleGroupOfOne)),
-                "must be force-reloaded with the CycleGroupOfOne reason");
-    }
-
-    #[test]
     fn layout_completed_uses_the_right_reason_when_sync_role_is_set_but_no_override_is_active() {
         // sync_role alone is too broad for the log *reason* -- only
         // sync_layout_active (a genuine active override) should count
@@ -5366,6 +5584,7 @@ mod handle_trigger_code_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
                                         std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
@@ -5408,6 +5627,60 @@ mod handle_trigger_code_tests {
         assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::SingleLayoutLoop)),
                 "must reload (genuine schedule entry), but logged as SingleLayoutLoop, not \
                  SyncGroup, since no override is actually active");
+    }
+
+    #[test]
+    fn layout_completed_reloads_a_cycle_playback_group_of_one() {
+        // Unlike the ordinary case above, a Cycle Playback group still
+        // needs this signal even with only one (currently eligible)
+        // member -- its own play count has to advance regardless (see
+        // record_cycle_group_completion's own doc comment).
+        let port = start_mock_ready();
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::bounded(5);
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+
+        let xml = r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <layout file="913" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="1" priority="0" syncEvent="0" shareOfVoice="0" duration="60" isGeoAware="0" geoLocation="" cyclePlayback="1" groupKey="42" playCount="0" maxPlaysPerHour="0"/>
+  <default file="913" duration="60"/>
+</schedule>"#;
+        let tree = elementtree::Element::from_reader(xml.as_bytes()).unwrap();
+        handler.schedule = Schedule::parse(&tree).unwrap();
+        handler.cache.insert_fake_layout_for_test(913);
+        handler.layouts = vec![913];
+        handler.current_layout = 913;
+        while togui_rx.try_recv().is_ok() {} // drain any startup messages
+
+        if handler.override_revert_on_completion && handler.override_layout.take().is_some() {
+            handler.override_revert_on_completion = false;
+            handler.schedule_check();
+        } else if handler.override_layout.is_none() {
+            let was_cycle_member = handler.schedule.record_cycle_group_completion(
+                handler.current_layout, &handler.criteria, &mut handler.cycle_state);
+            let in_sync_group = handler.sync_layout_active;
+            let resolved = handler.schedule.layouts_now(&handler.criteria, &mut handler.cycle_state);
+            let available: Vec<_> = resolved.iter().copied()
+                .filter(|&id| handler.cache.get_layout(id).is_some())
+                .collect();
+            if available == handler.layouts && available.len() == 1 {
+                let reason = if was_cycle_member { ForceReloadReason::CycleGroupOfOne }
+                             else if in_sync_group { ForceReloadReason::SyncGroup }
+                             else { ForceReloadReason::SingleLayoutLoop };
+                handler.to_gui.send(ToGui::ForceReloadLayout(available[0], reason)).unwrap();
+            }
+        }
+
+        let msg = togui_rx.try_recv().expect("a Cycle Playback group of one must still reload");
+        assert!(matches!(msg, ToGui::ForceReloadLayout(913, ForceReloadReason::CycleGroupOfOne)),
+                "must be force-reloaded with the CycleGroupOfOne reason");
     }
 }
 
@@ -5513,7 +5786,8 @@ mod xmr_disconnected_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // Sanity check: clear whatever xmr_retry_key ended up as from
         // construction (e.g. if the mock's bare "READY" response, with
@@ -5624,7 +5898,8 @@ mod sticky_address_applies_to_first_connection_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // The in-memory settings must reflect the corrected address...
         assert_eq!(handler.settings.xmr_web_socket_address_in_use, good_address);
@@ -5921,7 +6196,8 @@ mod screenshot_requested_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         let _ = count_screenshot_messages(&togui_rx);
 
         handler.settings.screen_shot_requested = true;
@@ -6087,7 +6363,8 @@ mod attempt_cms_migration_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // A second, independent CMS to "migrate" to -- also validates
         // successfully.
@@ -6121,7 +6398,8 @@ mod attempt_cms_migration_tests {
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
 
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // new_cms_address/new_cms_key left empty (the default, no
         // migration requested) -- must not error at all.
@@ -6241,7 +6519,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         handler.rearm_data_refresh_timer();
 
@@ -6261,7 +6540,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // Must not panic, and must leave the timer disarmed afterward
         // (re-confirms rearm gets called even with nothing to do).
@@ -6287,7 +6567,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
 
         // With the flag unset (the ordinary case, every other
@@ -6334,7 +6615,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
 
         // The flag is set, but 4242.xlf.html was never actually
@@ -6362,13 +6644,13 @@ mod data_refresh_timer_tests {
         // must NOT count -- those already self-heal via
         // resource_retry_queue/note_layout_file_downloaded once they
         // eventually succeed.
+        assert!(!any_non_resource_failure(&[]),
+                "an empty result (e.g. nothing needed downloading) must not count as a \
+                 failure");
         use crate::resource::InventoryEntry;
         fn simple(typ: &'static str, id: i64, complete: bool) -> InventoryEntry {
             InventoryEntry::Simple { typ, id, complete }
         }
-        assert!(!any_non_resource_failure(&[]),
-                "an empty result (e.g. nothing needed downloading) must not count as a \
-                 failure");
         assert!(!any_non_resource_failure(&[simple("media", 1, true), simple("layout", 2, true)]),
                 "all-success must not count as a failure");
         assert!(any_non_resource_failure(&[simple("media", 1, false)]),
@@ -6407,7 +6689,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
 
         handler.current_layout = 4242;
@@ -6445,7 +6728,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         while togui_rx.try_recv().is_ok() {} // drain any startup messages
         handler.current_layout = 4242;
 
@@ -6506,7 +6790,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // Already fully cached (matching md5, an empty Vec here) --
         // simulating this exact layout having been downloaded in an
@@ -6542,7 +6827,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // Not cached at all -- and start_mock_ready's own GetResource/
         // GetFile-equivalent endpoints aren't wired up to serve real
@@ -6594,7 +6880,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         // Drain whatever update_settings() sent during construction
         // (a ToGui::Settings) so it doesn't get mistaken for the
         // ReloadWidget message this test is actually checking for.
@@ -6634,7 +6921,8 @@ mod data_refresh_timer_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         // Real overlay XML shape (see schedule.rs's own
         // parses_real_overlays_xml_from_user test) -- overlay layout
@@ -6745,7 +7033,8 @@ mod flush_faults_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         handler.faults.record(faults::Fault::new(9001, "test fault"));
         handler.flush_faults();
@@ -6766,7 +7055,8 @@ mod flush_faults_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         handler.flush_faults();
 
@@ -6803,7 +7093,9 @@ mod flush_faults_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
 
         handler.faults.record(faults::Fault::new(9001, "test fault"));
         handler.flush_faults();
@@ -6858,7 +7150,8 @@ mod sync_group_schedule_check_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                    togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         (handler, togui_rx)
     }
 
@@ -7699,6 +7992,269 @@ mod sync_group_schedule_check_tests {
                    "an already-pending sync_keys value must be left completely \
                     untouched when a different, not-yet-cached layout is discovered");
     }
+
+    fn lead_handler_with_real_sync_group() -> Handler {
+        let (mut handler, _togui_rx) = test_handler();
+        handler.settings.sync_role = SyncRole::Lead;
+        handler.sync_group = Some(syncgroup::SyncGroup::start_lead(0, Duration::ZERO).unwrap());
+        handler
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A Lead handler with a real Lead SyncGroup and a real Follower
+    /// SyncGroup connected to it, standing in for a remote display.
+    fn lead_with_connected_follower() -> (Handler, syncgroup::SyncGroup) {
+        let port = free_port();
+        let (mut handler, _togui_rx) = test_handler();
+        handler.settings.sync_role = SyncRole::Lead;
+        let lead = syncgroup::SyncGroup::start_lead(port, Duration::ZERO).unwrap();
+        handler.video_ready_reports = lead.video_ready().unwrap().clone();
+        handler.sync_group = Some(lead);
+        let follower = syncgroup::SyncGroup::start_follower(format!("127.0.0.1:{port}")).unwrap();
+        // The ZMTP subscription settles a moment after the connection:
+        // publish until the Follower hears something.
+        let rx = follower.video_commands().unwrap().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut warmed = false;
+        while std::time::Instant::now() < deadline && !warmed {
+            handler.sync_group.as_ref().unwrap().publish_video_position("warmup".into(), 0, 0);
+            warmed = rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        }
+        assert!(warmed, "the Follower never connected to the Lead");
+        (handler, follower)
+    }
+
+    fn item(key: &str, item: u32, phase: server::VideoItemPhase) -> server::VideoItemRequest {
+        server::VideoItemRequest { sync_key: key.to_string(), item,
+                                   target: format!("{item}.mp4"), phase }
+    }
+
+    fn state(handler: &Handler, key: &str) -> Option<server::VideoWallState> {
+        handler.video_command_store.lock().unwrap().get(key).cloned()
+    }
+
+    #[test]
+    fn prepare_starts_a_round_and_fills_the_local_state() {
+        let mut handler = lead_handler_with_real_sync_group();
+        handler.on_video_item(item("wall1", 2, server::VideoItemPhase::Prepare));
+        assert_eq!(handler.video_rounds.len(), 1);
+        let r = &handler.video_rounds[0];
+        assert_eq!((r.sync_key.as_str(), r.item, r.start_requested, r.lead_ready),
+                   ("wall1", 2, false, false));
+        let st = state(&handler, "wall1").expect("the page must see the preload");
+        assert_eq!(st.preloads, vec![server::VideoPreload { round: r.id, item: 2,
+                                                              target: "2.mp4".to_string() }]);
+        assert!(st.play.is_none());
+    }
+
+    #[test]
+    fn a_repeated_prepare_for_the_same_item_reuses_the_round() {
+        let mut handler = lead_handler_with_real_sync_group();
+        for _ in 0..3 {
+            handler.on_video_item(item("wall1", 1, server::VideoItemPhase::Prepare));
+        }
+        assert_eq!(handler.video_rounds.len(), 1);
+        assert_eq!(state(&handler, "wall1").unwrap().preloads.len(), 1);
+    }
+
+    #[test]
+    fn start_without_a_prepared_round_creates_one_and_marks_it_started() {
+        let mut handler = lead_handler_with_real_sync_group();
+        handler.on_video_item(item("wall1", 0, server::VideoItemPhase::Start));
+        assert_eq!(handler.video_rounds.len(), 1);
+        assert!(handler.video_rounds[0].start_requested);
+    }
+
+    #[test]
+    fn the_play_waits_for_the_item_to_start_even_when_everyone_is_ready() {
+        let mut handler = lead_handler_with_real_sync_group();   // no Follower connected
+        handler.on_video_item(item("wall1", 3, server::VideoItemPhase::Prepare));
+        let id = handler.video_rounds[0].id;
+        handler.on_local_video_ready(server::VideoReadyRequest { sync_key: "wall1".into(), round: id });
+        assert_eq!(handler.video_rounds.len(), 1, "ready, but not active yet: no Play");
+        assert!(state(&handler, "wall1").unwrap().play.is_none());
+
+        handler.on_video_item(item("wall1", 3, server::VideoItemPhase::Start));
+        assert!(handler.video_rounds.is_empty(), "played and forgotten");
+        assert_eq!(state(&handler, "wall1").unwrap().play, Some(server::VideoPlay { round: id }));
+    }
+
+    #[test]
+    fn a_play_is_held_until_the_leads_own_page_is_ready() {
+        let mut handler = lead_handler_with_real_sync_group();
+        handler.on_video_item(item("wall1", 0, server::VideoItemPhase::Start));
+        assert_eq!(handler.video_rounds.len(), 1, "started but the Lead's page is not ready");
+        let id = handler.video_rounds[0].id;
+        handler.on_local_video_ready(server::VideoReadyRequest { sync_key: "wall1".into(), round: id });
+        assert!(handler.video_rounds.is_empty());
+        assert_eq!(state(&handler, "wall1").unwrap().play, Some(server::VideoPlay { round: id }));
+    }
+
+    #[test]
+    fn a_connected_followers_ready_report_releases_the_play_over_the_real_network() {
+        let (mut handler, follower) = lead_with_connected_follower();
+        let rx = follower.video_commands().unwrap().clone();
+        handler.on_video_item(item("wall1", 1, server::VideoItemPhase::Prepare));
+        let id = handler.video_rounds[0].id;
+        match rx.recv_timeout(Duration::from_secs(5)).expect("the Follower must get the Preload") {
+            syncgroup::VideoCommand::Preload { sync_key, item, round, .. } =>
+                assert_eq!((sync_key.as_str(), item, round), ("wall1", 1, id)),
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // The item becomes active and the Lead's own page is ready, but the
+        // Follower has not reported yet: the Play must wait for it.
+        handler.on_video_item(item("wall1", 1, server::VideoItemPhase::Start));
+        handler.on_local_video_ready(server::VideoReadyRequest { sync_key: "wall1".into(), round: id });
+        assert_eq!(handler.video_rounds.len(), 1, "must wait for the connected Follower");
+
+        // The Follower reports ready; the Lead receives it exactly as the
+        // `recv(self.video_ready_reports)` arm of run() does.
+        follower.report_video_ready("wall1", id);
+        let report = handler.video_ready_reports.recv_timeout(Duration::from_secs(5))
+            .expect("the Lead must receive the Follower's report");
+        handler.on_remote_video_ready(report);
+        assert!(handler.video_rounds.is_empty(), "now everyone is ready: Play");
+        match rx.recv_timeout(Duration::from_secs(5)).expect("the Follower must get the Play") {
+            syncgroup::VideoCommand::Play { sync_key, round } =>
+                assert_eq!((sync_key.as_str(), round), ("wall1", id)),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ready_report_for_another_round_does_not_release_the_play() {
+        let (mut handler, follower) = lead_with_connected_follower();
+        handler.on_video_item(item("wall1", 1, server::VideoItemPhase::Start));
+        let id = handler.video_rounds[0].id;
+        handler.on_local_video_ready(server::VideoReadyRequest { sync_key: "wall1".into(), round: id });
+        follower.report_video_ready("wall1", id + 100);
+        let report = handler.video_ready_reports.recv_timeout(Duration::from_secs(5)).unwrap();
+        handler.on_remote_video_ready(report);
+        assert_eq!(handler.video_rounds.len(), 1, "a stale round id must not count");
+    }
+
+    #[test]
+    fn a_round_that_waited_too_long_plays_anyway_and_does_not_end_the_event() {
+        let (mut handler, _follower) = lead_with_connected_follower();
+        handler.override_layout = Some(1017);
+        handler.sync_layout_active = true;
+        handler.on_video_item(item("wall1", 1, server::VideoItemPhase::Start));
+        let id = handler.video_rounds[0].id;
+        // Nobody confirms; age the round past the timeout.
+        handler.video_rounds[0].started = std::time::Instant::now()
+            .checked_sub(VIDEO_WALL_CONFIRM_TIMEOUT + Duration::from_secs(1)).unwrap();
+        handler.evaluate_video_rounds();
+        assert!(handler.video_rounds.is_empty());
+        assert_eq!(state(&handler, "wall1").unwrap().play, Some(server::VideoPlay { round: id }),
+                   "playback must go ahead");
+        assert_eq!(handler.override_layout, Some(1017), "the synchronized event must go on");
+        assert!(handler.sync_layout_active);
+    }
+
+    #[test]
+    fn a_follower_relays_the_leads_messages_into_the_state_the_page_polls() {
+        let (mut handler, _togui_rx) = test_handler();
+        handler.settings.sync_role = SyncRole::Follower { lead_addr: "127.0.0.1".into() };
+        handler.on_video_command(syncgroup::VideoCommand::Preload {
+            sync_key: "w".into(), target: "a.mp4".into(), item: 1, round: 5 });
+        handler.on_video_command(syncgroup::VideoCommand::Preload {
+            sync_key: "w".into(), target: "b.mp4".into(), item: 2, round: 6 });
+        handler.on_video_command(syncgroup::VideoCommand::Play { sync_key: "w".into(), round: 5 });
+        handler.on_video_command(syncgroup::VideoCommand::Position {
+            sync_key: "w".into(), position_ms: 900, round: 5 });
+        let st = state(&handler, "w").unwrap();
+        assert_eq!(st.preloads.iter().map(|p| (p.round, p.item)).collect::<Vec<_>>(),
+                   vec![(5, 1), (6, 2)], "a later preload must not overwrite an earlier one");
+        assert_eq!(st.play, Some(server::VideoPlay { round: 5 }));
+        assert_eq!(st.position, Some(server::VideoPosition { round: 5, position_ms: 900 }));
+    }
+
+    #[test]
+    fn a_followers_own_ready_is_reported_to_the_lead_with_its_round() {
+        let port = free_port();
+        let lead = syncgroup::SyncGroup::start_lead(port, Duration::ZERO).unwrap();
+        let reports = lead.video_ready().unwrap().clone();
+        let (mut handler, _togui_rx) = test_handler();
+        handler.settings.sync_role = SyncRole::Follower { lead_addr: "127.0.0.1".into() };
+        handler.sync_group = Some(
+            syncgroup::SyncGroup::start_follower(format!("127.0.0.1:{port}")).unwrap());
+        handler.on_local_video_ready(server::VideoReadyRequest { sync_key: "wall1".into(), round: 7 });
+        let report = reports.recv_timeout(Duration::from_secs(5)).expect("the Lead must hear it");
+        assert_eq!((report.sync_key.as_str(), report.round), ("wall1", 7));
+        drop(lead);
+    }
+
+    #[test]
+    fn becoming_a_lead_wires_up_the_remote_ready_reports() {
+        // Port and port+1 (the reports listener) must both be free.
+        let port = (0..20).map(|_| free_port()).find(|p| {
+            std::net::TcpListener::bind(("127.0.0.1", p + 1)).is_ok()
+        }).expect("a free port pair");
+        let (mut handler, _togui_rx) = test_handler();
+        handler.first_collection_done = true;
+        handler.settings.sync_role = SyncRole::Lead;
+        handler.settings.sync_publisher_port = port;
+        handler.update_sync_group();
+        assert!(handler.sync_group.is_some(), "the Lead must have started");
+
+        let follower = syncgroup::SyncGroup::start_follower(format!("127.0.0.1:{port}")).unwrap();
+        follower.report_video_ready("wall1", 3);
+        let report = handler.video_ready_reports.recv_timeout(Duration::from_secs(5))
+            .expect("the handler must be wired to the Lead's ready reports");
+        assert_eq!((report.sync_key.as_str(), report.round), ("wall1", 3));
+
+        // Leaving the Lead role must drop that wiring again.
+        handler.settings.sync_role = SyncRole::None;
+        handler.update_sync_group();
+        assert!(handler.sync_group.is_none());
+        assert!(handler.video_ready_reports.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_non_lead_ignores_item_requests() {
+        let (mut handler, _togui_rx) = test_handler();
+        handler.settings.sync_role = SyncRole::Follower { lead_addr: "127.0.0.1".into() };
+        handler.on_video_item(item("wall1", 0, server::VideoItemPhase::Start));
+        handler.on_video_item(item("wall1", 1, server::VideoItemPhase::Prepare));
+        assert!(handler.video_rounds.is_empty());
+        assert!(state(&handler, "wall1").is_none());
+    }
+
+    #[test]
+    fn rounds_in_flight_are_capped() {
+        let mut handler = lead_handler_with_real_sync_group();
+        for n in 0..(MAX_VIDEO_ROUNDS as u32 + 4) {
+            handler.on_video_item(item("wall1", n, server::VideoItemPhase::Prepare));
+        }
+        assert_eq!(handler.video_rounds.len(), MAX_VIDEO_ROUNDS);
+        assert_eq!(handler.video_rounds.last().unwrap().item, MAX_VIDEO_ROUNDS as u32 + 3,
+                   "the newest round is kept");
+    }
+
+    #[test]
+    fn reset_video_wall_forgets_rounds_and_state() {
+        let mut handler = lead_handler_with_real_sync_group();
+        handler.on_video_item(item("wall1", 0, server::VideoItemPhase::Start));
+        assert!(!handler.video_rounds.is_empty() && state(&handler, "wall1").is_some());
+        handler.reset_video_wall();
+        assert!(handler.video_rounds.is_empty());
+        assert!(state(&handler, "wall1").is_none());
+    }
+
+    #[test]
+    fn ending_a_synchronized_event_also_forgets_the_video_wall_state() {
+        let mut handler = lead_handler_with_real_sync_group();
+        handler.override_layout = Some(1017);
+        handler.sync_layout_active = true;
+        handler.on_video_item(item("wall1", 0, server::VideoItemPhase::Prepare));
+        handler.end_sync_layout_override();
+        assert!(handler.video_rounds.is_empty());
+        assert!(state(&handler, "wall1").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -7725,20 +8281,18 @@ mod parallel_download_tests {
     /// time* (a small artificial delay before responding widens the
     /// window in which concurrent requests can actually overlap) --
     /// lets a test confirm real concurrency happened, not just that
-    /// results came back correctly.
+    /// results came back correctly. Several handling threads sharing
+    /// the same server (matching server.rs's own real `start_pool`
+    /// pattern) -- a single handling thread/loop can only ever process
+    /// one request at a time itself, regardless of how many requests a
+    /// genuinely-parallel client sends concurrently, so it could never
+    /// actually observe real client-side concurrency at all (confirmed
+    /// the hard way while writing this test).
     fn start_mock_ready_counting_concurrency() -> (u16, std::sync::Arc<AtomicU32>) {
         let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
         let port = server.server_addr().to_ip().unwrap().port();
         let current = std::sync::Arc::new(AtomicU32::new(0));
         let max_seen = std::sync::Arc::new(AtomicU32::new(0));
-        // Several handling threads sharing the same server, matching
-        // server.rs's own real `start_pool` pattern -- a single
-        // handling thread/loop (this mock's first draft) can only ever
-        // process one request at a time itself, regardless of how many
-        // requests a genuinely-parallel client sends concurrently, so
-        // it could never actually observe real client-side concurrency
-        // at all (confirmed the hard way: every attempt showed "1",
-        // never more, until this fix).
         for _ in 0..8 {
             let server = server.clone();
             let current = current.clone();
@@ -7785,13 +8339,13 @@ mod parallel_download_tests {
     #[test]
     fn several_pending_downloads_are_all_processed_in_order_even_if_some_fail() {
         // The mock here never serves real file content (same mechanism
-        // the existing single-file failure test above relies on) --
-        // every one of these genuinely fails. The point of this test
-        // is that *all* of them still get processed and correctly
-        // reported, in the same order they were given, whether
-        // dispatched in parallel chunks or not -- confirmed with the
-        // user: a failure must not block the others, same as the
-        // original sequential behavior.
+        // the existing single-file failure test relies on) -- every
+        // one of these genuinely fails. The point of this test is that
+        // *all* of them still get processed and correctly reported, in
+        // the same order they were given, whether dispatched in
+        // parallel chunks or not -- confirmed with the user: a failure
+        // must not block the others, same as the original sequential
+        // behavior.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
@@ -7801,7 +8355,9 @@ mod parallel_download_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         handler.settings.max_concurrent_downloads = 3;
 
         let files = vec![not_cached_layout_file(101), not_cached_layout_file(102),
@@ -7833,7 +8389,9 @@ mod parallel_download_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         // Reset here -- Handler::new's own initial RegisterDisplay call
         // (sequential, one request) already touched the counter once,
         // harmlessly, before this test's own real subject even starts.
@@ -7869,7 +8427,9 @@ mod parallel_download_tests {
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
-                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
+                                        test_video_sync_receivers(),
+                                        std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         max_seen.store(0, Ordering::SeqCst);
         assert_eq!(handler.settings.max_concurrent_downloads, 1,
                    "this test's own premise -- the mock's RegisterDisplay response never \

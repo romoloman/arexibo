@@ -52,7 +52,7 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 use anyhow::{bail, Context, Result};
 use byteorder::{ReadBytesExt, WriteBytesExt, BE};
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use crate::xmr::{retry_on_eintr, ZmqSubSocket};
@@ -77,6 +77,13 @@ const READER_TIMEOUT: StdDuration = StdDuration::from_secs(12);
 const STOP_CHECK_INTERVAL: StdDuration = StdDuration::from_millis(500);
 
 const MAX_RECONNECT_BACKOFF: StdDuration = StdDuration::from_secs(30);
+
+/// The Lead's "video ready" reports listener (Follower -> Lead) binds
+/// on `port + REPORTS_PORT_OFFSET` -- a real ZMTP PUB socket can't
+/// carry data in this direction at all, so this is a plain, separate
+/// TCP connection (one newline-delimited JSON line per report, not
+/// ZMTP-framed) rather than an extension of the existing channel.
+const REPORTS_PORT_OFFSET: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -109,6 +116,17 @@ enum Message {
         #[serde(with = "time::serde::rfc3339")]
         target_time: OffsetDateTime,
     },
+    // Video wall (Sync Group Phase 5): broadcast Lead -> every
+    // Follower, reusing this same PUB/SUB channel (no offset
+    // correction applied to these -- only Command's own target_time
+    // needs that, since these three are reactive/ongoing, not a single
+    // future instant to hit precisely).
+    // `round`/`item` default to 0 so messages from a version without them
+    // still decode (single-video behaviour).
+    VideoPreload { sync_key: String, target: String,
+                   #[serde(default)] item: u32, #[serde(default)] round: u32 },
+    VideoPlay { sync_key: String, #[serde(default)] round: u32 },
+    VideoPosition { sync_key: String, position_ms: i64, #[serde(default)] round: u32 },
 }
 
 /// A layout-switch command received by a Follower, with the tracked
@@ -123,6 +141,39 @@ enum Message {
 pub struct SyncCommand {
     pub sync_keys: Vec<String>,
     pub target_local: OffsetDateTime,
+}
+
+/// A video-wall message received by a Follower, passed through
+/// unchanged (no clock-offset correction -- see the Message enum's own
+/// doc comment on why only Command needs that).
+#[derive(Debug, Clone, PartialEq)]
+pub enum VideoCommand {
+    Preload { sync_key: String, target: String, item: u32, round: u32 },
+    Play { sync_key: String, round: u32 },
+    Position { sync_key: String, position_ms: i64, round: u32 },
+}
+
+/// Wire format only (see `send_video_ready_report`) -- carries no
+/// follower identity of its own; the Lead learns *which* Follower sent
+/// it from the TCP connection itself (see VideoReadyReport).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoReady {
+    pub sync_key: String,
+    #[serde(default)]
+    pub round: u32,
+}
+
+/// A "buffered, ready to play" confirmation, enriched with the
+/// reporting Follower's own address (from the reports connection's own
+/// peer address, not anything the Follower claims about itself) --
+/// needed so the Lead's own orchestration (mainloop.rs) can tell *how
+/// many distinct* Followers have confirmed for the current round, not
+/// just that *some* report arrived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoReadyReport {
+    pub sync_key: String,
+    pub round: u32,
+    pub follower_addr: String,
 }
 
 /// Handle to a running Sync Group Lead or Follower background thread
@@ -168,6 +219,33 @@ pub struct SyncGroup {
     /// to this by re-staging/re-publishing the currently-active
     /// synchronized layout, not just noting the connection.
     peer_connected: Option<Receiver<()>>,
+    /// (Lead only.) Sends a video-wall broadcast request to
+    /// `lead_publish_loop`, which turns it into an actual `Message` and
+    /// broadcasts it -- see `publish_video_preload`/`_play`/`_position`.
+    video_publish: Option<Sender<VideoPublishRequest>>,
+    /// (Follower only.) Incoming video-wall messages, passed through
+    /// unchanged from the wire (see VideoCommand's own doc comment).
+    video_commands: Option<Receiver<VideoCommand>>,
+    /// (Lead only.) "Ready to play" reports received from any Follower
+    /// over the separate reports channel.
+    video_ready: Option<Receiver<VideoReadyReport>>,
+    /// (Follower only.) The Lead's reports-channel address
+    /// (`host:port+REPORTS_PORT_OFFSET`) -- see `report_video_ready`.
+    reports_addr: Option<String>,
+    /// (Lead only.) The same list `accept_loop`/`lead_publish_loop`
+    /// share -- exposed so `connected_follower_addrs` can query who's
+    /// currently connected without needing its own IPC round-trip.
+    peers: Option<Arc<Mutex<Vec<TcpStream>>>>,
+}
+
+/// Internal request from SyncGroup's own public API to `lead_publish_loop`
+/// -- turned into the matching `Message` variant and broadcast from
+/// there (not constructed by callers directly, so the wire format stays
+/// this module's own implementation detail).
+enum VideoPublishRequest {
+    Preload { sync_key: String, target: String, item: u32, round: u32 },
+    Play { sync_key: String, round: u32 },
+    Position { sync_key: String, position_ms: i64, round: u32 },
 }
 
 impl Drop for SyncGroup {
@@ -190,10 +268,17 @@ impl SyncGroup {
             .with_context(|| format!("binding Sync Group Lead listener on port {port}"))?;
         listener.set_nonblocking(true)
             .context("setting Sync Group Lead listener non-blocking")?;
+        let reports_port = port + REPORTS_PORT_OFFSET;
+        let reports_listener = TcpListener::bind(("0.0.0.0", reports_port))
+            .with_context(|| format!("binding Sync Group reports listener on port {reports_port}"))?;
+        reports_listener.set_nonblocking(true)
+            .context("setting Sync Group reports listener non-blocking")?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let peers: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let (publish_tx, publish_rx) = unbounded::<Vec<String>>();
+        let (video_publish_tx, video_publish_rx) = unbounded::<VideoPublishRequest>();
+        let (video_ready_tx, video_ready_rx) = unbounded::<VideoReadyReport>();
         let current_sync_keys: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let (peer_connected_tx, peer_connected_rx) = unbounded::<()>();
 
@@ -205,14 +290,23 @@ impl SyncGroup {
         {
             let stop = stop.clone();
             let current_sync_keys = current_sync_keys.clone();
-            thread::spawn(move || lead_publish_loop(peers, publish_rx, stop, switch_delay,
-                                                     current_sync_keys));
+            let peers = peers.clone();
+            thread::spawn(move || lead_publish_loop(peers, publish_rx, video_publish_rx, stop,
+                                                      switch_delay, current_sync_keys));
+        }
+        {
+            let stop = stop.clone();
+            thread::spawn(move || reports_accept_loop(reports_listener, video_ready_tx, stop));
         }
 
-        log::info!("Sync Group: started as Lead, listening on 0.0.0.0:{port}");
+        log::info!("Sync Group: started as Lead, listening on 0.0.0.0:{port} \
+                     (reports on 0.0.0.0:{reports_port})");
         Ok(Self { stop, commands: None, publish: Some(publish_tx),
                   current_sync_keys: Some(current_sync_keys),
-                  peer_connected: Some(peer_connected_rx) })
+                  peer_connected: Some(peer_connected_rx),
+                  video_publish: Some(video_publish_tx), video_commands: None,
+                  video_ready: Some(video_ready_rx), reports_addr: None,
+                  peers: Some(peers) })
     }
 
     /// Starts a Follower: connects (and, on failure or disconnection,
@@ -227,14 +321,19 @@ impl SyncGroup {
     pub fn start_follower(lead_addr: String) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let (commands_tx, commands_rx) = unbounded::<SyncCommand>();
+        let (video_commands_tx, video_commands_rx) = unbounded::<VideoCommand>();
+        let reports_addr = reports_address(&lead_addr)?;
 
         {
             let stop = stop.clone();
-            thread::spawn(move || follower_reconnect_loop(lead_addr, commands_tx, stop));
+            thread::spawn(move || follower_reconnect_loop(lead_addr, commands_tx,
+                                                            video_commands_tx, stop));
         }
 
         Ok(Self { stop, commands: Some(commands_rx), publish: None, current_sync_keys: None,
-                  peer_connected: None })
+                  peer_connected: None, video_publish: None,
+                  video_commands: Some(video_commands_rx), video_ready: None,
+                  reports_addr: Some(reports_addr), peers: None })
     }
 
     /// (Lead only.) Broadcasts the sync_keys of whichever layout is
@@ -277,6 +376,68 @@ impl SyncGroup {
     pub fn peer_connected(&self) -> Option<&Receiver<()>> {
         self.peer_connected.as_ref()
     }
+
+    /// (Lead only, silently a no-op for a Follower's own SyncGroup.)
+    /// Broadcasts to every connected Follower.
+    pub fn publish_video_preload(&self, sync_key: String, round: u32, item: u32, target: String) {
+        if let Some(tx) = &self.video_publish {
+            let _ = tx.send(VideoPublishRequest::Preload { sync_key, target, item, round });
+        }
+    }
+
+    pub fn publish_video_play(&self, sync_key: String, round: u32) {
+        if let Some(tx) = &self.video_publish {
+            let _ = tx.send(VideoPublishRequest::Play { sync_key, round });
+        }
+    }
+
+    pub fn publish_video_position(&self, sync_key: String, round: u32, position_ms: i64) {
+        if let Some(tx) = &self.video_publish {
+            let _ = tx.send(VideoPublishRequest::Position { sync_key, position_ms, round });
+        }
+    }
+
+    /// (Follower only.) Incoming video-wall messages -- `None` for a
+    /// Lead's own SyncGroup.
+    pub fn video_commands(&self) -> Option<&Receiver<VideoCommand>> {
+        self.video_commands.as_ref()
+    }
+
+    /// (Lead only.) "Ready to play" reports from any Follower -- `None`
+    /// for a Follower's own SyncGroup.
+    pub fn video_ready(&self) -> Option<&Receiver<VideoReadyReport>> {
+        self.video_ready.as_ref()
+    }
+
+    /// (Lead only.) IP addresses of currently connected Followers, from
+    /// the same PUB/SUB connections `broadcast` writes to -- lets
+    /// mainloop.rs's own orchestration tell how many *distinct*
+    /// Followers are actually connected right now, to compare against
+    /// how many have reported ready for the current round. Empty (not
+    /// `None`) for a Follower's own SyncGroup, and if a stream's own
+    /// `peer_addr()` somehow fails (should not happen for a live
+    /// connection), that one entry is just skipped rather than erroring
+    /// the whole call.
+    pub fn connected_follower_addrs(&self) -> Vec<String> {
+        let Some(peers) = &self.peers else { return Vec::new() };
+        peers.lock().expect("poisoned lock").iter()
+            .filter_map(|s| s.peer_addr().ok())
+            .map(|a| a.ip().to_string())
+            .collect()
+    }
+
+    /// (Follower only, silently a no-op for a Lead's own SyncGroup.)
+    /// Tells the Lead this Follower has finished buffering `sync_key`
+    /// and is ready to play -- a short-lived connection (connect, send
+    /// one line, close), since this happens at most once per content
+    /// change, not continuously.
+    pub fn report_video_ready(&self, sync_key: &str, round: u32) {
+        let Some(addr) = &self.reports_addr else { return };
+        if let Err(e) = send_video_ready_report(addr, sync_key, round) {
+            log::warn!("Sync Group: reporting video ready for {sync_key:?} (round {round}) \
+                         to Lead at {addr}: {e:#}");
+        }
+    }
 }
 
 // ---- Lead side ----
@@ -316,6 +477,50 @@ fn accept_loop(listener: TcpListener, peers: Arc<Mutex<Vec<TcpStream>>>, stop: A
         }
     }
     log::debug!("Sync Group: Lead accept thread stopped");
+}
+
+/// Accepts short-lived connections on the reports port (see
+/// REPORTS_PORT_OFFSET), each carrying exactly one newline-delimited
+/// JSON `VideoReady` line, then closes -- not ZMTP-framed at all (this
+/// is arexibo-to-arexibo only, no XMR-compatibility requirement here).
+fn reports_accept_loop(listener: TcpListener, video_ready_tx: Sender<VideoReadyReport>,
+                        stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                if let Err(e) = stream.set_read_timeout(Some(StdDuration::from_secs(5))) {
+                    log::warn!("Sync Group: setting reports read timeout for {addr}: {e:#}");
+                    continue;
+                }
+                let mut line = String::new();
+                use std::io::BufRead;
+                let mut reader = std::io::BufReader::new(stream);
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => {}
+                    Ok(_) => match serde_json::from_str::<VideoReady>(line.trim()) {
+                        Ok(wire) => {
+                            let report = VideoReadyReport {
+                                sync_key: wire.sync_key,
+                                round: wire.round,
+                                follower_addr: addr.ip().to_string(),
+                            };
+                            let _ = video_ready_tx.send(report);
+                        }
+                        Err(e) => log::warn!("Sync Group: bad video-ready report from \
+                                               {addr}: {e:#}"),
+                    },
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(STOP_CHECK_INTERVAL);
+            }
+            Err(e) => {
+                log::warn!("Sync Group: reports accept error: {e:#}");
+                thread::sleep(STOP_CHECK_INTERVAL);
+            }
+        }
+    }
+    log::debug!("Sync Group: Lead reports accept thread stopped");
 }
 
 /// ZMTP handshake for the *server* (PUB) role -- same wire protocol as
@@ -404,13 +609,14 @@ fn broadcast(peers: &Arc<Mutex<Vec<TcpStream>>>, msg: &Message) {
 }
 
 fn lead_publish_loop(peers: Arc<Mutex<Vec<TcpStream>>>, publish_rx: Receiver<Vec<String>>,
-                      stop: Arc<AtomicBool>, switch_delay: StdDuration,
-                      current_sync_keys: Arc<Mutex<Vec<String>>>) {
+                      video_publish_rx: Receiver<VideoPublishRequest>, stop: Arc<AtomicBool>,
+                      switch_delay: StdDuration, current_sync_keys: Arc<Mutex<Vec<String>>>) {
     let mut last_sync = Instant::now() - SYNC_INTERVAL; // send one immediately on start
     while !stop.load(Ordering::Relaxed) {
-        // A short recv timeout doubles as this loop's own `stop`
-        // check interval whenever no layout switch is pending.
-        match publish_rx.recv_timeout(StdDuration::from_millis(200)) {
+        // A short default timeout doubles as this loop's own `stop`
+        // check interval whenever neither channel has anything ready.
+        select! {
+            recv(publish_rx) -> msg => match msg {
             Ok(sync_keys) => {
                 // Broadcasts a Sync right alongside every Command --
                 // a real, severe regression found this way: a
@@ -464,8 +670,18 @@ fn lead_publish_loop(peers: Arc<Mutex<Vec<TcpStream>>>, publish_rx: Receiver<Vec
                 log::info!("Sync Group: published Command sync_keys={sync_keys:?} \
                             target_time={target_time}");
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break, // SyncGroup itself was dropped
+                Err(_) => break, // SyncGroup itself was dropped
+            },
+            recv(video_publish_rx) -> msg => match msg {
+                Ok(VideoPublishRequest::Preload { sync_key, target, item, round }) =>
+                    broadcast(&peers, &Message::VideoPreload { sync_key, target, item, round }),
+                Ok(VideoPublishRequest::Play { sync_key, round }) =>
+                    broadcast(&peers, &Message::VideoPlay { sync_key, round }),
+                Ok(VideoPublishRequest::Position { sync_key, position_ms, round }) =>
+                    broadcast(&peers, &Message::VideoPosition { sync_key, position_ms, round }),
+                Err(_) => break, // SyncGroup itself was dropped
+            },
+            default(StdDuration::from_millis(200)) => {}
         }
         if last_sync.elapsed() >= SYNC_INTERVAL {
             // Read fresh on every heartbeat (not cached/passed in once)
@@ -485,11 +701,34 @@ fn lead_publish_loop(peers: Arc<Mutex<Vec<TcpStream>>>, publish_rx: Receiver<Vec
 
 // ---- Follower side ----
 
+/// `lead_addr` is `host:port` -- the reports channel is always
+/// `port + REPORTS_PORT_OFFSET` on that same host.
+fn reports_address(lead_addr: &str) -> Result<String> {
+    let (host, port) = lead_addr.rsplit_once(':')
+        .with_context(|| format!("Sync Group Lead address {lead_addr:?} missing a port"))?;
+    let port: u16 = port.parse()
+        .with_context(|| format!("Sync Group Lead address {lead_addr:?} has an invalid port"))?;
+    Ok(format!("{host}:{}", port + REPORTS_PORT_OFFSET))
+}
+
+/// Connects, sends one line, closes -- see `report_video_ready`'s own
+/// doc comment for why this is a short-lived connection, not a
+/// persistent one.
+fn send_video_ready_report(addr: &str, sync_key: &str, round: u32) -> Result<()> {
+    let mut stream = TcpStream::connect(addr)
+        .with_context(|| format!("connecting to Sync Group reports channel at {addr}"))?;
+    let mut line = serde_json::to_vec(&VideoReady { sync_key: sync_key.to_string(), round })
+        .context("serializing video-ready report")?;
+    line.push(b'\n');
+    stream.write_all(&line).context("sending video-ready report")?;
+    Ok(())
+}
+
 fn follower_reconnect_loop(lead_addr: String, commands_tx: Sender<SyncCommand>,
-                            stop: Arc<AtomicBool>) {
+                            video_commands_tx: Sender<VideoCommand>, stop: Arc<AtomicBool>) {
     let mut backoff = StdDuration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
-        match follower_session(&lead_addr, &commands_tx, &stop) {
+        match follower_session(&lead_addr, &commands_tx, &video_commands_tx, &stop) {
             Ok(()) => {
                 // Either `stop` was requested (normal, silent exit) or
                 // the Lead closed the connection cleanly -- reset
@@ -523,6 +762,7 @@ fn follower_reconnect_loop(lead_addr: String, commands_tx: Sender<SyncCommand>,
 /// protocol error, read error), which the caller (the reconnect loop
 /// above) turns into a logged warning and a backoff-then-retry.
 fn follower_session(lead_addr: &str, commands_tx: &Sender<SyncCommand>,
+                     video_commands_tx: &Sender<VideoCommand>,
                      stop: &Arc<AtomicBool>) -> Result<()> {
     // A much shorter read timeout than XMR's own (40s, tuned for XMR's
     // 30s heartbeat cadence) -- Sync Group's own Sync heartbeat is
@@ -639,6 +879,12 @@ fn follower_session(lead_addr: &str, commands_tx: &Sender<SyncCommand>,
                     }
                 }
             }
+            Message::VideoPreload { sync_key, target, item, round } =>
+                { let _ = video_commands_tx.send(VideoCommand::Preload { sync_key, target, item, round }); }
+            Message::VideoPlay { sync_key, round } =>
+                { let _ = video_commands_tx.send(VideoCommand::Play { sync_key, round }); }
+            Message::VideoPosition { sync_key, position_ms, round } =>
+                { let _ = video_commands_tx.send(VideoCommand::Position { sync_key, position_ms, round }); }
         }
     }
     Ok(())
@@ -913,5 +1159,108 @@ mod tests {
         assert!(start.elapsed() < StdDuration::from_millis(100),
                 "start_follower must not block on the initial connection attempt");
         drop(follower);
+    }
+
+    fn free_port() -> u16 {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn video_preload_play_and_position_reach_the_follower() {
+        let port = free_port();
+        let leader = SyncGroup::start_lead(port, StdDuration::ZERO).expect("starting lead");
+        let follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
+            .expect("starting follower");
+        let rx = follower.video_commands().expect("a follower always has this channel");
+
+        // Retried (not a single send) since the Follower's own ZMTP
+        // handshake/subscribe needs a moment to complete after
+        // connecting -- a message published before that finishes
+        // would never be seen by this specific connection at all.
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        let mut got_preload = false;
+        while Instant::now() < deadline && !got_preload {
+            leader.publish_video_preload("key1".into(), 7, 2, "123.mp4".into());
+            if let Ok(VideoCommand::Preload { sync_key, target, item, round }) =
+                rx.recv_timeout(StdDuration::from_millis(300)) {
+                assert_eq!(sync_key, "key1");
+                assert_eq!(target, "123.mp4");
+                assert_eq!((item, round), (2, 7));
+                got_preload = true;
+            }
+        }
+        assert!(got_preload, "follower never received the Preload command");
+
+        leader.publish_video_play("key1".into(), 7);
+        let cmd = rx.recv_timeout(StdDuration::from_secs(2))
+            .expect("follower never received the Play command");
+        assert_eq!(cmd, VideoCommand::Play { sync_key: "key1".into(), round: 7 });
+
+        leader.publish_video_position("key1".into(), 7, 4200);
+        let cmd = rx.recv_timeout(StdDuration::from_secs(2))
+            .expect("follower never received the Position command");
+        assert_eq!(cmd, VideoCommand::Position { sync_key: "key1".into(), position_ms: 4200, round: 7 });
+    }
+
+    #[test]
+    fn video_messages_without_round_or_item_still_decode() {
+        // Wire format of a version that had neither field.
+        let m: Message = serde_json::from_str(
+            r#"{"type":"videoPreload","sync_key":"k","target":"a.mp4"}"#).unwrap();
+        assert!(matches!(m, Message::VideoPreload { item: 0, round: 0, .. }));
+        let m: Message = serde_json::from_str(r#"{"type":"videoPlay","sync_key":"k"}"#).unwrap();
+        assert!(matches!(m, Message::VideoPlay { round: 0, .. }));
+        let m: Message = serde_json::from_str(
+            r#"{"type":"videoPosition","sync_key":"k","position_ms":5}"#).unwrap();
+        assert!(matches!(m, Message::VideoPosition { position_ms: 5, round: 0, .. }));
+        let r: VideoReady = serde_json::from_str(r#"{"sync_key":"k"}"#).unwrap();
+        assert_eq!(r.round, 0);
+    }
+
+    #[test]
+    fn a_follower_ready_report_reaches_the_lead() {
+        let port = free_port();
+        let leader = SyncGroup::start_lead(port, StdDuration::ZERO).expect("starting lead");
+        let follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
+            .expect("starting follower");
+        let rx = leader.video_ready().expect("a lead always has this channel");
+
+        follower.report_video_ready("key1", 7);
+        let report = rx.recv_timeout(StdDuration::from_secs(5))
+            .expect("lead never received the ready report");
+        assert_eq!(report.sync_key, "key1");
+        assert_eq!(report.round, 7);
+        // Both ends are 127.0.0.1 in this test, but the field must
+        // genuinely be populated (from the reports connection's own
+        // peer address), not left blank.
+        assert_eq!(report.follower_addr, "127.0.0.1");
+    }
+
+    #[test]
+    fn connected_follower_addrs_reflects_the_pub_sub_connection_count() {
+        let port = free_port();
+        let leader = SyncGroup::start_lead(port, StdDuration::ZERO).expect("starting lead");
+        assert_eq!(leader.connected_follower_addrs(), Vec::<String>::new(),
+                   "no followers connected yet");
+
+        let follower = SyncGroup::start_follower(format!("127.0.0.1:{port}"))
+            .expect("starting follower");
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        while Instant::now() < deadline && leader.connected_follower_addrs().is_empty() {
+            thread::sleep(StdDuration::from_millis(50));
+        }
+        assert_eq!(leader.connected_follower_addrs(), vec!["127.0.0.1".to_string()]);
+        drop(follower);
+    }
+
+    #[test]
+    fn reports_address_adds_the_offset_to_the_leads_own_port() {
+        assert_eq!(reports_address("10.0.0.5:9590").unwrap(), "10.0.0.5:9591");
+    }
+
+    #[test]
+    fn reports_address_rejects_a_missing_port() {
+        assert!(reports_address("10.0.0.5").is_err());
     }
 }

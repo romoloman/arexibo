@@ -18,7 +18,7 @@ use crate::util::{ElementExt, percent_decode, percent_encode};
 
 /// Bump when the generated page changes: cached layouts translated with an
 /// older version are re-downloaded and retranslated.
-pub const TRANSLATOR_VERSION: u32 = 32;
+pub const TRANSLATOR_VERSION: u32 = 33;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -558,6 +558,12 @@ fn substitute_display_placeholders(url: &str, display: Option<&DisplayInfo>) -> 
     }
 }
 
+/// A sync-gated region's items in playlist order: (media id, URL if a video).
+type VideoWallItems = Vec<(i32, Option<String>)>;
+
+/// What `Translator::translate` reports: (width, height, enable_stat, sync_keys).
+pub type TranslateOutput = (i32, i32, bool, Vec<String>);
+
 pub struct Translator<'a> {
     id: LayoutId,
     tree: Option<Element>,
@@ -638,6 +644,18 @@ pub struct Translator<'a> {
     /// eventual per-item drift correction) won't need this scanning
     /// work redone.
     sync_keys: std::collections::HashSet<String>,
+    /// Maps a region's `id` to its own `syncKey` (only for regions that
+    /// have one) -- lets `write_media` (called per-widget, deep inside
+    /// a region's own playlist) look up "is the region I'm currently
+    /// in sync-gated, and under which key" without threading an extra
+    /// parameter through every intermediate call.
+    region_sync_key: HashMap<i32, String>,
+    /// Video wall: media id -> URL of every video widget found in a
+    /// sync-gated region (see write_region and the runtime JS).
+    vw_video_urls: HashMap<i32, String>,
+    /// Video wall: for each sync-gated region that has a video, its sync
+    /// key and its items in playlist order -- (media id, URL if video).
+    vw_regions: Vec<(String, VideoWallItems)>,
 }
 
 impl<'a> Translator<'a> {
@@ -656,7 +674,9 @@ impl<'a> Translator<'a> {
                   swap_target_regions: std::collections::HashSet::new(),
                   region_geom: HashMap::new(),
                   enable_stat: true, adspace, html_port, display: None,
-                  sync_keys: std::collections::HashSet::new() })
+                  sync_keys: std::collections::HashSet::new(),
+                  region_sync_key: HashMap::new(), vw_video_urls: HashMap::new(),
+                  vw_regions: Vec::new() })
     }
 
     /// Provides the display identity used to fill native webpage URL placeholders.
@@ -665,7 +685,7 @@ impl<'a> Translator<'a> {
         self
     }
 
-    pub fn translate(mut self) -> Result<(i32, i32, bool, Vec<String>)> {
+    pub fn translate(mut self) -> Result<TranslateOutput> {
         let tree = self.tree.take().unwrap();
         // Pre-scan for PDF widgets to know if we need pdf.js
         for region in tree.find_all("region") {
@@ -941,6 +961,7 @@ impl<'a> Translator<'a> {
     }
 
     fn write_footer(&mut self) -> Result<()> {
+        self.write_video_wall_runtime()?;
         // start all regions' first item
         writeln!(self.out, "<script type='text/javascript'>\n\
                             window.addEventListener('load', function() {{")?;
@@ -964,6 +985,7 @@ impl<'a> Translator<'a> {
         if let Some(key) = region.get_attr("syncKey") {
             if !key.is_empty() {
                 self.sync_keys.insert(key.to_string());
+                self.region_sync_key.insert(rid, key.to_string());
             }
         }
         writeln!(self.out, "<!-- region {rid} -->")?;
@@ -1059,6 +1081,22 @@ impl<'a> Translator<'a> {
             // this is simpler than deferring whether to open it at all.
             writeln!(self.out, "</div> <!-- end region {rid} wrapper (empty) -->")?;
             return Ok(());
+        }
+
+        // Video wall: a sync-gated region with a video gets the runtime's
+        // hooks on every one of its items (images too -- they trigger the
+        // lookahead for the next video) and is registered with them in
+        // playlist order.
+        if let Some(key) = self.region_sync_key.get(&rid).cloned() {
+            if sequence.iter().any(|res| self.vw_video_urls.contains_key(&res.0)) {
+                let items = sequence.iter()
+                    .map(|res| (res.0, self.vw_video_urls.get(&res.0).cloned())).collect();
+                for res in sequence.iter_mut() {
+                    res.2 = format!("window.arexiboVW.onStart({}); {}", res.0, res.2);
+                    res.3 = format!("{} window.arexiboVW.onStop({});", res.3, res.0);
+                }
+                self.vw_regions.push((key, items));
+            }
         }
 
         writeln!(self.out, "<script type='text/javascript'>")?;
@@ -1339,10 +1377,10 @@ impl<'a> Translator<'a> {
             "() => {}", media.def_attr("duration", "").parse::<i32>().unwrap_or(10));
         let mut add_start = String::new();
         let mut add_stop = String::new();
-        // Whether this widget should always be visually hidden once
-        // its own stop function runs, even when alone in a region
-        // (see MediaInfo's own doc comment for the full story) --
-        // video and audio only, set within their own match arms below.
+        // Whether this widget should keep restarting itself
+        // indefinitely even when alone in a non-looping region (see
+        // MediaInfo's own doc comment for the full story) -- video and
+        // audio only, set within their own match arms below.
         let mut always_hide_when_stopped = false;
 
         // Per-widget transition override -- every widget's own
@@ -1506,21 +1544,21 @@ impl<'a> Translator<'a> {
                          object_fit(opts), object_pos(opts))?;
             }
             (_, Some("video" | "localvideo")) => {
-                // See MediaInfo's own doc comment for why.
+                // See MediaInfo's own doc comment for why. Harmless for
+                // a sync-gated video too -- its own add_start/add_stop
+                // are deliberately left empty (Phase 5's own script owns
+                // its play/pause lifecycle entirely), so this flag
+                // never actually does anything for those.
                 always_hide_when_stopped = true;
-                let raw_url = percent_decode(opts.find("uri").context("no video uri")?.text());
-                // A Local Video widget's own file:// URI (a path
-                // already on the display's own disk, outside the
-                // normal cache) can't be embedded directly -- see the
-                // /local-file endpoint's own doc comment in server.rs
-                // for why (a real, confirmed Chromium/QtWebEngine
-                // restriction, not something a settings toggle here
-                // can work around). Proxied through that same
-                // same-origin endpoint instead.
-                let url = match raw_url.strip_prefix("file://") {
-                    Some(path) => format!("/local-file?path={}", percent_encode(path)),
-                    None => raw_url,
-                };
+                let url = percent_decode(opts.find("uri").context("no video uri")?.text());
+                // Video wall: remembered here; write_region adds the
+                // runtime's hooks and write_video_wall_runtime wires it
+                // up. Not for the drawer (write_drawer never sets
+                // region_sync_key for whatever `rid` it uses).
+                let sync_key = self.region_sync_key.get(&rid).cloned();
+                if sync_key.is_some() {
+                    self.vw_video_urls.insert(mid, url.clone());
+                }
                 let mute = opts.find("mute").is_some_and(|el| el.text() == "1");
                 // loop=1 uses the native HTML loop attribute (browser
                 // handles repetition) and keeps the widget's own static
@@ -1547,7 +1585,24 @@ impl<'a> Translator<'a> {
                 } else {
                     (x, y, w, h, "")
                 };
-                writeln!(self.out, "<video class='media r{rid}' id='m{mid}' src='{url}' {} {} \
+                // A Local Video widget's own file:// URI (a path
+                // already on the display's own disk, outside the
+                // normal cache) can't be embedded directly -- see the
+                // /local-file endpoint's own doc comment in server.rs
+                // for why (a real, confirmed Chromium/QtWebEngine
+                // restriction, not something a settings toggle here
+                // can work around). Proxied through that same
+                // same-origin endpoint instead -- deliberately a
+                // separate variable from `url` itself: that one is
+                // still used as-is above for the video wall's own
+                // tracking, where a locally-proxied path
+                // would be meaningless (a Follower's own disk layout
+                // differs from the Lead's).
+                let video_src = match url.strip_prefix("file://") {
+                    Some(path) => format!("/local-file?path={}", percent_encode(path)),
+                    None => url.clone(),
+                };
+                writeln!(self.out, "<video class='media r{rid}' id='m{mid}' src='{video_src}' {} {} \
                                     style='{video_position}left: {video_x}px; top: {video_y}px; \
                                     width: {video_w}px; height: {video_h}px;{}{}'></video>",
                          if mute { "muted" } else { "" },
@@ -1562,8 +1617,14 @@ impl<'a> Translator<'a> {
                 // own natural length is shorter than the video's, its
                 // own `loop` attribute decides whether it restarts on
                 // its own to keep going, or just stays silent for the
-                // rest of that same video playthrough.
-                let audio = media.find("audio").and_then(|a| a.find("uri")).map(|uri_el| {
+                // rest of that same video playthrough. Not applicable
+                // at all to a sync-gated video (Phase 5 owns its whole
+                // play/pause lifecycle) -- left undetected there, same
+                // as this whole block already does for add_start/
+                // add_stop.
+                let audio = sync_key.is_none().then(|| {
+                    media.find("audio").and_then(|a| a.find("uri"))
+                }).flatten().map(|uri_el| {
                     let audio_url = percent_decode(uri_el.text());
                     let audio_volume = uri_el.get_attr("volume")
                         .and_then(|v| v.parse::<f32>().ok())
@@ -1576,10 +1637,6 @@ impl<'a> Translator<'a> {
                     writeln!(self.out,
                               "<audio id='m{mid}-audio' src='{audio_url}' style='display:none'></audio>")?;
                 }
-                // Embedded inside add_start, right where the video
-                // itself starts playing -- (re)starts the paired audio
-                // alongside it every single time, from its own
-                // beginning, regardless of where it currently was.
                 let audio_start = audio.as_ref().map(|(_, volume, audio_loop)| format!(
                     "let audioEl = document.getElementById('m{mid}-audio'); \
                      audioEl.volume = {volume}; audioEl.currentTime = 0; \
@@ -1605,7 +1662,12 @@ impl<'a> Translator<'a> {
                 // video's natural length, instead of always using the
                 // native `ended` event.
                 let use_duration = media.get_attr("useDuration").is_some_and(|v| v == "1");
-                if loop_video || use_duration {
+                if sync_key.is_some() {
+                    // Video wall: play timing is driven by the Lead (see
+                    // write_video_wall_runtime), not by the usual
+                    // add_start/add_stop autoplay wiring -- left unset
+                    // here; write_region adds the runtime's hooks.
+                } else if loop_video || use_duration {
                     // `.play()` can genuinely fail here too (see the
                     // main branch's own comment below for why) --
                     // same `.catch()`+`canplay` retry, just without
@@ -1680,19 +1742,27 @@ impl<'a> Translator<'a> {
                     duration = "() => 86400".to_string();
                 }
                 // Pause+reset when sent to background (regardless of
-                // branch above) -- otherwise the video kept playing
-                // invisibly, and would resume from wherever it was left
-                // off next time instead of restarting cleanly.
+                // which branch above ran) -- otherwise the video kept
+                // playing invisibly, and would resume from wherever it
+                // was left off next time instead of restarting cleanly.
+                // Skipped entirely for a sync-gated video -- Phase 5
+                // owns this widget's play/pause/seek lifecycle
+                // completely; the generic background-pause behavior
+                // would otherwise fight with it (e.g. resetting
+                // currentTime to 0 the moment the Lead pauses/hides
+                // anything else in the same layout).
                 //
                 // Removing `_canplayRetry` first (if it's still
                 // pending) is essential, not cosmetic -- see add_start's
                 // own comment above for the exact infinite-loop/extra-
                 // playthrough bugs this closes.
-                add_stop = format!(
-                    "{{ let el = document.getElementById('m{mid}'); \
-                       if (el._canplayRetry) {{ el.removeEventListener('canplay', el._canplayRetry); \
-                                                 el._canplayRetry = null; }} \
-                       el.pause(); el.currentTime = 0; {audio_stop}}}");
+                if sync_key.is_none() {
+                    add_stop = format!(
+                        "{{ let el = document.getElementById('m{mid}'); \
+                           if (el._canplayRetry) {{ el.removeEventListener('canplay', el._canplayRetry); \
+                                                     el._canplayRetry = null; }} \
+                           el.pause(); el.currentTime = 0; {audio_stop}}}");
+                }
             }
             (_, Some("audio")) => {
                 // See MediaInfo's own doc comment for why.
@@ -1828,7 +1898,158 @@ impl<'a> Translator<'a> {
         Ok(Some((mid, duration, add_start, add_stop, trans_in, ms_in, trans_out, ms_out,
                  always_hide_when_stopped)))
     }
+
+    /// Video wall: writes the page's single JS runtime (`arexiboVW`) and
+    /// one `register` call per sync-gated region that has a video. Does
+    /// nothing for a page without any.
+    fn write_video_wall_runtime(&mut self) -> Result<()> {
+        if self.vw_regions.is_empty() {
+            return Ok(());
+        }
+        writeln!(self.out, "<script type='text/javascript'>")?;
+        write!(self.out, "{VIDEO_WALL_RUNTIME_JS}")?;
+        for (key, items) in &self.vw_regions {
+            let items_json: Vec<String> = items.iter().map(|(mid, url)| {
+                let url_json = match url {
+                    Some(u) => serde_json::to_string(u).unwrap_or_else(|_| "null".to_string()),
+                    None => "null".to_string(),
+                };
+                format!("[{mid},{url_json}]")
+            }).collect();
+            let key_json = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string());
+            writeln!(self.out, "window.arexiboVW.register({key_json}, [{}]);", items_json.join(","))?;
+        }
+        writeln!(self.out, "</script>")?;
+        Ok(())
+    }
 }
+
+/// The video wall's page runtime. One script per page: polls the
+/// player's own server for the Lead's state, preloads/plays the item
+/// that is active, and (on the Lead's page) tells its own mainloop which
+/// item to prepare ahead of time and which has become the active one.
+/// Role-agnostic on purpose, like the rest of Phase 5: a Follower's
+/// mainloop simply ignores those requests.
+const VIDEO_WALL_RUNTIME_JS: &str = r#"window.arexiboVW = (function() {
+  var POLL_MS = 250, DRIFT_MS = 40, READY_FALLBACK_MS = 4000;
+  var regions = {}, byMid = {};
+  function el(mid) { return document.getElementById('m' + mid); }
+  function post(path, body) {
+    fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                 body: JSON.stringify(body)}).catch(function() {});
+  }
+  function nextVideo(r, idx) {
+    for (var k = 1; k < r.items.length; k++) {
+      var j = (idx + k) % r.items.length;
+      if (r.items[j].target !== null) return j;
+    }
+    return -1;
+  }
+  function begin(r, idx, round) {
+    r.playRound = round;
+    var pr = el(r.items[idx].mid).play();
+    if (pr && pr.catch) pr.catch(function() {});
+  }
+  function handlePreload(r, key, p) {
+    var it = r.items[p.item];
+    if (!it || it.target === null) return;
+    var e = el(it.mid);
+    if (r.active === p.item && r.playRound !== null && !e.paused) return;
+    r.armed[p.round] = p.item;
+    e.pause();
+    var reported = false;
+    function report() {
+      if (reported) return;
+      reported = true;
+      e.removeEventListener('canplaythrough', report);
+      post('/sync/video-ready', {syncKey: key, round: p.round});
+    }
+    e.addEventListener('canplaythrough', report);
+    e.load();
+    setTimeout(report, READY_FALLBACK_MS);
+  }
+  function handlePlay(r, round) {
+    var idx = r.armed[round];
+    if (idx === undefined) return;
+    if (r.active === idx) begin(r, idx, round); else r.pending = {round: round, idx: idx};
+  }
+  function poll(key) {
+    var r = regions[key];
+    fetch('/sync/video-command?syncKey=' + encodeURIComponent(key))
+      .then(function(res) { return res.json(); })
+      .then(function(st) {
+        if (!st) return;
+        (st.preloads || []).forEach(function(p) {
+          if (r.seen[p.round]) return;
+          r.seen[p.round] = true;
+          handlePreload(r, key, p);
+        });
+        if (st.play && r.lastPlay !== st.play.round) {
+          r.lastPlay = st.play.round;
+          handlePlay(r, st.play.round);
+        }
+        if (st.position && st.position.round === r.playRound && r.active !== null) {
+          var e = el(r.items[r.active].mid);
+          if (e && !e.paused && Math.abs(e.currentTime * 1000 - st.position.positionMs) > DRIFT_MS)
+            e.currentTime = st.position.positionMs / 1000;
+        }
+      }).catch(function() {});
+  }
+  function onStart(mid) {
+    var m = byMid[mid];
+    if (!m) return;
+    var r = regions[m.key], it = r.items[m.idx];
+    if (r.items.length === 1) {
+      if (r.started) { r.active = m.idx; return; }
+      r.started = true;
+    }
+    r.active = m.idx;
+    if (it.target !== null) {
+      if (r.pending && r.pending.idx === m.idx) {
+        var p = r.pending;
+        r.pending = null;
+        begin(r, m.idx, p.round);
+      }
+      post('/sync/video-item', {syncKey: m.key, item: m.idx, target: it.target, phase: 'start'});
+    }
+    var j = nextVideo(r, m.idx);
+    if (j >= 0)
+      post('/sync/video-item', {syncKey: m.key, item: j, target: r.items[j].target, phase: 'prepare'});
+  }
+  function onStop(mid) {
+    var m = byMid[mid];
+    if (!m) return;
+    var r = regions[m.key];
+    if (r.items.length === 1) return;
+    if (r.items[m.idx].target !== null) {
+      var e = el(mid);
+      if (e) e.pause();
+    }
+    if (r.active === m.idx) { r.active = null; r.playRound = null; }
+    if (r.pending && r.pending.idx === m.idx) r.pending = null;
+  }
+  function register(key, items) {
+    if (regions[key]) return;
+    regions[key] = {items: items.map(function(x) { return {mid: x[0], target: x[1]}; }),
+                    seen: {}, armed: {}, active: null, playRound: null, pending: null,
+                    lastPlay: null, started: false};
+    items.forEach(function(x, idx) { byMid[x[0]] = {key: key, idx: idx}; });
+    setInterval(function() { poll(key); }, POLL_MS);
+    poll(key);
+  }
+  setInterval(function() {
+    for (var key in regions) {
+      var r = regions[key];
+      if (r.active === null || r.playRound === null || r.items[r.active].target === null) continue;
+      var e = el(r.items[r.active].mid);
+      if (e && !e.paused)
+        post('/sync/video-position', {syncKey: key, round: r.playRound,
+                                      positionMs: Math.round(e.currentTime * 1000)});
+    }
+  }, POLL_MS);
+  return {register: register, onStart: onStart, onStop: onStop};
+})();
+"#;
 
 fn object_fit(el: &Element) -> &'static str {
     match el.find("scaleType") {
@@ -2364,35 +2585,6 @@ mod native_webpage_tests {
         // this widget type isn't exempt from that part of the fix.
         assert!(html.contains("style='left: 0px; top: 0px; width: 400px; height: 300px;'></div>"),
                 "the placeholder div itself must still use wrapper-relative (0,0) CSS -- got:\n{html}");
-    }
-
-    #[test]
-    fn webpage_widget_duration_zero_or_unset_lasts_as_long_as_the_layout() {
-        // A webpage widget's duration=0, or an unset duration, both
-        // mean "as long as the layout" -- not the shared 10s-default/
-        // literal-0 (which JS then treats as 1s via `|| 1`) that other
-        // widget types get.
-        for xlf in [
-            r#"<layout width="1920" height="1080">
-                <region id="7" left="0" top="0" width="400" height="300">
-                    <media id="9001" type="webpage" render="native" duration="0">
-                        <options><uri>https://example.com</uri><modeid>1</modeid></options>
-                    </media>
-                </region>
-            </layout>"#,
-            r#"<layout width="1920" height="1080">
-                <region id="7" left="0" top="0" width="400" height="300">
-                    <media id="9001" type="webpage" render="native">
-                        <options><uri>https://example.com</uri><modeid>1</modeid></options>
-                    </media>
-                </region>
-            </layout>"#,
-        ] {
-            let html = translate_xlf(xlf);
-            assert!(html.contains(", () => 86400, 9001],"),
-                    "webpage widget with duration=0 or unset must use the 86400s \
-                     as-long-as-the-layout duration -- got:\n{html}");
-        }
     }
 
     #[test]
@@ -4107,4 +4299,124 @@ mod sync_keys_tests {
     }
 }
 
+#[cfg(test)]
+mod video_wall_translation_tests {
+    use super::*;
+    use std::fs;
 
+    fn translate_xlf(xlf: &str, test_name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "arexibo_video_wall_translation_test_{test_name}_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let xlf_path = dir.join("test.xlf");
+        let html_path = dir.join("test.html");
+        fs::write(&xlf_path, xlf).unwrap();
+        let empty_map = HashMap::new();
+        let t = Translator::new(1, &xlf_path, &html_path, &empty_map, None, 0).unwrap();
+        t.translate().unwrap();
+        fs::read_to_string(html_path).unwrap()
+    }
+
+    fn layout(regions: &str) -> String {
+        format!(r#"<layout width="1080" height="1920">{regions}</layout>"#)
+    }
+
+    fn region(id: i32, key: &str, items: &str) -> String {
+        format!(r#"<region id="{id}" left="0" top="0" width="1080" height="1920" syncKey="{key}">{items}</region>"#)
+    }
+
+    fn video(id: i32, uri: &str) -> String {
+        format!(r#"<media id="{id}" type="video" duration="30"><options><uri>{uri}</uri></options></media>"#)
+    }
+
+    fn image(id: i32) -> String {
+        format!(r#"<media id="{id}" type="image" duration="10"><options><uri>p{id}.png</uri></options></media>"#)
+    }
+
+    #[test]
+    fn translate_reports_the_four_basic_values() {
+        let xlf = layout(&region(1, "wall1", &video(100, "a.mp4")));
+        let dir = std::env::temp_dir().join(format!("arexibo_vw_basic_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("t.xlf"), xlf).unwrap();
+        let empty = HashMap::new();
+        let t = Translator::new(1, &dir.join("t.xlf"), &dir.join("t.html"), &empty, None, 0).unwrap();
+        let (w, h, _, keys) = t.translate().unwrap();
+        assert_eq!((w, h, keys), (1080, 1920, vec!["wall1".to_string()]));
+    }
+
+    #[test]
+    fn every_video_of_a_sync_region_is_registered_in_playlist_order() {
+        let items = format!("{}{}", video(100, "a.mp4"), video(102, "b.mp4"));
+        let html = translate_xlf(&layout(&region(1, "wall1", &items)), "two_videos");
+        assert!(html.contains(r#"window.arexiboVW.register("wall1", [[100,"a.mp4"],[102,"b.mp4"]]);"#),
+                "got:\n{html}");
+        // Each <video> keeps its own authored source -- the old design
+        // re-pointed all of them to the first one's URL.
+        assert!(html.contains("id='m100' src='a.mp4'") && html.contains("id='m102' src='b.mp4'"));
+        assert_eq!(html.matches("window.arexiboVW = ").count(), 1, "a single runtime per page");
+    }
+
+    #[test]
+    fn a_mixed_playlist_registers_every_item_with_null_for_non_videos() {
+        let items = format!("{}{}{}", video(100, "a.mp4"), image(101), video(102, "b.mp4"));
+        let html = translate_xlf(&layout(&region(1, "wall1", &items)), "mixed");
+        assert!(html.contains(r#"register("wall1", [[100,"a.mp4"],[101,null],[102,"b.mp4"]]);"#),
+                "got:\n{html}");
+    }
+
+    #[test]
+    fn every_item_of_a_synced_video_region_gets_start_and_stop_hooks() {
+        let items = format!("{}{}{}", video(100, "a.mp4"), image(101), video(102, "b.mp4"));
+        let html = translate_xlf(&layout(&region(1, "wall1", &items)), "hooks");
+        for mid in [100, 101, 102] {
+            assert!(html.contains(&format!("window.arexiboVW.onStart({mid});")), "start {mid}");
+            assert!(html.contains(&format!("window.arexiboVW.onStop({mid});")), "stop {mid}");
+        }
+    }
+
+    #[test]
+    fn a_sync_region_without_any_video_gets_no_runtime_or_hooks() {
+        let items = format!("{}{}", image(101), image(103));
+        let html = translate_xlf(&layout(&region(1, "wall1", &items)), "images_only");
+        assert!(!html.contains("arexiboVW"), "got:\n{html}");
+    }
+
+    #[test]
+    fn an_ordinary_non_sync_gated_video_does_not_get_the_runtime() {
+        let html = translate_xlf(&layout(&region(1, "", &video(100, "show.mp4"))), "not_sync");
+        assert!(!html.contains("arexiboVW"), "an ordinary video must keep its normal \
+                autoplay behavior untouched -- got:\n{html}");
+    }
+
+    #[test]
+    fn a_sync_gated_video_does_not_get_the_normal_background_pause_reset() {
+        let html = translate_xlf(&layout(&region(1, "wall1", &video(100, "show.mp4"))), "no_bg_reset");
+        assert!(!html.contains("el.pause(); el.currentTime = 0;"),
+                "the runtime owns this video's lifecycle -- got:\n{html}");
+    }
+
+    #[test]
+    fn regions_with_different_sync_keys_register_separately() {
+        let xlf = layout(&format!("{}{}", region(1, "wall1", &video(100, "a.mp4")),
+                                  region(2, "wall2", &video(200, "b.mp4"))));
+        let html = translate_xlf(&xlf, "two_regions");
+        assert!(html.contains(r#"register("wall1", [[100,"a.mp4"]]);"#));
+        assert!(html.contains(r#"register("wall2", [[200,"b.mp4"]]);"#));
+    }
+
+    #[test]
+    fn the_runtime_talks_to_the_players_own_video_endpoints() {
+        let html = translate_xlf(&layout(&region(1, "wall1", &video(100, "a.mp4"))), "endpoints");
+        for needle in ["/sync/video-command?syncKey=", "/sync/video-ready", "/sync/video-position",
+                       "/sync/video-item", "phase: 'prepare'", "phase: 'start'"] {
+            assert!(html.contains(needle), "missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn a_media_name_with_quotes_is_escaped_in_the_registration() {
+        let html = translate_xlf(&layout(&region(1, "wall1", &video(100, "a\"b.mp4"))), "quotes");
+        assert!(html.contains(r#"[[100,"a\"b.mp4"]]"#), "got:\n{html}");
+    }
+}

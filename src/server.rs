@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use crossbeam_channel::Sender;
 use itertools::Itertools;
+use serde::Serialize;
 use tiny_http::{Request, Response, ResponseBox, Header, StatusCode};
 
 use crate::util::percent_decode;
@@ -149,6 +150,118 @@ pub enum SplashState {
 
 pub type SplashStateStore = Arc<Mutex<SplashState>>;
 
+/// Latest video-wall state for one syncKey -- the page's JS polls
+/// `GET /sync/video-command?syncKey=X`. Symmetric for Lead and
+/// Follower: mainloop.rs fills it from its own orchestration (Lead) or
+/// from `syncgroup::SyncGroup::video_commands()` (Follower).
+///
+/// A snapshot rather than one "latest command": with lookahead, a
+/// Preload for the next item arrives while Position updates for the
+/// current one keep coming, so a single slot would lose it. `round`
+/// ids are unique per Lead round, so a stale Play never matches a new
+/// Preload.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoWallState {
+    /// Oldest first, bounded by `MAX_PRELOADS`.
+    pub preloads: Vec<VideoPreload>,
+    pub play: Option<VideoPlay>,
+    pub position: Option<VideoPosition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoPreload { pub round: u32, pub item: u32, pub target: String }
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoPlay { pub round: u32 }
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoPosition { pub round: u32, pub position_ms: i64 }
+
+impl VideoWallState {
+    const MAX_PRELOADS: usize = 4;
+
+    pub fn push_preload(&mut self, preload: VideoPreload) {
+        self.preloads.retain(|p| p.round != preload.round);
+        self.preloads.push(preload);
+        if self.preloads.len() > Self::MAX_PRELOADS {
+            self.preloads.remove(0);
+        }
+    }
+}
+
+pub type VideoCommandStore = Arc<Mutex<HashMap<String, VideoWallState>>>;
+
+/// `POST /sync/video-ready` -- a widget's own JS reporting it has
+/// buffered enough of `sync_key` to play. Relayed to mainloop.rs, which
+/// either forwards it over the network (Follower, via
+/// syncgroup::SyncGroup::report_video_ready) or aggregates it directly
+/// alongside every other Follower's own report (Lead).
+#[derive(Debug, Clone)]
+pub struct VideoReadyRequest {
+    pub sync_key: String,
+    pub round: u32,
+}
+
+/// `POST /sync/video-position` -- the Lead's own local widget reporting
+/// its real playback position, relayed to mainloop.rs to broadcast via
+/// syncgroup::SyncGroup::publish_video_position. Never sent by a
+/// Follower's own widget (it only ever receives Position broadcasts).
+#[derive(Debug, Clone)]
+pub struct VideoPositionRequest {
+    pub sync_key: String,
+    pub round: u32,
+    pub position_ms: i64,
+}
+
+/// What a page tells its own mainloop about a sync-gated video item.
+/// Only a Lead acts on these (a Follower's mainloop ignores them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoItemPhase {
+    /// "Please start preloading this item" -- sent ahead of time, while
+    /// the item before it is still showing.
+    Prepare,
+    /// "This item is now the active one."
+    Start,
+}
+
+/// `POST /sync/video-item`.
+#[derive(Debug, Clone)]
+pub struct VideoItemRequest {
+    pub sync_key: String,
+    pub item: u32,
+    pub target: String,
+    pub phase: VideoItemPhase,
+}
+
+/// Bundles every video-wall-related shared handle a Server needs,
+/// grouped together since they're always constructed and passed as a
+/// unit (see main.rs's own video-wall setup) -- keeps Server::new's
+/// own argument list from growing by three more on top of everything
+/// already there.
+#[derive(Clone)]
+pub struct VideoSyncHandles {
+    pub command_store: VideoCommandStore,
+    pub ready_tx: Sender<VideoReadyRequest>,
+    pub position_tx: Sender<VideoPositionRequest>,
+    pub item_tx: Sender<VideoItemRequest>,
+}
+
+/// The receiving side of the same channels `VideoSyncHandles` sends
+/// into -- constructed from the same underlying channels/Arc in
+/// main.rs, given to mainloop.rs's own Handler (which writes into
+/// `command_store` and reads `ready_rx`/`position_rx`, the mirror
+/// image of what Server does with its own `VideoSyncHandles`).
+pub struct VideoSyncReceivers {
+    pub command_store: VideoCommandStore,
+    pub ready_rx: crossbeam_channel::Receiver<VideoReadyRequest>,
+    pub position_rx: crossbeam_channel::Receiver<VideoPositionRequest>,
+    pub item_rx: crossbeam_channel::Receiver<VideoItemRequest>,
+}
+
 pub struct Server {
     dir: PathBuf,
     server: tiny_http::Server,
@@ -158,6 +271,7 @@ pub struct Server {
     manual_register_tx: Sender<ManualRegisterRequest>,
     local_data: LocalDataStore,
     registration_code: RegistrationCodeStore,
+    video_sync: VideoSyncHandles,
     /// Whether this run started with no real CMS config at all (see
     /// main.rs's own "awaiting_code" doc comment) -- decided once at
     /// startup, never changes for this process's lifetime. Splash
@@ -186,13 +300,14 @@ impl Server {
                duration_tx: Sender<DurationRequest>, trigger_tx: Sender<TriggerRequest>,
                fault_tx: Sender<FaultRequest>, manual_register_tx: Sender<ManualRegisterRequest>,
                local_data: LocalDataStore, registration_code: RegistrationCodeStore,
-               awaiting_registration: bool, splash_state: SplashStateStore)
-               -> Result<Self> {
+               video_sync: VideoSyncHandles, awaiting_registration: bool,
+               splash_state: SplashStateStore) -> Result<Self> {
         let server = tiny_http::Server::http((bind_addr, port))
             .map_err(|e| anyhow!(e))?;
         let dir = dir.canonicalize().context("getting canonical server dir name")?;
         Ok(Self { dir, server, duration_tx, trigger_tx, fault_tx, manual_register_tx,
-                  local_data, registration_code, awaiting_registration, splash_state })
+                  local_data, registration_code, video_sync, awaiting_registration,
+                  splash_state })
     }
 
     pub fn port(&self) -> u16 {
@@ -210,6 +325,7 @@ impl Server {
             let manual_register_tx = self.manual_register_tx.clone();
             let local_data = self.local_data.clone();
             let registration_code = self.registration_code.clone();
+            let video_sync = self.video_sync.clone();
             let awaiting_registration = self.awaiting_registration;
             let splash_state = self.splash_state.clone();
             thread::spawn(move || {
@@ -217,7 +333,7 @@ impl Server {
                     let mut req = server.recv().unwrap();
                     match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx,
                                        &manual_register_tx, &local_data, &registration_code,
-                                       awaiting_registration, &splash_state) {
+                                       &video_sync, awaiting_registration, &splash_state) {
                         Ok(resp) => {  let _ = req.respond(resp); }
                         Err(e) => {
                             log::warn!("processing HTTP req {}: {:#}", req.url(), e);
@@ -318,6 +434,63 @@ impl Server {
             .boxed())
     }
 
+    /// Video wall (Sync Group Phase 5) -- see VideoReadyRequest's own
+    /// doc comment.
+    fn handle_video_ready(req: &mut Request, ready_tx: &Sender<VideoReadyRequest>)
+        -> Result<ResponseBox> {
+        let mut body = String::new();
+        req.as_reader().read_to_string(&mut body).context("reading video-ready request body")?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("parsing video-ready request body: {body:?}"))?;
+        let sync_key = json.get("syncKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        ensure!(!sync_key.is_empty(), "syncKey must be non-empty");
+        let round = json.get("round").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let _ = ready_tx.send(VideoReadyRequest { sync_key, round });
+        Ok(Response::from_data(b"{}".as_slice())
+            .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            .boxed())
+    }
+
+    /// `POST /sync/video-item` -- see VideoItemRequest's doc comment.
+    fn handle_video_item(req: &mut Request, item_tx: &Sender<VideoItemRequest>)
+        -> Result<ResponseBox> {
+        let mut body = String::new();
+        req.as_reader().read_to_string(&mut body).context("reading video-item request body")?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("parsing video-item request body: {body:?}"))?;
+        let sync_key = json.get("syncKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        ensure!(!sync_key.is_empty(), "syncKey must be non-empty");
+        let item = json.get("item").and_then(|v| v.as_u64()).context("item is required")? as u32;
+        let target = json.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let phase = match json.get("phase").and_then(|v| v.as_str()) {
+            Some("prepare") => VideoItemPhase::Prepare,
+            Some("start") => VideoItemPhase::Start,
+            other => bail!("unknown video-item phase: {other:?}"),
+        };
+        let _ = item_tx.send(VideoItemRequest { sync_key, item, target, phase });
+        Ok(Response::from_data(b"{}".as_slice())
+            .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            .boxed())
+    }
+
+    /// Video wall (Sync Group Phase 5) -- see VideoPositionRequest's
+    /// own doc comment.
+    fn handle_video_position(req: &mut Request, position_tx: &Sender<VideoPositionRequest>)
+        -> Result<ResponseBox> {
+        let mut body = String::new();
+        req.as_reader().read_to_string(&mut body).context("reading video-position request body")?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("parsing video-position request body: {body:?}"))?;
+        let sync_key = json.get("syncKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let position_ms = json.get("positionMs").and_then(|v| v.as_i64()).unwrap_or(0);
+        ensure!(!sync_key.is_empty(), "syncKey must be non-empty");
+        let round = json.get("round").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let _ = position_tx.send(VideoPositionRequest { sync_key, round, position_ms });
+        Ok(Response::from_data(b"{}".as_slice())
+            .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            .boxed())
+    }
+
 
     /// unchanged) purely to apply `Cache-Control: no-store` uniformly
     /// to every successful response, regardless of which of
@@ -333,11 +506,11 @@ impl Server {
              trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
              manual_register_tx: &Sender<ManualRegisterRequest>,
              local_data: &LocalDataStore, registration_code: &RegistrationCodeStore,
-             awaiting_registration: bool, splash_state: &SplashStateStore)
-             -> Result<ResponseBox> {
+             video_sync: &VideoSyncHandles, awaiting_registration: bool,
+             splash_state: &SplashStateStore) -> Result<ResponseBox> {
         let resp = Self::serve_inner(dir, req, duration_tx, trigger_tx, fault_tx, manual_register_tx,
-                                      local_data, registration_code, awaiting_registration,
-                                      splash_state)?;
+                                      local_data, registration_code, video_sync,
+                                      awaiting_registration, splash_state)?;
         Ok(resp.with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap()))
     }
 
@@ -346,8 +519,8 @@ impl Server {
                     trigger_tx: &Sender<TriggerRequest>, fault_tx: &Sender<FaultRequest>,
                     manual_register_tx: &Sender<ManualRegisterRequest>,
                     local_data: &LocalDataStore, registration_code: &RegistrationCodeStore,
-                    awaiting_registration: bool, splash_state: &SplashStateStore)
-                    -> Result<ResponseBox> {
+                    video_sync: &VideoSyncHandles, awaiting_registration: bool,
+                    splash_state: &SplashStateStore) -> Result<ResponseBox> {
         log::debug!("HTTP request: {}", req.url());
         let url = req.url();
         let (path_only, query) = url.split_once('?').unwrap_or((url, ""));
@@ -439,6 +612,29 @@ impl Server {
                     .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
                     .boxed()
             }
+
+            // Video wall (Sync Group Phase 5): a widget's own JS polls
+            // this for its currently pending instruction (see
+            // WidgetVideoCommand's own doc comment).
+            "/sync/video-command" => {
+                let sync_key = query.split('&').find_map(|kv| kv.strip_prefix("syncKey="))
+                    .unwrap_or("");
+                let state = video_sync.command_store.lock().unwrap().get(sync_key).cloned();
+                let json = match state {
+                    Some(st) => serde_json::to_string(&st)?,
+                    None => "null".to_string(),
+                };
+                Response::from_data(json.into_bytes())
+                    .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                    .boxed()
+            }
+
+            "/sync/video-ready" => return Self::handle_video_ready(req, &video_sync.ready_tx),
+
+            "/sync/video-item" => return Self::handle_video_item(req, &video_sync.item_tx),
+
+            "/sync/video-position" =>
+                return Self::handle_video_position(req, &video_sync.position_tx),
 
 
             // Real-time DataSet data lookup -- confirmed from a real
@@ -752,6 +948,17 @@ fn parse_range(total_size: u64, header: &str) -> Result<(u64, u64, u64)> {
     Ok((from, to, size))
 }
 
+
+#[cfg(test)]
+fn test_video_sync() -> VideoSyncHandles {
+    VideoSyncHandles {
+        command_store: Arc::new(Mutex::new(HashMap::new())),
+        ready_tx: crossbeam_channel::unbounded().0,
+        position_tx: crossbeam_channel::unbounded().0,
+        item_tx: crossbeam_channel::unbounded().0,
+    }
+}
+
 #[cfg(test)]
 mod realtime_tests {
     use super::*;
@@ -769,7 +976,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), std::sync::Arc::new(std::sync::Mutex::new(None)), test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         (port, local_data)
@@ -811,7 +1018,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -834,7 +1041,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -858,7 +1065,7 @@ mod realtime_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, duration_tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -920,7 +1127,7 @@ mod stable_port_tests {
             let (fault_tx, _fault_rx) = unbounded();
             let (manual_register_tx, _manual_register_rx) = unbounded();
             let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-            match Server::new(dir.clone(), "127.0.0.1", want, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))) {
+            match Server::new(dir.clone(), "127.0.0.1", want, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), test_video_sync(), false, Arc::new(Mutex::new(SplashState::Loading))) {
                 Ok(server) => {
                     assert_eq!(server.port(), want, "a requested non-zero port must be used as is");
                     return;
@@ -950,7 +1157,7 @@ mod no_cache_header_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -1045,7 +1252,7 @@ mod json_content_type_tests {
         let (fault_tx, _fault_rx) = unbounded();
         let (manual_register_tx, _manual_register_rx) = unbounded();
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
-        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx.clone(), manual_register_tx.clone(), local_data, std::sync::Arc::new(std::sync::Mutex::new(None)), test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
 
@@ -1074,7 +1281,7 @@ mod manual_register_tests {
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
                                   manual_register_tx, local_data,
-                                  Arc::new(Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+                                  Arc::new(Mutex::new(None)), test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         (port, manual_register_rx)
@@ -1191,8 +1398,8 @@ mod splash_html_tests {
                 "must show a distinct status while awaiting CMS authorization -- got:\n{html}");
         // Checks the actual displayed status div, not the whole page --
         // a static HTML comment elsewhere legitimately mentions
-        // "LOADING..." as historical context (why this text element
-        // exists at all), unrelated to which status is shown.
+        // "LOADING..." as historical context, unrelated to which
+        // status is shown.
         assert!(!html.contains("  LOADING...\n"),
                 "the generic loading text must not be the one displayed -- got:\n{html}");
         // Unrelated to awaiting_registration -- no registration
@@ -1239,7 +1446,7 @@ mod registration_code_endpoint_tests {
         let registration_code: RegistrationCodeStore =
             Arc::new(Mutex::new(initial_code.map(str::to_string)));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
-                                  manual_register_tx, local_data, registration_code, false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+                                  manual_register_tx, local_data, registration_code, test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         port
@@ -1263,6 +1470,151 @@ mod registration_code_endpoint_tests {
 }
 
 #[cfg(test)]
+mod video_sync_endpoint_tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    struct TestServer {
+        port: u16,
+        command_store: VideoCommandStore,
+        ready_rx: crossbeam_channel::Receiver<VideoReadyRequest>,
+        position_rx: crossbeam_channel::Receiver<VideoPositionRequest>,
+        item_rx: crossbeam_channel::Receiver<VideoItemRequest>,
+    }
+
+    fn start_test_server() -> TestServer {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_video_sync_test_{}_{n}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = unbounded();
+        let (trigger_tx, _trigger_rx) = unbounded();
+        let (fault_tx, _fault_rx) = unbounded();
+        let (manual_register_tx, _manual_register_rx) = unbounded();
+        let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
+        let command_store: VideoCommandStore = Arc::new(Mutex::new(HashMap::new()));
+        let (ready_tx, ready_rx) = unbounded();
+        let (position_tx, position_rx) = unbounded();
+        let (item_tx, item_rx) = unbounded();
+        let video_sync = VideoSyncHandles {
+            command_store: command_store.clone(), ready_tx, position_tx, item_tx,
+        };
+        let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
+                                  manual_register_tx, local_data,
+                                  Arc::new(Mutex::new(None)), video_sync, false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
+        let port = server.port();
+        server.start_pool();
+        TestServer { port, command_store, ready_rx, position_rx, item_rx }
+    }
+
+    #[test]
+    fn video_command_returns_null_when_nothing_pending() {
+        let s = start_test_server();
+        let resp = ureq::get(&format!("http://127.0.0.1:{}/sync/video-command?syncKey=key1",
+                                       s.port)).call().unwrap();
+        let body = resp.into_body().read_to_string().unwrap();
+        assert_eq!(body, "null");
+    }
+
+    #[test]
+    fn video_command_returns_the_pending_state_for_that_key_only() {
+        let s = start_test_server();
+        s.command_store.lock().unwrap().insert("key1".to_string(), VideoWallState {
+            preloads: vec![VideoPreload { round: 5, item: 1, target: "123.mp4".to_string() }],
+            play: Some(VideoPlay { round: 4 }),
+            position: Some(VideoPosition { round: 4, position_ms: 900 }),
+        });
+        let resp = ureq::get(&format!("http://127.0.0.1:{}/sync/video-command?syncKey=key1",
+                                       s.port)).call().unwrap();
+        let body = resp.into_body().read_to_string().unwrap();
+        assert_eq!(body, r#"{"preloads":[{"round":5,"item":1,"target":"123.mp4"}],"play":{"round":4},"position":{"round":4,"positionMs":900}}"#);
+
+        // A different key with nothing pending must not see key1's own
+        // state.
+        let resp = ureq::get(&format!("http://127.0.0.1:{}/sync/video-command?syncKey=key2",
+                                       s.port)).call().unwrap();
+        assert_eq!(resp.into_body().read_to_string().unwrap(), "null");
+    }
+
+    #[test]
+    fn push_preload_keeps_the_newest_few_and_replaces_a_repeated_round() {
+        let mut st = VideoWallState::default();
+        for round in 1..=6u32 {
+            st.push_preload(VideoPreload { round, item: 0, target: format!("{round}.mp4") });
+        }
+        let rounds: Vec<u32> = st.preloads.iter().map(|p| p.round).collect();
+        assert_eq!(rounds, vec![3, 4, 5, 6], "oldest dropped, order kept");
+        st.push_preload(VideoPreload { round: 5, item: 2, target: "again.mp4".to_string() });
+        assert_eq!(st.preloads.iter().filter(|p| p.round == 5).count(), 1);
+        assert_eq!(st.preloads.last().unwrap().target, "again.mp4");
+    }
+
+    #[test]
+    fn video_item_is_relayed_with_its_phase() {
+        let s = start_test_server();
+        for (phase, expected) in [("prepare", VideoItemPhase::Prepare), ("start", VideoItemPhase::Start)] {
+            let body = format!(r#"{{"syncKey": "key1", "item": 3, "target": "a.mp4", "phase": "{phase}"}}"#);
+            let resp = ureq::post(&format!("http://127.0.0.1:{}/sync/video-item", s.port))
+                .header("Content-Type", "application/json").send(body.as_bytes()).unwrap();
+            assert_eq!(resp.status(), 200);
+            let req = s.item_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            assert_eq!((req.sync_key.as_str(), req.item, req.target.as_str(), req.phase),
+                       ("key1", 3, "a.mp4", expected));
+        }
+    }
+
+    #[test]
+    fn video_item_with_an_unknown_phase_or_empty_key_is_rejected() {
+        let s = start_test_server();
+        for body in [r#"{"syncKey": "key1", "item": 1, "phase": "later"}"#,
+                     r#"{"syncKey": "", "item": 1, "phase": "start"}"#,
+                     r#"{"syncKey": "key1", "phase": "start"}"#] {
+            let resp = ureq::post(&format!("http://127.0.0.1:{}/sync/video-item", s.port))
+                .header("Content-Type", "application/json").send(body.as_bytes());
+            assert!(resp.is_err() || resp.unwrap().status() != 200, "{body}");
+        }
+        assert!(s.item_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn video_ready_is_relayed_and_acknowledged() {
+        let s = start_test_server();
+        let resp = ureq::post(&format!("http://127.0.0.1:{}/sync/video-ready", s.port))
+            .header("Content-Type", "application/json")
+            .send(br#"{"syncKey": "key1", "round": 9}"#).unwrap();
+        assert_eq!(resp.status(), 200);
+        let report = s.ready_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(report.sync_key, "key1");
+        assert_eq!(report.round, 9);
+    }
+
+    #[test]
+    fn video_position_is_relayed_and_acknowledged() {
+        let s = start_test_server();
+        let resp = ureq::post(&format!("http://127.0.0.1:{}/sync/video-position", s.port))
+            .header("Content-Type", "application/json")
+            .send(br#"{"syncKey": "key1", "round": 9, "positionMs": 4200}"#).unwrap();
+        assert_eq!(resp.status(), 200);
+        let report = s.position_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(report.sync_key, "key1");
+        assert_eq!(report.position_ms, 4200);
+        assert_eq!(report.round, 9);
+    }
+
+    #[test]
+    fn video_ready_with_an_empty_key_is_rejected() {
+        let s = start_test_server();
+        let resp = ureq::post(&format!("http://127.0.0.1:{}/sync/video-ready", s.port))
+            .header("Content-Type", "application/json")
+            .send(br#"{"syncKey": ""}"#);
+        assert!(resp.is_err() || resp.unwrap().status() != 200);
+        assert!(s.ready_rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
 mod local_file_tests {
     use super::*;
     use crate::util::percent_encode;
@@ -1281,7 +1633,8 @@ mod local_file_tests {
         let local_data: LocalDataStore = Arc::new(Mutex::new(HashMap::new()));
         let server = Server::new(dir, "127.0.0.1", 0, tx, trigger_tx, fault_tx,
                                   manual_register_tx, local_data,
-                                  std::sync::Arc::new(std::sync::Mutex::new(None)), false, Arc::new(Mutex::new(SplashState::Loading))).unwrap();
+                                  std::sync::Arc::new(std::sync::Mutex::new(None)),
+                                  test_video_sync(), false, std::sync::Arc::new(std::sync::Mutex::new(SplashState::Loading))).unwrap();
         let port = server.port();
         server.start_pool();
         port

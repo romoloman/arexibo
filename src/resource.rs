@@ -1074,20 +1074,19 @@ impl Cache {
             }
             Err(e) => {
                 // Deliberately NOT pruning on "Requested an invalid
-                // file" (or any other fault text) here -- tried twice
-                // (a direct re-check against our own cached resource,
-                // then the fault text itself with a 2-strikes safety
-                // margin) and rejected both times: confirmed via a real
-                // report, the CMS can take several minutes to
-                // materialize a dataset's own view/cache after a bulk
-                // collectNow, during which a genuinely valid, brand-new
-                // widget can keep failing with this exact fault for far
-                // longer than any short retry-count margin would
-                // tolerate without risking a false prune. Ground truth
-                // (the CMS explicitly purging the layout/widget, see
-                // purge_some) is the only mechanism trusted to stop
-                // tracking a widget -- this failure path only backs off
-                // and retries, same as any other kind of failure.
+                // file" (or any other fault text) here -- tried and
+                // rejected: confirmed via a real report, the CMS can
+                // take several minutes to materialize a dataset's own
+                // view/cache after a bulk collectNow, during which a
+                // genuinely valid, brand-new widget can keep failing
+                // with this exact fault for far longer than any short
+                // retry-count margin would tolerate without risking a
+                // false prune. Ground truth (the CMS explicitly purging
+                // the layout/widget, or it falling out of
+                // RequiredFiles -- see purge_some/stale_layout_keys) is
+                // the only mechanism trusted to stop tracking a widget
+                // -- this failure path only backs off and retries, same
+                // as any other kind of failure.
                 if let Some(state) = self.data_widgets.get_mut(&widget_id) {
                     state.last_attempt_failed_at = Some(now);
                 }
@@ -2121,6 +2120,43 @@ mod data_widget_polling_tests {
         test_cms_at(port)
     }
 
+    fn make_cms_with_getdata_fault(faultstring: &'static str) -> xmds::Cms {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = format!(
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><Fault><faultcode>soap:Server</faultcode>
+<faultstring>{faultstring}</faultstring></Fault></soap:Body>
+</soap:Envelope>"#);
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        test_cms_at(port)
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_usual_backoff_regardless_of_fault_text() {
+        // No fault text (not even the CMS's own "Requested an invalid
+        // file") is trusted to mean the widget is genuinely gone -- see
+        // refresh_data_widget's own doc comment for why. Every failure
+        // just backs off, same as "Cache not ready" here.
+        let (mut cache, _dir) = make_cache();
+        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
+        let mut cms = make_cms_with_getdata_fault("Cache not ready.");
+
+        let now = Instant::now();
+        assert!(cache.refresh_data_widget(4543, &mut cms, now).is_err());
+
+        assert!(cache.data_widgets.contains_key(&4543),
+                "must still be tracked -- this fault says nothing about the widget's own \
+                 continued existence");
+        assert!(cache.data_widgets_due(now).is_empty(), "must back off, not retry immediately");
+        let just_over_backoff = now + mainloop::RESOURCE_RETRY_DELAY + Duration::from_millis(1);
+        assert_eq!(cache.data_widgets_due(just_over_backoff), vec![4543]);
+    }
+
     #[test]
     fn a_failed_refresh_is_not_immediately_due_again() {
         let (mut cache, _dir) = make_cache();
@@ -2173,43 +2209,6 @@ mod data_widget_polling_tests {
         // interval (5 minutes), not the short retry backoff.
         let just_under_5_min = succeeded_at + Duration::from_secs(5 * 60 - 1);
         assert!(cache.data_widgets_due(just_under_5_min).is_empty());
-    }
-
-    fn make_cms_with_getdata_fault(faultstring: &'static str) -> xmds::Cms {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
-        std::thread::spawn(move || {
-            for request in server.incoming_requests() {
-                let body = format!(
-                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-<soap:Body><Fault><faultcode>soap:Server</faultcode>
-<faultstring>{faultstring}</faultstring></Fault></soap:Body>
-</soap:Envelope>"#);
-                let _ = request.respond(tiny_http::Response::from_string(body));
-            }
-        });
-        test_cms_at(port)
-    }
-
-    #[test]
-    fn a_failed_refresh_keeps_the_usual_backoff_regardless_of_fault_text() {
-        // No fault text (not even the CMS's own "Requested an invalid
-        // file") is trusted to mean the widget is genuinely gone -- see
-        // refresh_data_widget's own doc comment for why. Every failure
-        // just backs off, same as "Cache not ready" here.
-        let (mut cache, _dir) = make_cache();
-        cache.discover_data_widgets(V7_WIDGET_HTML, 1, 940);
-        let mut cms = make_cms_with_getdata_fault("Cache not ready.");
-
-        let now = Instant::now();
-        assert!(cache.refresh_data_widget(4543, &mut cms, now).is_err());
-
-        assert!(cache.data_widgets.contains_key(&4543),
-                "must still be tracked -- this fault says nothing about the widget's own \
-                 continued existence");
-        assert!(cache.data_widgets_due(now).is_empty(), "must back off, not retry immediately");
-        let just_over_backoff = now + mainloop::RESOURCE_RETRY_DELAY + Duration::from_millis(1);
-        assert_eq!(cache.data_widgets_due(just_over_backoff), vec![4543]);
     }
 
     // The following tests cover pruning by active schedule -- found
