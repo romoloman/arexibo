@@ -8,6 +8,7 @@
 #include <QTouchEvent>
 
 #include "view.h"
+#include <algorithm>
 
 // (Separate QWebEngineProfile for native webpage widgets: tried and
 // reverted, see status doc -- didn't fix the freeze and broke
@@ -94,9 +95,63 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
     connect(this, SIGNAL(overlayHide()), this, SLOT(overlayHideImpl()));
 
     view->setUrl(QUrl(base_uri + "0.xlf.html"));
+
+    if (const char *ms = getenv("AREXIBO_SPLASH_MS"))
+        splash_min_ms = std::max(0, atoi(ms));
+
+    // Never hold a deferred navigation forever if the splash's own init
+    // never arrives.
+    QTimer::singleShot(3000, this, [this]() {
+        if (!splash_inited && !splash_released) {
+            std::cout << "WARN : [arexibo::qt] splash screen not ready after 3s, "
+                         "continuing anyway" << std::endl;
+            releaseDeferredNavigation();
+        }
+    });
+}
+
+void Window::splashInitialized()
+{
+    if (splash_inited) return;
+    splash_inited = true;
+    splash_clock.start();
+    tryReleaseNavigation();
+}
+
+// Releases a deferred navigation once the splash has been up for its
+// minimum time; re-arms itself for the remainder otherwise.
+void Window::tryReleaseNavigation()
+{
+    if (splash_released || !splash_inited) return;
+    qint64 left = splash_min_ms - splash_clock.elapsed();
+    if (left > 0) {
+        QTimer::singleShot((int)left, this, [this]() { tryReleaseNavigation(); });
+        return;
+    }
+    releaseDeferredNavigation();
+}
+
+void Window::releaseDeferredNavigation()
+{
+    splash_released = true;
+    if (!deferred_navigation.isEmpty()) {
+        QString file = deferred_navigation;
+        deferred_navigation.clear();
+        navigateToImpl(file);
+    }
 }
 
 void Window::navigateToImpl(QString file) {
+    // A navigation arriving before the splash has loaded (cached schedule:
+    // it can come within milliseconds) would cancel the splash's own init,
+    // leaving the window in its initial letterboxed geometry. Wait for it.
+    if (!splash_released && file != "0.xlf.html") {
+        std::cout << "DEBUG: [arexibo::qt] splash not ready yet, deferring navigation to "
+                  << file.toStdString() << std::endl;
+        deferred_navigation = file;
+        tryReleaseNavigation();
+        return;
+    }
     clearNativeViews(false);
     // A new layout is about to load into `view` -- its own real
     // dimensions won't be known/applied again until its own
@@ -1015,6 +1070,8 @@ void JSInterface::jsLayoutInit(int id, int width, int height, QString region_geo
     // moment an overlay's own scaling read it).
     wnd->base_layout_scaled = true;
     wnd->cb(wnd->cb_ptr, CB_LAYOUT_INIT, id, width, height);
+    if (id == 0)
+        wnd->splashInitialized();
 }
 
 void JSInterface::jsLayoutDone(int id)

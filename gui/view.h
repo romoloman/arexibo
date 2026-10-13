@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <unistd.h>
+#include <QElapsedTimer>
 #include <QMainWindow>
 #include <QScreen>
 #include <QMap>
@@ -193,6 +194,18 @@ private:
 
     int layout_width;
     int layout_height;
+    // Splash (layout 0): the first navigation away from it waits until it
+    // has reported its own jsLayoutInit (window geometry final) and has
+    // then been on screen for `splash_min_ms` (AREXIBO_SPLASH_MS, default
+    // 1000; 0 = no minimum).
+    bool splash_inited = false;
+    bool splash_released = false;
+    int splash_min_ms = 1000;
+    QElapsedTimer splash_clock;
+    QString deferred_navigation;
+    void splashInitialized();
+    void tryReleaseNavigation();
+    void releaseDeferredNavigation();
 
     // One additional, non-iframed QWebEngineView per `render="native"`
     // webpage widget currently on screen in the MAIN layout -- keyed by
