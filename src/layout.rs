@@ -561,9 +561,6 @@ fn substitute_display_placeholders(url: &str, display: Option<&DisplayInfo>) -> 
 /// A sync-gated region's items in playlist order: (media id, URL if a video).
 type VideoWallItems = Vec<(i32, Option<String>)>;
 
-/// What `Translator::translate` reports: (width, height, enable_stat, sync_keys).
-pub type TranslateOutput = (i32, i32, bool, Vec<String>);
-
 pub struct Translator<'a> {
     id: LayoutId,
     tree: Option<Element>,
@@ -685,7 +682,7 @@ impl<'a> Translator<'a> {
         self
     }
 
-    pub fn translate(mut self) -> Result<TranslateOutput> {
+    pub fn translate(mut self) -> Result<(i32, i32, bool, Vec<String>)> {
         let tree = self.tree.take().unwrap();
         // Pre-scan for PDF widgets to know if we need pdf.js
         for region in tree.find_all("region") {
@@ -2585,6 +2582,35 @@ mod native_webpage_tests {
         // this widget type isn't exempt from that part of the fix.
         assert!(html.contains("style='left: 0px; top: 0px; width: 400px; height: 300px;'></div>"),
                 "the placeholder div itself must still use wrapper-relative (0,0) CSS -- got:\n{html}");
+    }
+
+    #[test]
+    fn webpage_widget_duration_zero_or_unset_lasts_as_long_as_the_layout() {
+        // A webpage widget's duration=0, or an unset duration, both
+        // mean "as long as the layout" -- not the shared 10s-default/
+        // literal-0 (which JS then treats as 1s via `|| 1`) that other
+        // widget types get.
+        for xlf in [
+            r#"<layout width="1920" height="1080">
+                <region id="7" left="0" top="0" width="400" height="300">
+                    <media id="9001" type="webpage" render="native" duration="0">
+                        <options><uri>https://example.com</uri><modeid>1</modeid></options>
+                    </media>
+                </region>
+            </layout>"#,
+            r#"<layout width="1920" height="1080">
+                <region id="7" left="0" top="0" width="400" height="300">
+                    <media id="9001" type="webpage" render="native">
+                        <options><uri>https://example.com</uri><modeid>1</modeid></options>
+                    </media>
+                </region>
+            </layout>"#,
+        ] {
+            let html = translate_xlf(xlf);
+            assert!(html.contains(", () => 86400, 9001],"),
+                    "webpage widget with duration=0 or unset must use the 86400s \
+                     as-long-as-the-layout duration -- got:\n{html}");
+        }
     }
 
     #[test]

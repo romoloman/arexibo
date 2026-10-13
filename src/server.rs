@@ -1398,8 +1398,8 @@ mod splash_html_tests {
                 "must show a distinct status while awaiting CMS authorization -- got:\n{html}");
         // Checks the actual displayed status div, not the whole page --
         // a static HTML comment elsewhere legitimately mentions
-        // "LOADING..." as historical context, unrelated to which
-        // status is shown.
+        // "LOADING..." as historical context (why this text element
+        // exists at all), unrelated to which status is shown.
         assert!(!html.contains("  LOADING...\n"),
                 "the generic loading text must not be the one displayed -- got:\n{html}");
         // Unrelated to awaiting_registration -- no registration

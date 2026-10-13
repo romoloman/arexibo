@@ -1260,7 +1260,13 @@ impl Handler {
                         // the same content again if the CMS has since
                         // bumped it; that's a harmless redundant fetch,
                         // not a correctness issue.
-                        match self.cache.refresh_resource(widget_id, &mut self.xmds) {
+                        let started = std::time::Instant::now();
+                        let result = self.cache.refresh_resource(widget_id, &mut self.xmds);
+                        // Diagnostic only -- see the same-purpose log
+                        // just above for refresh_data_widget.
+                        let elapsed = started.elapsed();
+                        log::debug!("refresh_resource for widget {widget_id} took {elapsed:?}");
+                        match result {
                             // Reload the *returned* id, not widget_id --
                             // they differ for a widget nested inside
                             // another resource's combined HTML, where
@@ -2975,7 +2981,12 @@ impl Handler {
                 crate::resource::ReqFile::Resource { id, .. } => Some(*id),
                 _ => None,
             };
-            match self.cache.download(file.clone(), &mut self.xmds) {
+            let started = std::time::Instant::now();
+            let result = self.cache.download(file.clone(), &mut self.xmds);
+            // Diagnostic only -- see the DataUpdate handler's own
+            // same-purpose log for the full story.
+            log::debug!("retry download for {desc} took {:?}", started.elapsed());
+            match result {
                 Ok(()) => {
                     log::info!("retry succeeded for {desc}");
                     if let Some(widget_id) = widget_id {
@@ -3001,7 +3012,13 @@ impl Handler {
         // exactly as the original DataUpdate handler did).
         let dataupdate_queue = std::mem::take(&mut self.dataupdate_retry_queue);
         for (widget_id, attempts) in dataupdate_queue {
-            match self.cache.refresh_resource(widget_id, &mut self.xmds) {
+            let started = std::time::Instant::now();
+            let result = self.cache.refresh_resource(widget_id, &mut self.xmds);
+            // Diagnostic only -- see the DataUpdate handler's own
+            // same-purpose log for the full story.
+            log::debug!("retry refresh_resource for widget {widget_id} took {:?}",
+                        started.elapsed());
+            match result {
                 Ok(fetch_id) => {
                     log::info!("retry succeeded for dataUpdate widget {widget_id}");
                     self.to_gui.send(ToGui::ReloadWidget(fetch_id)).unwrap();
@@ -6644,13 +6661,13 @@ mod data_refresh_timer_tests {
         // must NOT count -- those already self-heal via
         // resource_retry_queue/note_layout_file_downloaded once they
         // eventually succeed.
-        assert!(!any_non_resource_failure(&[]),
-                "an empty result (e.g. nothing needed downloading) must not count as a \
-                 failure");
         use crate::resource::InventoryEntry;
         fn simple(typ: &'static str, id: i64, complete: bool) -> InventoryEntry {
             InventoryEntry::Simple { typ, id, complete }
         }
+        assert!(!any_non_resource_failure(&[]),
+                "an empty result (e.g. nothing needed downloading) must not count as a \
+                 failure");
         assert!(!any_non_resource_failure(&[simple("media", 1, true), simple("layout", 2, true)]),
                 "all-success must not count as a failure");
         assert!(any_non_resource_failure(&[simple("media", 1, false)]),
@@ -8281,18 +8298,20 @@ mod parallel_download_tests {
     /// time* (a small artificial delay before responding widens the
     /// window in which concurrent requests can actually overlap) --
     /// lets a test confirm real concurrency happened, not just that
-    /// results came back correctly. Several handling threads sharing
-    /// the same server (matching server.rs's own real `start_pool`
-    /// pattern) -- a single handling thread/loop can only ever process
-    /// one request at a time itself, regardless of how many requests a
-    /// genuinely-parallel client sends concurrently, so it could never
-    /// actually observe real client-side concurrency at all (confirmed
-    /// the hard way while writing this test).
+    /// results came back correctly.
     fn start_mock_ready_counting_concurrency() -> (u16, std::sync::Arc<AtomicU32>) {
         let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
         let port = server.server_addr().to_ip().unwrap().port();
         let current = std::sync::Arc::new(AtomicU32::new(0));
         let max_seen = std::sync::Arc::new(AtomicU32::new(0));
+        // Several handling threads sharing the same server, matching
+        // server.rs's own real `start_pool` pattern -- a single
+        // handling thread/loop (this mock's first draft) can only ever
+        // process one request at a time itself, regardless of how many
+        // requests a genuinely-parallel client sends concurrently, so
+        // it could never actually observe real client-side concurrency
+        // at all (confirmed the hard way: every attempt showed "1",
+        // never more, until this fix).
         for _ in 0..8 {
             let server = server.clone();
             let current = current.clone();
@@ -8339,13 +8358,13 @@ mod parallel_download_tests {
     #[test]
     fn several_pending_downloads_are_all_processed_in_order_even_if_some_fail() {
         // The mock here never serves real file content (same mechanism
-        // the existing single-file failure test relies on) -- every
-        // one of these genuinely fails. The point of this test is that
-        // *all* of them still get processed and correctly reported, in
-        // the same order they were given, whether dispatched in
-        // parallel chunks or not -- confirmed with the user: a failure
-        // must not block the others, same as the original sequential
-        // behavior.
+        // the existing single-file failure test above relies on) --
+        // every one of these genuinely fails. The point of this test
+        // is that *all* of them still get processed and correctly
+        // reported, in the same order they were given, whether
+        // dispatched in parallel chunks or not -- confirmed with the
+        // user: a failure must not block the others, same as the
+        // original sequential behavior.
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
