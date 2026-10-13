@@ -106,6 +106,13 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                         cpp::navigate(file.as_ptr());
                     }
                 }
+                ToGui::Jump(id) => {
+                    log::info!("jumping to layout: {id}");
+                    let file = CString::new(format!("{id}.xlf.html")).expect("ok");
+                    unsafe {
+                        cpp::navigate(file.as_ptr());
+                    }
+                }
                 ToGui::WebHook(code) => {
                     // Matches layout.rs's own `write_action` -- a
                     // triggerType="webhook" action registers itself as
@@ -277,11 +284,13 @@ extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _
             }
         }
         cpp::CB_LAYOUT_JUMP => {
-            log::info!("jumping to layout: {arg2}");
-            let file = CString::new(format!("{arg2}.xlf.html")).expect("ok");
-            unsafe {
-                cpp::navigate(file.as_ptr());
-            }
+            // Not navigated to blindly: the target may have been replaced
+            // or purged since the page was translated (see
+            // Cache::resolve_jump_target) -- the main loop decides.
+            let _ = cb_data.sender.send(FromGui::Jump(arg2 as i64));
+        }
+        cpp::CB_LAYOUT_FAILED => {
+            let _ = cb_data.sender.send(FromGui::LayoutFailed(arg1 as i64));
         }
         cpp::CB_COMMAND | cpp::CB_SHELL => {
             let cmd = unsafe { CStr::from_ptr(arg1 as *const _) };

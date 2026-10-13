@@ -104,6 +104,10 @@ pub enum ToGui {
     /// readers into thinking Sync Groups were involved even when
     /// `sync_role` was `None`.
     ForceReloadLayout(i64, ForceReloadReason),
+    /// Navigate to this layout without touching the schedule state (a
+    /// Navigate Layout action, or going back to the scheduled layout
+    /// after a jump target failed to load).
+    Jump(i64),
 }
 
 /// See `ToGui::ForceReloadLayout`'s own doc comment for why this exists.
@@ -142,6 +146,11 @@ pub enum FromGui {
     /// duration==0 revert case (see override_revert_on_completion's
     /// own doc comment) -- otherwise ignored.
     LayoutCompleted,
+    /// A Navigate Layout action asks for this layout id (CB_LAYOUT_JUMP).
+    Jump(i64),
+    /// The main view gave up waiting for this layout id to load
+    /// (CB_LAYOUT_FAILED); it keeps retrying by itself meanwhile.
+    LayoutFailed(i64),
     Screenshot(Vec<u8>),
     Command(String),
     Shell(String, bool),
@@ -1417,6 +1426,8 @@ impl Handler {
                             }
                         }
                     }
+                    Ok(FromGui::Jump(id)) => self.on_jump(id),
+                    Ok(FromGui::LayoutFailed(id)) => self.on_layout_failed(id),
                     Ok(FromGui::Command(code)) =>
                         self.run_command(&code),
                     Ok(FromGui::Shell(code, with_shell)) =>
@@ -2897,6 +2908,41 @@ impl Handler {
         }
     }
 
+    /// A Navigate Layout action asks for layout `id`. The id was baked
+    /// into the page when it was translated, so it can be stale: the
+    /// layout may have been republished (same code, new id) or purged
+    /// since. Goes to its replacement if there is one; otherwise stays
+    /// put instead of loading a page that does not exist.
+    fn on_jump(&mut self, id: i64) {
+        match self.cache.resolve_jump_target(id) {
+            Some(target) => {
+                if target != id {
+                    log::info!("jump to layout {id}: it was replaced -- going to {target}");
+                }
+                let _ = self.to_gui.send(ToGui::Jump(target));
+            }
+            None => log::warn!("ignoring jump to layout {id}: it is not available \
+                                (purged, or not downloaded yet)"),
+        }
+    }
+
+    /// The main view could not load layout `id` after several tries. A
+    /// scheduled layout is left to keep retrying (nothing better to show);
+    /// anything else (a jump target) sends the view back to the scheduled
+    /// layout, or the splash if there is none.
+    fn on_layout_failed(&mut self, id: i64) {
+        if self.layouts.contains(&id) {
+            log::warn!("scheduled layout {id} still fails to load -- the view keeps retrying");
+            return;
+        }
+        let fallback = self.layouts.first().copied()
+            .filter(|l| self.cache.get_layout(*l).is_some()).unwrap_or(0);
+        log::warn!("layout {id} failed to load repeatedly -- going back to {}",
+                   if fallback == 0 { "the splash screen".to_string() }
+                   else { format!("layout {fallback}") });
+        let _ = self.to_gui.send(ToGui::Jump(fallback));
+    }
+
     /// Apply new player settings.
     /// Re-runs the translator over every cached layout (no network).
     fn retranslate_cached_layouts(&mut self) {
@@ -3951,6 +3997,86 @@ mod pending_network_tests {
         let f = offline_fixture(&envdir, true);
         assert!(!f.handler.first_collection_done);
         assert!(f.handler.sync_group.is_none());
+    }
+
+    fn layout_req(id: i64, code: &str) -> ReqFile {
+        ReqFile::File { id, typ: "layout", size: 0, md5: vec![], http: false,
+                        path: String::new(), name: format!("{id}.xlf"),
+                        code: Some(code.to_string()) }
+    }
+
+    fn drain(rx: &crossbeam_channel::Receiver<ToGui>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn a_jump_to_a_layout_republished_under_the_same_code_goes_to_the_new_id() {
+        // Real report: "documenti" was republished (1700 -> 1701) while the
+        // home layout, whose button still carries 1700, was on screen.
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        let h = &mut f.handler;
+        h.cache.insert_fake_layout_with_code_for_test(1700, "documenti");
+        h.cache.update_code_map(&[layout_req(1700, "documenti")]).unwrap();
+        h.cache.update_code_map(&[layout_req(1701, "documenti")]).unwrap();
+        h.cache.purge_some(&["1700.xlf".to_string()]).unwrap();
+        h.cache.insert_fake_layout_with_code_for_test(1701, "documenti");
+        drain(&f.togui_rx);
+        h.on_jump(1700);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(1701))));
+        assert!(f.togui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_jump_to_an_available_layout_goes_there() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.cache.insert_fake_layout_for_test(1699);
+        drain(&f.togui_rx);
+        f.handler.on_jump(1699);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(1699))));
+    }
+
+    #[test]
+    fn a_jump_to_a_layout_that_does_not_exist_is_ignored() {
+        // Used to navigate anyway and retry the 404 forever.
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        drain(&f.togui_rx);
+        f.handler.on_jump(1700);
+        assert!(f.togui_rx.try_recv().is_err(), "nothing must be sent to the GUI");
+    }
+
+    #[test]
+    fn a_scheduled_layout_that_fails_to_load_is_left_to_retry() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.layouts = vec![1699];
+        f.handler.cache.insert_fake_layout_for_test(1699);
+        drain(&f.togui_rx);
+        f.handler.on_layout_failed(1699);
+        assert!(f.togui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_jump_target_that_fails_to_load_sends_the_view_back_to_the_scheduled_layout() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.layouts = vec![1699];
+        f.handler.cache.insert_fake_layout_for_test(1699);
+        drain(&f.togui_rx);
+        f.handler.on_layout_failed(1700);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(1699))));
+    }
+
+    #[test]
+    fn a_failing_jump_target_with_nothing_scheduled_falls_back_to_the_splash() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.layouts = vec![1699];       // scheduled, but not in the cache
+        drain(&f.togui_rx);
+        f.handler.on_layout_failed(1700);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(0))));
     }
 }
 

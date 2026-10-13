@@ -18,6 +18,7 @@ pub const CB_COMMAND: isize = 6;
 pub const CB_SHELL: isize = 7;
 pub const CB_STOPSHELL: isize = 8;
 pub const CB_OVERLAY_LAYOUT_INIT: isize = 9;
+pub const CB_LAYOUT_FAILED: isize = 10;
 extern "C" {
     pub fn setup(
         base_uri: *const ::std::os::raw::c_char,

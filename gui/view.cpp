@@ -8,6 +8,7 @@
 #include <QTouchEvent>
 
 #include "view.h"
+#include <QRegularExpression>
 #include <algorithm>
 
 // (Separate QWebEngineProfile for native webpage widgets: tried and
@@ -64,7 +65,14 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
     // See LoggingPage's own doc comment -- must be set before
     // webChannel/devtools setup below, since those attach to whichever
     // page is current at that point.
-    view->setPage(new LoggingPage(view));
+    auto *main_page = new LoggingPage(view);
+    view->setPage(main_page);
+    connect(main_page, &LoggingPage::loadFailedRepeatedly, this, [this](const QUrl &url) {
+        QRegularExpressionMatch m =
+            QRegularExpression("/(\\d+)\\.xlf\\.html$").match(url.path());
+        if (m.hasMatch())
+            this->cb(this->cb_ptr, CB_LAYOUT_FAILED, m.captured(1).toLongLong(), 0, 0);
+    });
 
     channel = new QWebChannel(this);
     view->page()->setWebChannel(channel);

@@ -167,6 +167,11 @@ pub struct Cache {
     agent: Agent,
     content: HashMap<String, Resource>,
     code_map: HashMap<String, LayoutId>,
+    /// Layouts purged during this run -> the code each had, so a jump to
+    /// a retired id (a stale page's Navigate Layout button) can follow
+    /// that code to whatever replaced it. In memory only: a restart
+    /// translates every page afresh.
+    retired: HashMap<LayoutId, String>,
     /// Whether Adspace Exchange (`ssp` widgets) should be resolved
     /// during layout translation -- off by default (fails closed,
     /// matching the C#'s own `IsAdspaceEnabled` default), set by
@@ -282,6 +287,7 @@ impl Cache {
         }).collect();
 
         let cache = Self { dir, agent: cms.make_agent(no_verify)?, content, code_map,
+                           retired: HashMap::new(),
                            adspace_enabled: false, adspace_partner: None, html_port: 0,
                            data_widgets: HashMap::new(),
                            display_name: String::new(),
@@ -629,6 +635,18 @@ impl Cache {
         self.code_map.get(code).copied()
     }
 
+    /// Where a jump to layout `id` should actually go: `id` itself if it
+    /// is cached, else the layout that now carries the code the purged
+    /// `id` had (a republished layout gets a new id but keeps its code),
+    /// provided that one is cached too. `None` if neither exists.
+    pub fn resolve_jump_target(&self, id: LayoutId) -> Option<LayoutId> {
+        if self.get_layout(id).is_some() {
+            return Some(id);
+        }
+        let new_id = *self.code_map.get(self.retired.get(&id)?)?;
+        self.get_layout(new_id).map(|_| new_id)
+    }
+
     pub fn get_layout(&self, id: LayoutId) -> Option<Arc<LayoutInfo>> {
         self.content.get(&format!("{id}.xlf")).and_then(|entry| match entry {
             Resource::Layout(layout) => Some(layout.clone()),
@@ -646,6 +664,15 @@ impl Cache {
     #[cfg(test)]
     pub(crate) fn insert_fake_layout_for_test(&mut self, id: LayoutId) {
         self.insert_fake_layout_with_sync_keys_for_test(id, vec![]);
+    }
+
+    /// Same as `insert_fake_layout_for_test`, but with a layout `code`.
+    #[cfg(test)]
+    pub(crate) fn insert_fake_layout_with_code_for_test(&mut self, id: LayoutId, code: &str) {
+        self.content.insert(format!("{id}.xlf"), Resource::Layout(Arc::new(LayoutInfo {
+            id, md5: vec![], size: (1080, 1920), code: Some(code.to_string()),
+            enable_stat: true, translated_version: TRANSLATOR_VERSION, sync_keys: vec![],
+        })));
     }
 
     /// Same as `insert_fake_layout_for_test`, but also sets sync_keys
@@ -890,6 +917,11 @@ impl Cache {
             }
             if let Some(removed) = self.content.remove(name) {
                 changed = true;
+                if let Resource::Layout(info) = &removed {
+                    if let Some(code) = &info.code {
+                        self.retired.insert(info.id, code.clone());
+                    }
+                }
                 // A purged resource might have been the container for
                 // tracked data widgets (v7 GetData polling, see
                 // data_widgets's own doc comment). Covers both an
@@ -2467,5 +2499,85 @@ mod update_code_map_tests {
         assert_eq!(info.md5, vec![1, 2, 3], "md5/code must be preserved -- the raw XLF itself \
                                               didn't change, only its own translated output");
         assert_eq!(info.code, Some("home".into()));
+    }
+}
+
+#[cfg(test)]
+mod resolve_jump_target_tests {
+    use super::*;
+
+    fn make_cache() -> Cache {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("arexibo_jump_test_{}_{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cms = CmsSettings {
+            address: "https://example.com".into(), key: "k".into(),
+            display_id: "d".into(), display_name: None, proxy: None,
+        };
+        Cache::new(&cms, dir, false, true).unwrap()
+    }
+
+    fn layout_file(id: LayoutId, code: &str) -> ReqFile {
+        ReqFile::File { id, typ: "layout", size: 0, md5: vec![], http: false,
+                         path: String::new(), name: format!("{id}.xlf"),
+                         code: Some(code.to_string()) }
+    }
+
+    /// The real report: "documenti" (1700) republished as 1701 under the
+    /// same code while a page linking to 1700 is still on screen.
+    fn republished() -> Cache {
+        let mut cache = make_cache();
+        cache.insert_fake_layout_with_code_for_test(1700, "documenti");
+        cache.update_code_map(&[layout_file(1700, "documenti")]).unwrap();
+        cache.update_code_map(&[layout_file(1701, "documenti")]).unwrap();
+        cache.purge_some(&["1700.xlf".to_string()]).unwrap();
+        cache
+    }
+
+    #[test]
+    fn a_cached_layout_is_its_own_target() {
+        let mut cache = make_cache();
+        cache.insert_fake_layout_with_code_for_test(1699, "home");
+        assert_eq!(cache.resolve_jump_target(1699), Some(1699));
+    }
+
+    #[test]
+    fn a_purged_layout_resolves_to_its_replacement_by_code() {
+        let mut cache = republished();
+        cache.insert_fake_layout_with_code_for_test(1701, "documenti");
+        assert_eq!(cache.resolve_jump_target(1700), Some(1701));
+        assert_eq!(cache.resolve_jump_target(1701), Some(1701));
+    }
+
+    #[test]
+    fn a_replacement_that_is_not_downloaded_yet_is_not_a_target() {
+        let cache = republished();      // 1701 known by code, not cached yet
+        assert_eq!(cache.resolve_jump_target(1700), None);
+    }
+
+    #[test]
+    fn a_purged_layout_with_no_replacement_has_no_target() {
+        let mut cache = make_cache();
+        cache.insert_fake_layout_with_code_for_test(1700, "documenti");
+        cache.update_code_map(&[layout_file(1700, "documenti")]).unwrap();
+        cache.purge_some(&["1700.xlf".to_string()]).unwrap();
+        assert_eq!(cache.resolve_jump_target(1700), None);
+    }
+
+    #[test]
+    fn an_id_never_seen_has_no_target() {
+        assert_eq!(make_cache().resolve_jump_target(424242), None);
+    }
+
+    #[test]
+    fn a_layout_without_a_code_cannot_be_followed() {
+        let mut cache = make_cache();
+        cache.insert_fake_layout_for_test(1700);       // code: None
+        cache.purge_some(&["1700.xlf".to_string()]).unwrap();
+        assert_eq!(cache.resolve_jump_target(1700), None);
     }
 }

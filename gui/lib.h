@@ -21,6 +21,11 @@ const intptr_t CB_STOPSHELL   = 8;
 // treated as "the current layout" for CMS status reporting purposes
 // (see FromGui::Showing in mainloop.rs, only wired to CB_LAYOUT_INIT).
 const intptr_t CB_OVERLAY_LAYOUT_INIT = 9;
+// The main view's page failed to load several times in a row (arg1: the
+// layout id from its /<id>.xlf.html URL) -- e.g. a layout that was purged
+// while a stale page still linked to it. The view keeps retrying on its
+// own; this lets the Rust side move it elsewhere.
+const intptr_t CB_LAYOUT_FAILED = 10;
 
 void setup(const char *base_uri, const char *screen,
            int inspect, int debug, callback cb, void *cb_ptr);

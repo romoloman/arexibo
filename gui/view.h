@@ -53,6 +53,12 @@ inline bool g_web_debug_enabled = false;
 class LoggingPage : public QWebEnginePage
 {
     Q_OBJECT
+signals:
+    // Emitted once per streak of failed loads of the same URL.
+    void loadFailedRepeatedly(const QUrl &url);
+private:
+    int load_failures = 0;
+    QUrl failing_url;
 public:
     // `profile`: explicit profile override (unused currently; see
     // status doc). `hang_watchdog_secs`: forces a stuck navigation to
@@ -118,13 +124,26 @@ public:
         // destroyed first (e.g. widget removed from layout).
         connect(this, &QWebEnginePage::loadFinished, this, [this](bool ok) {
             if (!ok) {
+                QUrl failed = url();
+                if (failed != failing_url) {
+                    failing_url = failed;
+                    load_failures = 0;
+                }
+                load_failures++;
                 std::cout << "WARN : [arexibo::qt] page failed to load (" \
-                           << url().toString().toStdString() << ") -- retrying in 2.5s" << std::endl;
-                QTimer::singleShot(2500, this, [this]() {
-                    triggerAction(QWebEnginePage::Reload);
+                           << failed.toString().toStdString() << ") -- retrying in 2.5s" << std::endl;
+                if (load_failures == 4)
+                    emit loadFailedRepeatedly(failed);
+                QTimer::singleShot(2500, this, [this, failed]() {
+                    // The owner may have navigated elsewhere meanwhile:
+                    // never reload an unrelated page.
+                    if (url() == failed)
+                        triggerAction(QWebEnginePage::Reload);
                 });
                 return;
             }
+            load_failures = 0;
+            failing_url = QUrl();
             std::cout << "DEBUG: [arexibo::qt] page finished loading (" \
                        << url().toString().toStdString() << ")" << std::endl;
         });
