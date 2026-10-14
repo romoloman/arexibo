@@ -5,6 +5,32 @@
 - The player's own HTTPS requests (CMS, media downloads) and the XMR
   WebSocket now also trust the Linux system CA store, besides the bundled
   Mozilla roots, so a CMS behind an internal CA no longer needs `--no-verify`.
+- By default (offline mode), a display that loses its connection to the CMS
+  mid-session now keeps playing its cached schedule instead of falling back
+  to the splash screen after 3 failed collection cycles; once 3 cycles have
+  failed it retries every 30 s, so a returning CMS is noticed promptly.
+  `--disallow-offline` keeps the splash screen fallback.
+- A display with a Sync Group role that starts from a valid cache (schedule
+  and settings) now starts or joins its Sync Group right away, even with the
+  CMS unreachable, instead of waiting for a first successful collection.
+- Fix the startup splash screen being cut short when a cached schedule arrives
+  within milliseconds of it: the first navigation could cancel the splash's own
+  initialisation, leaving a blank letterboxed strip (no logo, black bars) for as
+  long as the first layout took to load. Navigation now waits until the splash
+  has initialised (at most 3 s) and has then been shown for 1 s, adjustable with
+  the `AREXIBO_SPLASH_MS` environment variable (0 = no minimum).
+- Fix a Navigate Layout button sending the display to a layout that no longer
+  exists. The target id is fixed when the page is translated, so after the
+  target layout was republished (new id, same code) and the old one purged, the
+  already open page still pointed at the old id and the display got stuck
+  retrying the missing page until a purge-all. A jump now goes to the layout
+  that replaced it, or is ignored if there is none, and a jump target that
+  cannot be loaded after several tries sends the view back to the scheduled
+  layout (or the splash screen).
+- Add an opt-in focus on load for webpage widgets in "Open Natively" mode: `[HasFocus]` in the
+  URL (removed before loading) makes that page take keyboard focus once, when it first
+  finishes loading.  Before, a native page only received focus on touch and keys typed
+  earlier reached nobody.
 
 ## 0.6.6 - Oct 2026
 

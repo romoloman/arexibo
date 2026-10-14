@@ -475,6 +475,7 @@ void Window::runJavascriptImpl(QString js)
 void Window::clearNativeViews(bool overlay)
 {
     auto &views = overlay ? overlay_native_views : native_views;
+    (overlay ? overlay_focus_on_load_views : focus_on_load_views).clear();
     for (auto nview : views) {
         nview->deleteLater();
     }
@@ -928,6 +929,19 @@ void Window::jsNativeWebShowImplNow(bool overlay, int mediaId, QString url, int 
             nview->setAttribute(Qt::WA_AlwaysStackOnTop);
         }
         views[mediaId] = nview;
+        // [HasFocus] (stripped in Rust): focus once, on the first successful load.
+        auto &want_focus = overlay ? overlay_focus_on_load_views : focus_on_load_views;
+        if (want_focus.remove(mediaId)) {
+            auto conn = QSharedPointer<QMetaObject::Connection>::create();
+            *conn = connect(nview, &QWebEngineView::loadFinished, this,
+                            [mediaId, nview, conn](bool ok) {
+                if (!ok) return;    // LoggingPage retries
+                QObject::disconnect(*conn);
+                std::cout << "DEBUG: [arexibo::qt] native widget " << mediaId \
+                           << " loaded -- taking focus" << std::endl;
+                nview->setFocus();
+            });
+        }
     }
     // Position in the same coordinate space the relevant base view
     // (`view` for the main layout, `overlay_view` for the overlay) itself
@@ -1145,4 +1159,14 @@ void JSInterface::jsNativeWebShow(int mediaId, QString url, int x, int y, int w,
 void JSInterface::jsNativeWebHide(int mediaId)
 {
     wnd->jsNativeWebHideImpl(is_overlay, mediaId);
+}
+
+void JSInterface::jsNativeWebFocusOnLoad(int mediaId)
+{
+    wnd->jsNativeWebFocusOnLoadImpl(is_overlay, mediaId);
+}
+
+void Window::jsNativeWebFocusOnLoadImpl(bool overlay, int mediaId)
+{
+    (overlay ? overlay_focus_on_load_views : focus_on_load_views).insert(mediaId);
 }

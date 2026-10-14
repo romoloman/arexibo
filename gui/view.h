@@ -8,6 +8,7 @@
 #include <QMainWindow>
 #include <QScreen>
 #include <QMap>
+#include <QSet>
 #include <QVector>
 #include <QRect>
 #include <QEvent>
@@ -297,6 +298,9 @@ private:
     // from the main view's `native_views` so overlayHideImpl() tears down
     // exactly its own without touching the main layout's.
     QMap<int, QWebEngineView*> overlay_native_views;
+    // Media ids whose native view takes focus on first load ([HasFocus]).
+    QSet<int> focus_on_load_views;
+    QSet<int> overlay_focus_on_load_views;
 
     // Touch/click passthrough for an active Overlay Layout (found from
     // a real report, compared directly against the Windows client's own
@@ -369,6 +373,7 @@ public:
     void jsNativeWebShowImplNow(bool overlay, int, QString, int, int, int, int);
     void processNextPendingNativeWebShow();
     void jsNativeWebHideImpl(bool overlay, int);
+    void jsNativeWebFocusOnLoadImpl(bool overlay, int);
     // Destroys any native_views left over from the *previous* layout --
     // called before navigating to a new one, since those widgets don't
     // exist in the new page at all and would otherwise leak/linger on
@@ -420,6 +425,7 @@ public slots:
     void jsStopShell(int);
     void jsNativeWebShow(int, QString, int, int, int, int);
     void jsNativeWebHide(int);
+    void jsNativeWebFocusOnLoad(int);
 };
 
 #endif

@@ -558,6 +558,13 @@ fn substitute_display_placeholders(url: &str, display: Option<&DisplayInfo>) -> 
     }
 }
 
+/// Removes the `[HasFocus]` marker from a native Webpage widget's URL;
+/// the flag says whether it was there.
+fn take_focus_marker(url: &str) -> (String, bool) {
+    const MARKER: &str = "[HasFocus]";
+    (url.replace(MARKER, ""), url.contains(MARKER))
+}
+
 pub struct Translator<'a> {
     id: LayoutId,
     tree: Option<Element>,
@@ -1442,6 +1449,7 @@ impl<'a> Translator<'a> {
                 let truly_native = media.get_attr("render") == Some("native")
                     && mode_id.as_deref() == Some("1");
                 if truly_native {
+                    let (url, focus) = take_focus_marker(&url);
                     let url = substitute_display_placeholders(&url, self.display.as_ref());
                     // A real top-level browser view, not embedded via
                     // iframe -- not subject to X-Frame-Options (which
@@ -1465,8 +1473,14 @@ impl<'a> Translator<'a> {
                                         data-native-webpage-url='{url}' \
                                         style='left: {x}px; top: {y}px; width: {w}px; \
                                         height: {h}px;'></div>")?;
+                    // Only pages with the marker get the extra call.
+                    let focus_call = if focus {
+                        format!("window.arexiboGui.jsNativeWebFocusOnLoad({mid});")
+                    } else {
+                        String::new()
+                    };
                     add_start = format!(
-                        "window.arexiboGui.jsNativeWebShow({mid}, {url:?}, {abs_x}, {abs_y}, {w}, {h});");
+                        "{focus_call}window.arexiboGui.jsNativeWebShow({mid}, {url:?}, {abs_x}, {abs_y}, {w}, {h});");
                     add_stop = format!("window.arexiboGui.jsNativeWebHide({mid});");
                 } else if media.get_attr("render") == Some("native") {
                     // modeid "2"/"3": same resource-iframe path as
@@ -2256,6 +2270,54 @@ mod native_webpage_tests {
 
     fn totem() -> DisplayInfo {
         DisplayInfo { name: "totem-014".into(), hardware_key: "abc123".into() }
+    }
+
+    #[test]
+    fn native_webpage_focus_marker_is_removed_from_the_url_and_requests_focus() {
+        let xlf = native_webpage_xlf("https://x.test/p?a=1[HasFocus]", "1");
+        let html = translate_xlf_with_display(&xlf, Some(totem()));
+        assert!(html.contains(concat!(
+            r#"jsNativeWebFocusOnLoad(9001);window.arexiboGui.jsNativeWebShow("#,
+            r#"9001, "https://x.test/p?a=1", 150, 250, 400, 300);"#)), "got:\n{html}");
+        assert!(html.contains("data-native-webpage-url='https://x.test/p?a=1'"));
+        assert!(!html.contains("HasFocus"), "the marker must not survive anywhere");
+    }
+
+    #[test]
+    fn native_webpage_without_the_focus_marker_does_not_request_focus() {
+        let xlf = native_webpage_xlf("https://x.test/p?a=1", "1");
+        let html = translate_xlf_with_display(&xlf, Some(totem()));
+        assert!(!html.contains("jsNativeWebFocusOnLoad"), "got:\n{html}");
+        assert!(html.contains(r#"jsNativeWebShow(9001, "https://x.test/p?a=1", 150, 250, 400, 300);"#));
+    }
+
+    #[test]
+    fn native_webpage_focus_marker_works_mid_url_and_when_stored_percent_encoded() {
+        let xlf = native_webpage_xlf("https://x.test/p?a=1[HasFocus]&amp;b=2", "1");
+        let html = translate_xlf_with_display(&xlf, None);
+        assert!(html.contains(r#""https://x.test/p?a=1&b=2""#) && html.contains("jsNativeWebFocusOnLoad(9001)"),
+                "mid-URL marker -- got:\n{html}");
+        let xlf = native_webpage_xlf("https%3A%2F%2Fx.test%2Fp%3Fa%3D1%5BHasFocus%5D", "1");
+        let html = translate_xlf_with_display(&xlf, None);
+        assert!(html.contains(r#""https://x.test/p?a=1""#) && html.contains("jsNativeWebFocusOnLoad(9001)"),
+                "percent-encoded marker -- got:\n{html}");
+    }
+
+    #[test]
+    fn native_webpage_focus_marker_combines_with_the_display_placeholders() {
+        let xlf = native_webpage_xlf("https://x.test/?n=[DisplayName][HasFocus]", "1");
+        let html = translate_xlf_with_display(&xlf, Some(totem()));
+        assert!(html.contains(r#"jsNativeWebShow(9001, "https://x.test/?n=totem-014", "#)
+                && html.contains("jsNativeWebFocusOnLoad(9001)"), "got:\n{html}");
+    }
+
+    #[test]
+    fn take_focus_marker_reports_whether_it_was_present() {
+        assert_eq!(take_focus_marker("https://x.test/a[HasFocus]"), ("https://x.test/a".to_string(), true));
+        assert_eq!(take_focus_marker("https://x.test/a"), ("https://x.test/a".to_string(), false));
+        assert_eq!(take_focus_marker("https://x.test/[HasFocus]a[HasFocus]"), ("https://x.test/a".to_string(), true));
+        // Case-sensitive, like the other placeholders.
+        assert_eq!(take_focus_marker("https://x.test/a[hasfocus]"), ("https://x.test/a[hasfocus]".to_string(), false));
     }
 
     #[test]
