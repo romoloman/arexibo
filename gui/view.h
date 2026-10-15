@@ -340,6 +340,8 @@ private:
     QSet<int> overlay_focus_on_load_views;
     // Media ids whose native view gets a transparent background.
     QSet<int> transparent_views;
+    // Data Connector views by dataSetId: 1x1, behind everything, never seen.
+    QMap<int, QWebEngineView *> connector_views;
     QSet<int> overlay_transparent_views;
 
     // Touch/click passthrough for an active Overlay Layout (found from
@@ -429,6 +431,8 @@ signals:
     void runJavascript(QString);
     void overlayShow(QString);
     void overlayHide();
+    void dataConnectorStart(int, QString);
+    void dataConnectorStop(int);
 
 public slots:
     void navigateToImpl(QString);
@@ -437,6 +441,8 @@ public slots:
     void runJavascriptImpl(QString);
     void overlayShowImpl(QString);
     void overlayHideImpl();
+    void dataConnectorStartImpl(int, QString);
+    void dataConnectorStopImpl(int);
 };
 
 class JSInterface : public QObject

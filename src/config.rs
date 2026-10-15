@@ -153,6 +153,9 @@ pub struct PlayerSettings {
     // system-wide one.
     #[serde(default)]
     pub display_time_zone: String,
+    /// The display's tags in the CMS (name -> value, "" if it has none).
+    #[serde(default)]
+    pub display_tags: std::collections::BTreeMap<String, String>,
     // If true, even the currently-playing layout is refreshed
     // immediately when modified (default: exempt it, per the
     // reference client).
@@ -280,6 +283,7 @@ impl Default for PlayerSettings {
             download_start_window: String::new(),
             download_end_window: String::new(),
             display_time_zone: String::new(),
+            display_tags: Default::default(),
             expire_modified_layouts: false,
             screen_shot_requested: false,
             new_cms_address: String::new(),
@@ -335,6 +339,7 @@ impl fmt::Debug for PlayerSettings {
             .field("download_start_window", &self.download_start_window)
             .field("download_end_window", &self.download_end_window)
             .field("display_time_zone", &self.display_time_zone)
+            .field("display_tags", &self.display_tags)
             .field("expire_modified_layouts", &self.expire_modified_layouts)
             .field("screen_shot_requested", &self.screen_shot_requested)
             .field("new_cms_address", &self.new_cms_address)
@@ -683,7 +688,7 @@ mod tests {
             "xmr_web_socket_address", "xmr_web_socket_address_in_use",
             "xmr_cms_key", "log_level", "screenshot_interval", "screenshot_size",
             "send_current_layout_as_status_update", "is_adspace_enabled",
-            "download_start_window", "download_end_window", "display_time_zone",
+            "download_start_window", "download_end_window", "display_time_zone", "display_tags",
             "expire_modified_layouts", "screen_shot_requested", "new_cms_address",
             "new_cms_key", "force_https", "embedded_server_port",
             "embedded_server_allow_wan",

@@ -133,6 +133,24 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                         cpp::run_js(code.as_ptr());
                     }
                 }
+                ToGui::DataConnectorStart(id, url) => {
+                    let url = CString::new(url).unwrap();
+                    unsafe { cpp::data_connector_start(id as i32, url.as_ptr()); }
+                }
+                ToGui::DataConnectorStop(id) => {
+                    unsafe { cpp::data_connector_stop(id as i32); }
+                }
+                ToGui::NotifyData(key) => {
+                    // xiboIC inside each widget turns this message into the
+                    // widget's own "new data" notification.
+                    let key = serde_json::to_string(&key).unwrap();
+                    let code = CString::new(format!(
+                        "document.querySelectorAll('iframe').forEach(function(f) {{ try {{ \
+                         f.contentWindow.postMessage({{ctrl: 'rtNotifyData', data: {{dataKey: {key}}}}}, '*'); \
+                         }} catch (e) {{}} }});"
+                    )).unwrap();
+                    unsafe { cpp::run_js(code.as_ptr()); }
+                }
                 ToGui::ReloadWidget(id) => {
                     // Only reload this one iframe in place -- not a full
                     // layout navigate(), which would restart every other
@@ -292,6 +310,7 @@ extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _
         cpp::CB_LAYOUT_FAILED => {
             let _ = cb_data.sender.send(FromGui::LayoutFailed(arg1 as i64));
         }
+        cpp::CB_SCREEN_SIZE => crate::info::set_screen_size(arg1 as i32, arg2 as i32),
         cpp::CB_COMMAND | cpp::CB_SHELL => {
             let cmd = unsafe { CStr::from_ptr(arg1 as *const _) };
             let cmd = cmd.to_str().unwrap_or_default().to_owned();

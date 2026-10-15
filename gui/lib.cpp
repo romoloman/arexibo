@@ -551,6 +551,16 @@ void run_js(const char *js) {
     emit the_wnd->runJavascript(js);
 }
 
+void data_connector_start(int data_set_id, const char *url) {
+    if (!the_wnd) return;
+    emit the_wnd->dataConnectorStart(data_set_id, url);
+}
+
+void data_connector_stop(int data_set_id) {
+    if (!the_wnd) return;
+    emit the_wnd->dataConnectorStop(data_set_id);
+}
+
 void overlay_show(const char *file) {
     if (!the_wnd) return;
     emit the_wnd->overlayShow(file);

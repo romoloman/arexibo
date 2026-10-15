@@ -108,6 +108,13 @@ pub enum ToGui {
     /// Navigate Layout action, or going back to the scheduled layout
     /// after a jump target failed to load).
     Jump(i64),
+    /// Start a data connector: load its page (the URL) in a hidden browser
+    /// page of its own -- see dcruntime.rs.
+    DataConnectorStart(i64, String),
+    DataConnectorStop(i64),
+    /// A data connector has new data behind this key: tell every widget on
+    /// screen (its `xiboIC` turns it into the widget's own notification).
+    NotifyData(String),
 }
 
 /// See `ToGui::ForceReloadLayout`'s own doc comment for why this exists.
@@ -600,6 +607,8 @@ impl Handler {
                             log::info!("using cached schedule, experience may be degraded");
                             schedule = cached_sched;
                             started_from_cache = true;
+                            // Cached settings only exist after a READY registration.
+                            crate::info::set_display_status(0);
                         }
 
                         Some(settings)
@@ -857,6 +866,9 @@ impl Handler {
         // within any given command's own due window, never silently
         // skipping past it between checks.
         let command_check = tick(Duration::from_secs(5));
+        let data_connectors = crate::dcruntime::runtime();
+        data_connectors.attach(self.to_gui.clone());
+        let data_connector_events = data_connectors.events();
         loop {
             select! {
                 // timer channel that fires when collect is needed
@@ -920,6 +932,14 @@ impl Handler {
                 },
                 recv(command_check) -> _ => {
                     self.check_scheduled_commands();
+                },
+                // a data connector set a schedule criterion
+                recv(data_connector_events) -> event => {
+                    if let Ok(crate::dcruntime::DcEvent::Criteria { metric, value, ttl }) = event {
+                        log::info!("criteria update from a data connector: {metric}={value} (ttl {ttl}s)");
+                        self.criteria.set(metric, value, ttl);
+                        self.schedule_check();
+                    }
                 },
                 // timer channel that fires when the active overlay's
                 // requested duration has elapsed
@@ -1118,6 +1138,7 @@ impl Handler {
                         if let Err(e) = self.cache.purge() {
                             log::error!("during cache purge: {e:#}");
                         }
+                        crate::dcruntime::runtime().stop_all();
                         collect = after(Duration::from_secs(0));  // force re-download
                         // purge() deletes every file on disk
                         // immediately, including whatever a currently-
@@ -1322,6 +1343,7 @@ impl Handler {
                     }
                     Ok(FromGui::Showing(layout)) => {
                         self.current_layout = layout;
+                        crate::info::set_current_layout(layout);
                         self.record_layout_shown(layout);
                         if self.settings.send_current_layout_as_status_update {
                             self.send_status_update();
@@ -1481,7 +1503,7 @@ impl Handler {
             return;
         }
         if let Some(cmd) = self.settings.commands.get(code) {
-            let success = match cmd.run() {
+            let success = match cmd.run(&self.settings.display_tags) {
                 Ok(success) => success,
                 Err(e) => {
                     log::warn!("running command {code}: {e:#}");
@@ -1528,13 +1550,23 @@ impl Handler {
         // makes sense for genuine shell commands.
         if code.starts_with("http|") || code.starts_with("rs232|") {
             let adhoc = Command { command: code.to_string(), validate: String::new(), alerts: String::new() };
-            match adhoc.run() {
+            match adhoc.run(&self.settings.display_tags) {
                 Ok(_) => log::info!("ran ad-hoc {} command successfully",
                                      if code.starts_with("http|") { "HTTP" } else { "RS232" }),
                 Err(e) => log::error!("running ad-hoc command {code:?}: {e:#}"),
             }
             return;
         }
+        // The allowlist authorizes the command as configured; the display's
+        // tags fill in its `[[placeholders]]` just before it runs.
+        let resolved = match crate::command::resolve_shell(code, &self.settings.display_tags) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                log::error!("not running shell command {code:?}: {e:#}");
+                return;
+            }
+        };
+        let code = resolved.as_str();
         let config = Default::default();
         let res = if with_shell {
             Popen::create(&["/bin/sh", "-c", code], config)
@@ -2310,6 +2342,7 @@ impl Handler {
         // stale value doesn't keep a criteria-conditioned layout active
         // (or, for a `ne` condition, incorrectly inactive) past its ttl.
         self.criteria.prune_expired();
+        self.assess_data_connectors(crate::dcruntime::runtime());
 
         // A Sync Group override (see sync_layout_active's own doc
         // comment) has no fixed duration/completion signal of its own
@@ -2970,6 +3003,10 @@ impl Handler {
         // field name found, optional in the bid request anyway.
         self.cache.adspace_enabled = self.settings.is_adspace_enabled;
         self.cache.display_name = self.settings.display_name.clone();
+        let display = self.cache.display_info();
+        crate::info::set_identity(
+            &display.name, &display.hardware_key,
+            &timezone_to_report(&self.settings.display_time_zone, &util::timezone()));
 
         // Applies the CMS's own display_time_zone as *this process's*
         // local timezone (see apply_process_timezone's own doc comment
@@ -3280,6 +3317,28 @@ fn timezone_to_report(cms_display_time_zone: &str, system_timezone: &str) -> Str
         cms_display_time_zone.to_string()
     } else {
         system_timezone.to_string()
+    }
+}
+
+impl Handler {
+    /// Starts, restarts and stops the data connectors the schedule wants right
+    /// now (a connector whose script is not downloaded and verified waits).
+    /// Run on every schedule check: once a minute, and on any schedule or
+    /// criteria change.
+    fn assess_data_connectors(&self, runtime: &crate::dcruntime::DcRuntime) {
+        runtime.set_display_tags(self.settings.display_tags.clone());
+        let eligible = self.schedule.data_connectors_now(&self.criteria);
+        let payloads = crate::dataconnector::payloads(&eligible, |js| {
+            self.cache.verified_connector_script(js).map(|(_, md5)| md5)
+        });
+        let port = server::effective_port(self.settings.embedded_server_port);
+        runtime.sync(
+            payloads,
+            |p| self.cache.connector_script_source(&p.js, &p.md5),
+            // On a loopback address of its own, as the widgets' pages are.
+            |id| format!("http://127.0.0.{}:{port}/dc/host/{id}.html",
+                         1 + (id as u32 % server::HTML_SHARD_COUNT)),
+        );
     }
 }
 
@@ -5146,6 +5205,188 @@ mod handle_trigger_code_tests {
             path: String::new(), name: String::new(), code: Some(layout_code.into()),
         };
         handler.cache.update_code_map(&[file]).unwrap();
+    }
+
+    fn connector_schedule(criteria: &str) -> Schedule {
+        let xml = format!(
+            r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <dataConnectors><connector fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="7"
+    priority="0" duration="0" isGeoAware="0" geoLocation="" dataSetId="16" dataParams="a%3D1"
+    js="dataSet_16.js">{criteria}</connector></dataConnectors>
+</schedule>"#);
+        Schedule::parse(&elementtree::Element::from_reader(xml.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// Puts a connector script in the handler's cache as a download would.
+    fn cache_connector_script(handler: &mut Handler, script: &str) {
+        use md5::{Digest, Md5};
+        std::fs::write(handler.cache.dir().join("dataSet_16.js"), script).unwrap();
+        handler.cache.commit(crate::resource::FetchedContent::Dependency {
+            name: "dataSet_16.js".into(),
+            info: crate::resource::DependencyInfo {
+                id: "16".into(), file_type: "data_connector".into(),
+                size: script.len() as u64, md5: Md5::digest(script.as_bytes()).to_vec() },
+        }).unwrap();
+    }
+
+    fn connector_runtime() -> (crate::dcruntime::DcRuntime, crossbeam_channel::Receiver<ToGui>) {
+        let runtime = crate::dcruntime::DcRuntime::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        runtime.attach(tx);
+        (runtime, rx)
+    }
+
+    fn connector_messages(rx: &crossbeam_channel::Receiver<ToGui>) -> Vec<String> {
+        rx.try_iter().map(|m| match m {
+            ToGui::DataConnectorStart(id, url) => format!("start {id} {url}"),
+            ToGui::DataConnectorStop(id) => format!("stop {id}"),
+            ToGui::NotifyData(key) => format!("notify {key}"),
+            _ => "other".to_string(),
+        }).collect()
+    }
+
+    #[test]
+    fn a_scheduled_connector_with_a_verified_script_is_started() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        let messages = connector_messages(&rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].starts_with("start 16 http://127.0.0."), "{messages:?}");
+        assert!(messages[0].ends_with("/dc/host/16.html"), "{messages:?}");
+        assert!(runtime.host_page(16).unwrap().contains("var a = 1;"));
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty(), "already running: nothing more");
+    }
+
+    #[test]
+    fn a_connector_whose_script_is_not_downloaded_waits() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty());
+        cache_connector_script(&mut handler, "var a = 1;");
+        handler.assess_data_connectors(&runtime);
+        assert_eq!(connector_messages(&rx).len(), 1, "started once the script arrived");
+    }
+
+    #[test]
+    fn a_script_changed_on_disk_is_not_run() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        std::fs::write(handler.cache.dir().join("dataSet_16.js"), "var a = 'tampered';").unwrap();
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty());
+        assert!(runtime.host_page(16).is_none());
+    }
+
+    #[test]
+    fn a_connector_waits_for_its_criteria() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule(
+            r#"<criteria metric="weather" condition="equals" type="weather">rain</criteria>"#);
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty());
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        handler.assess_data_connectors(&runtime);
+        assert_eq!(connector_messages(&rx).len(), 1);
+    }
+
+    #[test]
+    fn an_edited_script_restarts_the_connector() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        connector_messages(&rx);
+        cache_connector_script(&mut handler, "var a = 2;");
+        handler.assess_data_connectors(&runtime);
+        let messages = connector_messages(&rx);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0], "stop 16");
+        assert!(messages[1].starts_with("start 16 "));
+        assert!(runtime.host_page(16).unwrap().contains("var a = 2;"));
+    }
+
+    #[test]
+    fn leaving_the_schedule_stops_the_connector_after_three_checks() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        connector_messages(&rx);
+        handler.schedule = Schedule::default();
+        handler.assess_data_connectors(&runtime);
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty(), "two misses: still running");
+        handler.assess_data_connectors(&runtime);
+        assert_eq!(connector_messages(&rx), ["stop 16"]);
+    }
+
+    fn with_command(handler: &mut Handler, command: &str, validate: &str, tags: &[(&str, &str)]) {
+        handler.settings.enable_shell_commands = true;
+        handler.settings.commands.insert("c1".into(), Command {
+            command: command.into(), validate: validate.into(), alerts: String::new() });
+        handler.settings.display_tags = tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    }
+
+    #[test]
+    fn a_command_by_code_runs_with_the_displays_tags() {
+        let mut handler = test_handler();
+        with_command(&mut handler, "printf '%s' '[[city]]'", "^Massa$", &[("city", "Massa")]);
+        handler.run_command("c1");
+        assert_eq!(handler.last_command_success, Some(true));
+        handler.settings.display_tags.insert("city".into(), "Pisa".into());
+        handler.run_command("c1");
+        assert_eq!(handler.last_command_success, Some(false), "the new value is used at once");
+    }
+
+    #[test]
+    fn a_command_by_code_with_an_unresolvable_tag_is_reported_as_failed() {
+        let mut handler = test_handler();
+        with_command(&mut handler, "printf '%s' '[[city]]'", "", &[]);
+        handler.run_command("c1");
+        assert_eq!(handler.last_command_success, Some(false));
+    }
+
+    #[test]
+    fn a_layout_command_takes_the_tags_too() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let _ = tx.send(req.url().to_string());
+                let _ = req.respond(tiny_http::Response::from_string("ok"));
+            }
+        });
+        let mut handler = test_handler();
+        handler.settings.enable_shell_commands = true;
+        handler.settings.display_tags = [("city".to_string(), "Massa Carrara".to_string())].into();
+        let command = format!(r#"http|http://127.0.0.1:{port}/[[city]]|text/plain|{{"method":"GET","headers":"{{}}","body":"{{}}"}}"#);
+        handler.run_shell(&command, true);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "/Massa%20Carrara");
+    }
+
+    #[test]
+    fn a_layout_shell_command_with_an_unresolvable_tag_does_not_start() {
+        let mut handler = test_handler();
+        handler.settings.enable_shell_commands = true;
+        handler.run_shell("echo [[nothing]]", true);
+        assert!(handler.shell_process.is_none());
+        handler.settings.display_tags = [("nothing".to_string(), "x".to_string())].into();
+        handler.run_shell("sleep 5", true);
+        assert!(handler.shell_process.is_some(), "an ordinary command still starts");
+        if let Some(child) = handler.shell_process.as_mut() { let _ = child.kill(); }
     }
 
     #[test]

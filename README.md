@@ -128,6 +128,39 @@ pages loaded by the embedded browser.
   shows through wherever the page paints nothing.  The page itself must be transparent too (e.g. `html, body { background:
   transparent }`).  Unchecked, the view stays opaque white, as before.
 
+## Data Connectors
+
+A Data Connector (a JavaScript file scheduled in the CMS against a DataSet) publishes real-time data that widgets read through
+`/realtime`. It follows the official Electron player:
+
+- It runs in a hidden page of its own, for as long as it is scheduled (inside its dates, with its criteria met, the highest priority
+  one per DataSet). A connector tied to a geographic area never runs: there is no location source.
+- The script is downloaded like any other file and checked against the md5 announced by the CMS before every run; one edited in the
+  CMS is downloaded again. A connector that is no longer scheduled stops after three schedule checks, and its data goes with it.
+- It has `xiboDC.setData(key, data, {done, error})` (at most one stored write per key every 500 ms, 2 MB a value, 100 keys a connector),
+  `notifyHost(key)` (tells the widgets on screen), `makeRequest(url, {type, headers, data, done, error})` (made by the player, no CORS,
+  30 s timeout) and `setCriteria(metric, value, ttl)` (a schedule criterion, as from the CMS). The `dataParams` of the event arrive as
+  variables of the page, and `onInit()` is called once it is loaded.
+- `window.displayTags` is the display's tags in the CMS, as an object (`{name: value}`), set before `onInit()`. The Electron player defines
+  `setDisplayTags` but never calls it, so a connector relying on it works here only.
+- Widgets read the data at `/realtime?dataKey=...`: JSON, a 404 when there is none (the widget's error callback), a 400 without a key.
+- Not supported: geographic areas.
+
+## Display tags in commands
+
+A command (one defined in the CMS and run by code or by a schedule, or one in a shell command widget) can contain `[[name]]`, replaced by
+the value of the display's tag of that name when the command runs, so a change in the CMS applies at once. The name is matched exactly
+(letters, digits and `_`).
+
+- In an `http|...` or `rs232|...` command each `|`-separated part is filled in on its own, so a value containing `|` cannot move a boundary.
+  In a URL (`http://...`) the value is percent-encoded like JavaScript's `encodeURIComponent`; in a JSON part (such as the options of an
+  HTTP command, including the body inside them) it is escaped for the string it sits in; elsewhere it is used as typed.
+- A shell command is one piece and takes the value as typed: quote the placeholder where the shell needs it (`echo '[[name]]'`). A value
+  is trusted as much as the command itself, as both are set in the CMS.
+- A tag that is missing, or set without a value, stops the command: it does not run, and is reported to the CMS as failed.
+- The list of allowed shell commands is checked on the command as written, before the placeholders are filled in.
+- Not supported: the macros of the Electron player (`[EPOCH]`, `[UNIX_TIMESTAMP]`, `[TIMESTAMP]`, `[LAT]`, `[LNG]`); they stay as written.
+
 ## Standalone setup with X server
 
 The following example systemd service file shows how to to start an X server

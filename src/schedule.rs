@@ -168,6 +168,24 @@ struct ScheduleEntry {
     play_count: i64,
 }
 
+/// A `<connector>` in `<dataConnectors>` (a Data Connector schedule event):
+/// `<connector fromdt todt scheduleid priority duration isGeoAware
+/// geoLocation dataSetId dataParams js="dataSet_<id>.js">` plus `<criteria>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataConnectorEntry {
+    pub data_set_id: i64,
+    pub schedule_id: i64,
+    pub priority: i32,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+    pub is_geo_aware: bool,
+    /// As sent by the CMS (URL-encoded).
+    pub data_params: String,
+    /// The script, a `data_connector` dependency.
+    pub js: String,
+    criteria: Vec<ScheduleCriterion>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Schedule {
     default: Option<LayoutId>,
@@ -178,6 +196,8 @@ pub struct Schedule {
     commands: Vec<ScheduledCommand>,
     #[serde(default)]
     actions: Vec<ScheduledAction>,
+    #[serde(default)]
+    data_connectors: Vec<DataConnectorEntry>,
 }
 
 /// Persistent Cycle Playback state -- which member of each active cycle
@@ -368,13 +388,80 @@ impl Schedule {
             }
         }
 
+        // A connector we cannot read is skipped: it must never cost the whole schedule.
+        let mut data_connectors = Vec::new();
+        for connector in tree.find("dataConnectors").into_iter()
+            .flat_map(|el| el.find_all("connector"))
+        {
+            match Self::parse_data_connector(connector, tz_offset) {
+                Ok(c) => data_connectors.push(c),
+                Err(e) => log::warn!("skipping data connector: {e:#}"),
+            }
+        }
+
         Ok(Self {
             default,
             schedules,
             overlays,
             commands,
             actions,
+            data_connectors,
         })
+    }
+
+    fn parse_data_connector(c: &Element, tz_offset: time::UtcOffset) -> Result<DataConnectorEntry> {
+        let data_set_id: i64 = c.get_attr("dataSetId").and_then(|s| s.parse().ok())
+            .context("missing or invalid dataSetId")?;
+        let from = PrimitiveDateTime::parse(c.get_attr("fromdt").context("missing fromdt")?, &TIME_FMT)
+            .context("invalid fromdt")?.assume_offset(tz_offset);
+        let to = PrimitiveDateTime::parse(c.get_attr("todt").context("missing todt")?, &TIME_FMT)
+            .context("invalid todt")?.assume_offset(tz_offset);
+        let criteria = c.find_all("criteria").map(|k| Ok(ScheduleCriterion {
+            metric: k.get_attr("metric").context("criteria missing metric")?.into(),
+            condition: k.get_attr("condition").context("criteria missing condition")?.into(),
+            value: k.text().into(),
+        })).collect::<Result<Vec<_>>>()?;
+        Ok(DataConnectorEntry {
+            data_set_id,
+            schedule_id: c.get_attr("scheduleid").and_then(|s| s.parse().ok()).unwrap_or(0),
+            priority: c.get_attr("priority").and_then(|s| s.parse().ok()).unwrap_or(0),
+            from,
+            to,
+            is_geo_aware: c.get_attr("isGeoAware") == Some("1"),
+            data_params: c.get_attr("dataParams").unwrap_or("").into(),
+            js: c.get_attr("js").filter(|s| !s.is_empty()).map(String::from)
+                .unwrap_or_else(|| format!("dataSet_{data_set_id}.js")),
+            criteria,
+        })
+    }
+
+    /// The connectors that should run now, as the Electron player assesses
+    /// them: inside their window, with all their criteria satisfied, and the
+    /// highest priority one per dataset (the first on a tie). A geo-aware
+    /// connector never runs: there is no location source, so the player is
+    /// never inside its area (the Electron player on Linux reports 0, 0).
+    pub fn data_connectors_now(&self, criteria: &CriteriaStore) -> Vec<&DataConnectorEntry> {
+        self.data_connectors_at(OffsetDateTime::now_local().unwrap(), criteria)
+    }
+
+    pub fn data_connectors_at(&self, now: OffsetDateTime, criteria: &CriteriaStore)
+                              -> Vec<&DataConnectorEntry> {
+        let mut best: HashMap<i64, &DataConnectorEntry> = HashMap::new();
+        for c in &self.data_connectors {
+            let satisfied = c.criteria.iter().all(|k| match criteria.get(&k.metric) {
+                Some(actual) => criterion_matches(&k.condition, &k.value, actual),
+                None => false,
+            });
+            if c.from <= now && now <= c.to && satisfied && !c.is_geo_aware {
+                match best.get(&c.data_set_id) {
+                    Some(existing) if existing.priority >= c.priority => {}
+                    _ => { best.insert(c.data_set_id, c); }
+                }
+            }
+        }
+        let mut list: Vec<&DataConnectorEntry> = best.into_values().collect();
+        list.sort_by_key(|c| c.data_set_id);
+        list
     }
 
     /// Currently-active Overlay Layouts (see `OverlayEntry`'s own doc
@@ -841,7 +928,7 @@ mod tests {
 
     #[test]
     fn layout_with_no_criteria_is_always_eligible() {
-        let sched = Schedule { default: None, schedules: vec![entry(1, 0, vec![])], overlays: vec![], commands: vec![], actions: vec![] };
+        let sched = Schedule { default: None, schedules: vec![entry(1, 0, vec![])], overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![] };
         assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default()), vec![1]);
     }
 
@@ -850,7 +937,7 @@ mod tests {
         let crit = ScheduleCriterion {
             metric: "temperature".into(), condition: "gt".into(), value: "30".into(),
         };
-        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![] };
+        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![] };
         // no criteria set at all -> fails closed, falls back to default
         assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default()), vec![99]);
 
@@ -864,7 +951,7 @@ mod tests {
         let crit = ScheduleCriterion {
             metric: "temperature".into(), condition: "gt".into(), value: "30".into(),
         };
-        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![] };
+        let sched = Schedule { default: Some(99), schedules: vec![entry(1, 0, vec![crit])], overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![] };
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "35".into(), 3600);
         assert_eq!(sched.layouts_now(&cs, &mut CycleState::default()), vec![1]);
@@ -881,7 +968,7 @@ mod tests {
         let sched = Schedule {
             default: Some(99),
             schedules: vec![entry(1, 0, vec![crit_ok, crit_fail])],
-            overlays: vec![], commands: vec![], actions: vec![],
+            overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         let mut cs = CriteriaStore::default();
         cs.set("temperature".into(), "35".into(), 3600);
@@ -895,7 +982,7 @@ mod tests {
         let sched = Schedule {
             default: None,
             schedules: vec![entry(1, 0, vec![]), entry(2, 0, vec![])],
-            overlays: vec![], commands: vec![], actions: vec![],
+            overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         assert_eq!(result, vec![1, 2]);
@@ -911,7 +998,7 @@ mod tests {
                 entry(1, 0, vec![]),
                 interrupt_entry(2, 100, 3600),
             ],
-            overlays: vec![], commands: vec![], actions: vec![],
+            overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         assert_eq!(sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default()), vec![2]);
     }
@@ -934,7 +1021,7 @@ mod tests {
                 },
                 interrupt_entry(2, 10, 60),
             ],
-            overlays: vec![], commands: vec![], actions: vec![],
+            overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         // Both layouts appear, interrupt spread through rather than
@@ -964,7 +1051,7 @@ mod tests {
                 interrupt_entry(2, 5, 60),  // target 180s -> 3 plays
                 interrupt_entry(3, 5, 60),  // target 180s -> 3 plays
             ],
-            overlays: vec![], commands: vec![], actions: vec![],
+            overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         assert_eq!(result.iter().filter(|&&id| id == 2).count(), 3);
@@ -976,7 +1063,7 @@ mod tests {
         let sched = Schedule {
             default: Some(99),
             schedules: vec![interrupt_entry(2, 10, 60)],
-            overlays: vec![], commands: vec![], actions: vec![],
+            overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         let result = sched.layouts_now(&CriteriaStore::default(), &mut CycleState::default());
         assert!(result.contains(&99));
@@ -992,7 +1079,8 @@ mod tests {
     }
 
     fn sched_with(entries: Vec<ScheduleEntry>) -> Schedule {
-        Schedule { default: None, schedules: entries, overlays: vec![], commands: vec![], actions: vec![] }
+        Schedule { default: None, schedules: entries, overlays: vec![], commands: vec![], actions: vec![],
+                   data_connectors: vec![] }
     }
 
     #[test]
@@ -1137,7 +1225,7 @@ mod overlay_tests {
 
     #[test]
     fn no_overlays_means_empty_active_list() {
-        let sched = Schedule { default: None, schedules: vec![], overlays: vec![], commands: vec![], actions: vec![] };
+        let sched = Schedule { default: None, schedules: vec![], overlays: vec![], commands: vec![], actions: vec![], data_connectors: vec![] };
         assert!(sched.active_overlays().is_empty());
     }
 
@@ -1145,7 +1233,7 @@ mod overlay_tests {
     fn single_active_overlay_is_returned_with_its_duration() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true)], commands: vec![], actions: vec![],
+            overlays: vec![mk_overlay(727, 91, true)], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         assert_eq!(sched.active_overlays(), vec![(727, 91)]);
     }
@@ -1154,7 +1242,7 @@ mod overlay_tests {
     fn expired_overlay_is_not_active() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, false)], commands: vec![], actions: vec![],
+            overlays: vec![mk_overlay(727, 91, false)], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         assert!(sched.active_overlays().is_empty());
     }
@@ -1163,7 +1251,7 @@ mod overlay_tests {
     fn multiple_simultaneously_active_overlays_all_returned() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true), mk_overlay(728, 30, true)], commands: vec![], actions: vec![],
+            overlays: vec![mk_overlay(727, 91, true), mk_overlay(728, 30, true)], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         let active = sched.active_overlays();
         assert_eq!(active.len(), 2);
@@ -1175,7 +1263,7 @@ mod overlay_tests {
     fn mixed_active_and_expired_only_active_returned() {
         let sched = Schedule {
             default: None, schedules: vec![],
-            overlays: vec![mk_overlay(727, 91, true), mk_overlay(999, 30, false)], commands: vec![], actions: vec![],
+            overlays: vec![mk_overlay(727, 91, true), mk_overlay(999, 30, false)], commands: vec![], actions: vec![], data_connectors: vec![],
         };
         assert_eq!(sched.active_overlays(), vec![(727, 91)]);
     }
@@ -1275,7 +1363,8 @@ mod scheduled_command_tests {
 
     fn sched_with(date: OffsetDateTime, scheduleid: i64) -> Schedule {
         Schedule { default: None, schedules: vec![], overlays: vec![],
-                   commands: vec![ScheduledCommand { date, scheduleid, code: "TESTTOUCH".into() }], actions: vec![] }
+                   commands: vec![ScheduledCommand { date, scheduleid, code: "TESTTOUCH".into() }], actions: vec![],
+                   data_connectors: vec![] }
     }
 
     #[test]
@@ -1334,7 +1423,7 @@ mod scheduled_command_tests {
                 ScheduledCommand { date: now, scheduleid: 1, code: "A".into() },
                 ScheduledCommand { date: now, scheduleid: 2, code: "B".into() },
             ],
-            actions: vec![],
+            actions: vec![], data_connectors: vec![],
         };
         let mut already_run = HashSet::new();
         already_run.insert(1);
@@ -1394,6 +1483,7 @@ mod scheduled_action_tests {
                 from: now - time::Duration::hours(1), to: now + time::Duration::hours(1),
                 scheduleid: 1, duration, trigger_code: trigger_code.into(), target,
             }],
+            data_connectors: vec![],
         }
     }
 
@@ -1433,3 +1523,126 @@ mod scheduled_action_tests {
     }
 }
 
+#[cfg(test)]
+mod data_connector_tests {
+    use super::*;
+
+    const FAR: &str = r#"fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07""#;
+
+    fn parse(inner: &str) -> Schedule {
+        let xml = format!("<schedule><dataConnectors>{inner}</dataConnectors></schedule>");
+        Schedule::parse(&Element::from_reader(xml.as_bytes()).unwrap()).unwrap()
+    }
+
+    fn ids(list: &[&DataConnectorEntry]) -> Vec<i64> {
+        list.iter().map(|c| c.data_set_id).collect()
+    }
+
+    fn now() -> OffsetDateTime { OffsetDateTime::now_local().unwrap() }
+
+    #[test]
+    fn a_connector_is_parsed_as_the_cms_sends_it() {
+        let s = parse(&format!(r#"<connector {FAR} scheduleid="7" priority="1" duration="0"
+            isGeoAware="0" geoLocation="" dataSetId="16" dataParams="a%3D1%26b%3Dx+y" js="dataSet_16.js"/>"#));
+        let list = s.data_connectors_at(now(), &CriteriaStore::default());
+        assert_eq!(ids(&list), [16]);
+        let c = list[0];
+        assert_eq!((c.schedule_id, c.priority, c.is_geo_aware), (7, 1, false));
+        assert_eq!(c.data_params, "a%3D1%26b%3Dx+y", "kept URL-encoded, decoded only when handed to the script");
+        assert_eq!(c.js, "dataSet_16.js");
+    }
+
+    #[test]
+    fn the_script_name_defaults_to_the_dataset_one() {
+        let s = parse(&format!(r#"<connector {FAR} dataSetId="16"/>"#));
+        assert_eq!(s.data_connectors_at(now(), &CriteriaStore::default())[0].js, "dataSet_16.js");
+    }
+
+    #[test]
+    fn a_schedule_without_connectors_has_none() {
+        let s = Schedule::parse(&Element::from_reader("<schedule/>".as_bytes()).unwrap()).unwrap();
+        assert!(s.data_connectors_at(now(), &CriteriaStore::default()).is_empty());
+    }
+
+    #[test]
+    fn only_connectors_inside_their_window_are_active() {
+        let s = parse(r#"
+            <connector fromdt="2001-01-01 00:00:00" todt="2001-12-31 00:00:00" dataSetId="1"/>
+            <connector fromdt="2037-01-01 00:00:00" todt="2037-12-31 00:00:00" dataSetId="2"/>
+            <connector fromdt="2001-01-01 00:00:00" todt="2037-12-31 00:00:00" dataSetId="3"/>"#);
+        assert_eq!(ids(&s.data_connectors_at(now(), &CriteriaStore::default())), [3]);
+    }
+
+    #[test]
+    fn criteria_must_all_be_satisfied() {
+        let s = parse(&format!(r#"<connector {FAR} dataSetId="16">
+            <criteria metric="weather" condition="equals" type="weather">rain</criteria>
+        </connector>"#));
+        let mut store = CriteriaStore::default();
+        assert!(s.data_connectors_at(now(), &store).is_empty(), "a metric never set fails closed");
+        store.set("weather".into(), "sun".into(), 300);
+        assert!(s.data_connectors_at(now(), &store).is_empty());
+        store.set("weather".into(), "rain".into(), 300);
+        assert_eq!(ids(&s.data_connectors_at(now(), &store)), [16]);
+    }
+
+    #[test]
+    fn a_geo_aware_connector_never_runs() {
+        let s = parse(&format!(r#"<connector {FAR} dataSetId="16" isGeoAware="1" geoLocation="{{}}"/>"#));
+        assert!(s.data_connectors_at(now(), &CriteriaStore::default()).is_empty());
+    }
+
+    #[test]
+    fn the_highest_priority_connector_of_a_dataset_wins_and_the_first_on_a_tie() {
+        let s = parse(&format!(r#"
+            <connector {FAR} dataSetId="16" scheduleid="1" priority="0"/>
+            <connector {FAR} dataSetId="16" scheduleid="2" priority="1"/>
+            <connector {FAR} dataSetId="17" scheduleid="3" priority="1"/>
+            <connector {FAR} dataSetId="17" scheduleid="4" priority="1"/>"#));
+        let list = s.data_connectors_at(now(), &CriteriaStore::default());
+        assert_eq!(ids(&list), [16, 17]);
+        assert_eq!(list[0].schedule_id, 2);
+        assert_eq!(list[1].schedule_id, 3);
+    }
+
+    #[test]
+    fn an_unreadable_connector_is_skipped_without_losing_the_rest() {
+        let s = parse(&format!(r#"
+            <connector {FAR}/>
+            <connector fromdt="not a date" todt="2038-01-19 04:14:07" dataSetId="5"/>
+            <connector {FAR} dataSetId="x"/>
+            <connector {FAR} dataSetId="9"/>"#));
+        assert_eq!(ids(&s.data_connectors_at(now(), &CriteriaStore::default())), [9]);
+    }
+
+    #[test]
+    fn a_bad_connector_does_not_break_the_layouts_of_the_same_schedule() {
+        let xml = r#"<schedule>
+            <layout file="1014" fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="264" priority="0"/>
+            <dataConnectors><connector fromdt="garbage" todt="garbage" dataSetId="5"/></dataConnectors>
+        </schedule>"#;
+        let s = Schedule::parse(&Element::from_reader(xml.as_bytes()).unwrap()).unwrap();
+        assert_eq!(s.schedules.len(), 1);
+    }
+
+    #[test]
+    fn connectors_survive_a_save_and_load_of_the_schedule() {
+        let s = parse(&format!(r#"<connector {FAR} scheduleid="7" dataSetId="16" dataParams="a%3D1"/>"#));
+        let path = std::env::temp_dir().join(format!("arexibo_dc_sched_{}.json", std::process::id()));
+        s.to_file(&path).unwrap();
+        let loaded = Schedule::from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let list = loaded.data_connectors_at(now(), &CriteriaStore::default());
+        assert_eq!(ids(&list), [16]);
+        assert_eq!(list[0].data_params, "a%3D1");
+    }
+
+    #[test]
+    fn an_old_saved_schedule_without_connectors_still_loads() {
+        let path = std::env::temp_dir().join(format!("arexibo_dc_old_{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"default":null,"schedules":[]}"#).unwrap();
+        let loaded = Schedule::from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(loaded.data_connectors_at(now(), &CriteriaStore::default()).is_empty());
+    }
+}

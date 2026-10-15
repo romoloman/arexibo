@@ -36,6 +36,19 @@
   resource that never completes (a web font, an iframe) used to leave the screen blank until the next reload.
 - Honor the Webpage widget's "Background transparent?" option in "Open Natively" mode: the native view is now transparent when
   it is checked (it was always opaque white outside the overlay), so the layout shows through the page's transparent areas.
+- Add the `/info` endpoint (`xiboIC.info()`), with the same fields as the official Electron player: `version`, `displayName`,
+  `hardwareKey`, `screenWidth`, `screenHeight`, `latitude`/`longitude` (always 0: no location source on Linux), `timeZone`,
+  `currentLayoutId` and `displayStatus` (the CMS registration status). Served to local requests only.
+- Add Data Connectors (real-time data), as in the official Electron player. A connector scheduled in the CMS runs in a
+  hidden page of its own, with the `xiboDC` API (`setData`, `notifyHost`, `makeRequest`, `setCriteria`); its data is served at
+  `/realtime`, the widgets are notified when it changes, and the criteria it sets drive the schedule. Its script is checked against the
+  md5 announced by the CMS before every run (and downloaded again when edited in the CMS). A connector tied to a geographic area
+  never runs, as there is no location source. See the README.
+- Read the display's tags from the registration (kept with the settings, so they survive a start from the cache) and give them to the
+  data connectors as `window.displayTags`, an object, before `onInit()`.
+- `/realtime` now answers as the Electron player does: the key is decoded like a query parameter (`%20` and `+` were not), a missing key is
+  a 400, a miss a 404 (the widget's error callback), both with a JSON error, and a hit is served as `application/json`.
+- Commands accept `[[tag]]` placeholders, filled with the display's tags when the command runs, as in the Electron player. See the README.
 
 ## 0.6.6 - Oct 2026
 

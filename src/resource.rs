@@ -41,7 +41,8 @@ pub enum ReqFile {
     /// based widgets, etc.) -- a distinct variant, not reusing `File`,
     /// because its id is a string (e.g. a font/bundle name), unlike
     /// every other file type's integer id, and the CMS provides no
-    /// md5 to verify it against (see required_files's own parsing).
+    /// md5 to verify it against (see required_files's own parsing) --
+    /// except a `data_connector` script, whose `md5` is kept.
     Dependency {
         id: String,
         file_type: String,
@@ -49,6 +50,8 @@ pub enum ReqFile {
         http: bool,
         path: String,
         name: String,
+        /// The md5 the CMS announced; empty if it sent none.
+        md5: Vec<u8>,
     },
 }
 
@@ -133,6 +136,8 @@ pub struct DependencyInfo {
     pub id: String,
     pub file_type: String,
     pub size: u64,
+    #[serde(default, deserialize_with = "util::de_hex", serialize_with = "util::ser_hex")]
+    pub md5: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -396,7 +401,11 @@ impl Cache {
             // under this name, considered up to date until the CMS's
             // own purge mechanism removes it from RequiredFiles/the
             // purge list entirely.
-            ReqFile::Dependency { ref name, .. } => self.get_dependency(name).is_some(),
+            ReqFile::Dependency { ref name, ref file_type, ref md5, .. } =>
+                self.get_dependency(name).is_some_and(|d| {
+                    // A connector script is edited in the CMS under the same name.
+                    file_type != "data_connector" || d.md5 == *md5
+                }),
         }
     }
 
@@ -485,7 +494,7 @@ impl Cache {
                     Ok(FetchedContent::Media { name, info: MediaInfo { id, size, md5 } })
                 }
             }
-            ReqFile::Dependency { id, file_type, size, http, path, name } => {
+            ReqFile::Dependency { id, file_type, size, http, path, name, md5 } => {
                 let filename = dir.join(&name);
                 if http {
                     match download_http_to(agent, &path, &filename, None) {
@@ -499,7 +508,7 @@ impl Cache {
                 } else {
                     Self::download_dependency_xmds(&id, &file_type, size, cms, &filename)?;
                 }
-                Ok(FetchedContent::Dependency { name, info: DependencyInfo { id, file_type, size } })
+                Ok(FetchedContent::Dependency { name, info: DependencyInfo { id, file_type, size, md5 } })
             }
         }
     }
@@ -699,6 +708,27 @@ impl Cache {
             Resource::Media(media) => Some(media.clone()),
             _ => None
         })
+    }
+
+    /// A data connector script, if it is downloaded and still matches the md5
+    /// the CMS announced: its path and that md5 (hex). Checked before every
+    /// run, not just at download.
+    pub fn verified_connector_script(&self, name: &str) -> Option<(PathBuf, String)> {
+        let dep = self.get_dependency(name)?;
+        if dep.file_type != "data_connector" || dep.md5.is_empty() {
+            return None;
+        }
+        let path = self.dir.join(name);
+        let actual = Md5::digest(fs::read(&path).ok()?);
+        (actual.as_slice() == dep.md5.as_slice()).then(|| (path, hex::encode(&dep.md5)))
+    }
+
+    /// The text of a connector script, only if its md5 is `md5` (hex): the
+    /// check and the read are one, so what runs is what was verified.
+    pub fn connector_script_source(&self, name: &str, md5: &str) -> Option<String> {
+        let bytes = fs::read(self.dir.join(name)).ok()?;
+        (hex::encode(Md5::digest(&bytes)) == md5)
+            .then(|| String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn get_dependency(&self, name: &str) -> Option<Arc<DependencyInfo>> {
@@ -1718,6 +1748,7 @@ mod dependency_download_tests {
         let req = ReqFile::Dependency {
             id: "roboto-regular.ttf".to_string(), file_type: "font".to_string(),
             size: 12, http: false, path: String::new(), name: "roboto-regular.ttf".to_string(),
+            md5: vec![],
         };
         assert!(!cache.has(&req), "must not be considered cached before any download");
         let mut cms = make_cms_with_mock_getdependency(b"font bytes!!");
@@ -1732,10 +1763,102 @@ mod dependency_download_tests {
         let req = ReqFile::Dependency {
             id: "roboto-regular.ttf".to_string(), file_type: "font".to_string(),
             size: 22, http: false, path: String::new(), name: "roboto-regular.ttf".to_string(),
+            md5: vec![],
         };
         cache.download(req, &mut cms).unwrap();
         let saved = fs::read(dir.join("roboto-regular.ttf")).unwrap();
         assert_eq!(saved, b"actual font file bytes");
+    }
+
+    fn connector_req(content: &[u8], md5: &[u8]) -> ReqFile {
+        ReqFile::Dependency {
+            id: "16".to_string(), file_type: "data_connector".to_string(),
+            size: content.len() as u64, http: false, path: String::new(),
+            name: "dataSet_16.js".to_string(), md5: md5.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_connector_script_is_verified_against_the_md5_the_cms_announced() {
+        let content = b"xiboDC.setData('k', '1');";
+        let md5 = Md5::digest(content).to_vec();
+        let (mut cache, _dir) = make_cache();
+        let mut cms = make_cms_with_mock_getdependency(content);
+        cache.download(connector_req(content, &md5), &mut cms).unwrap();
+        let (path, announced) = cache.verified_connector_script("dataSet_16.js").expect("verified");
+        assert_eq!(fs::read(path).unwrap(), content);
+        assert_eq!(announced, hex::encode(&md5));
+    }
+
+    #[test]
+    fn a_connector_script_changed_on_disk_is_not_verified() {
+        let content = b"xiboDC.setData('k', '1');";
+        let md5 = Md5::digest(content).to_vec();
+        let (mut cache, dir) = make_cache();
+        let mut cms = make_cms_with_mock_getdependency(content);
+        cache.download(connector_req(content, &md5), &mut cms).unwrap();
+        fs::write(dir.join("dataSet_16.js"), b"somebody was here").unwrap();
+        assert!(cache.verified_connector_script("dataSet_16.js").is_none());
+    }
+
+    #[test]
+    fn a_connector_script_without_an_announced_md5_is_not_verified() {
+        let content = b"xiboDC.setData('k', '1');";
+        let (mut cache, _dir) = make_cache();
+        let mut cms = make_cms_with_mock_getdependency(content);
+        cache.download(connector_req(content, &[]), &mut cms).unwrap();
+        assert!(cache.verified_connector_script("dataSet_16.js").is_none());
+    }
+
+    #[test]
+    fn only_data_connector_dependencies_are_verified() {
+        let content = b"font bytes!!";
+        let md5 = Md5::digest(content).to_vec();
+        let (mut cache, _dir) = make_cache();
+        let mut cms = make_cms_with_mock_getdependency(content);
+        let req = ReqFile::Dependency {
+            id: "roboto-regular.ttf".to_string(), file_type: "font".to_string(),
+            size: content.len() as u64, http: false, path: String::new(),
+            name: "roboto-regular.ttf".to_string(), md5,
+        };
+        cache.download(req, &mut cms).unwrap();
+        assert!(cache.verified_connector_script("roboto-regular.ttf").is_none());
+        assert!(cache.verified_connector_script("never-downloaded.js").is_none());
+    }
+
+    #[test]
+    fn a_connector_script_edited_in_the_cms_is_downloaded_again() {
+        let old = b"var a = 1;";
+        let new = b"var a = 2;";
+        let (md5_old, md5_new) = (Md5::digest(old).to_vec(), Md5::digest(new).to_vec());
+        let (mut cache, _dir) = make_cache();
+        let mut cms = make_cms_with_mock_getdependency(old);
+        cache.download(connector_req(old, &md5_old), &mut cms).unwrap();
+        assert!(cache.has(&connector_req(old, &md5_old)));
+        assert!(!cache.has(&connector_req(new, &md5_new)), "same name, new md5: must be fetched again");
+    }
+
+    #[test]
+    fn a_connector_script_is_read_only_if_it_has_the_expected_md5() {
+        let content = "var a = 'caff\u{e8}';";
+        let md5 = hex::encode(Md5::digest(content.as_bytes()));
+        let (cache, dir) = make_cache();
+        fs::write(dir.join("dataSet_16.js"), content).unwrap();
+        assert_eq!(cache.connector_script_source("dataSet_16.js", &md5).as_deref(), Some(content));
+        assert!(cache.connector_script_source("dataSet_16.js", "00").is_none());
+        assert!(cache.connector_script_source("missing.js", &md5).is_none());
+    }
+
+    #[test]
+    fn other_dependencies_are_still_matched_by_name_only() {
+        let (mut cache, _dir) = make_cache();
+        let mut cms = make_cms_with_mock_getdependency(b"font bytes!!");
+        let font = |md5: Vec<u8>| ReqFile::Dependency {
+            id: "roboto-regular.ttf".to_string(), file_type: "font".to_string(), size: 12,
+            http: false, path: String::new(), name: "roboto-regular.ttf".to_string(), md5,
+        };
+        cache.download(font(vec![]), &mut cms).unwrap();
+        assert!(cache.has(&font(vec![1, 2, 3])), "a font is not re-downloaded because of an md5");
     }
 }
 

@@ -19,6 +19,7 @@ pub const CB_SHELL: isize = 7;
 pub const CB_STOPSHELL: isize = 8;
 pub const CB_OVERLAY_LAYOUT_INIT: isize = 9;
 pub const CB_LAYOUT_FAILED: isize = 10;
+pub const CB_SCREEN_SIZE: isize = 11;
 extern "C" {
     pub fn setup(
         base_uri: *const ::std::os::raw::c_char,
@@ -54,6 +55,9 @@ extern "C" {
 }
 extern "C" {
     pub fn run_js(js: *const ::std::os::raw::c_char);
+    pub fn data_connector_start(data_set_id: ::std::os::raw::c_int,
+                                url: *const ::std::os::raw::c_char);
+    pub fn data_connector_stop(data_set_id: ::std::os::raw::c_int);
 }
 extern "C" {
     pub fn overlay_show(file: *const ::std::os::raw::c_char);

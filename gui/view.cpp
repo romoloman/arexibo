@@ -104,6 +104,9 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
             this, SLOT(runJavascriptImpl(QString)));
     connect(this, SIGNAL(overlayShow(QString)), this, SLOT(overlayShowImpl(QString)));
     connect(this, SIGNAL(overlayHide()), this, SLOT(overlayHideImpl()));
+    connect(this, SIGNAL(dataConnectorStart(int, QString)),
+            this, SLOT(dataConnectorStartImpl(int, QString)));
+    connect(this, SIGNAL(dataConnectorStop(int)), this, SLOT(dataConnectorStopImpl(int)));
 
     view->setUrl(QUrl(base_uri + "0.xlf.html"));
 
@@ -270,6 +273,7 @@ void Window::setSizeImpl(int pos_x, int pos_y, int size_x, int size_y)
                   << pos_x*ratio << "+" << pos_y*ratio << std::endl;
     }
 
+    cb(cb_ptr, CB_SCREEN_SIZE, std::lround(size_x * ratio), std::lround(size_y * ratio), 0);
     adjustScale(layout_width, layout_height);
 }
 
@@ -458,6 +462,36 @@ void Window::adjustOverlayScale(int layout_w, int layout_h)
     overlay_view->setGeometry(ov_x, ov_y, ov_w, ov_h);
     overlay_view->setZoomFactor(scale_factor);
     overlay_scale_applied_this_cycle = true;
+}
+
+// A data connector runs in a page of its own: no web channel (it cannot reach the
+// layout or this program), alive for as long as the connector is scheduled. It
+// gets a 1x1 view behind everything else: a page without a view counts as hidden
+// for the browser, which then slows its timers to one a second (and to one a
+// minute after a few minutes), while this one counts as visible and shows nothing.
+void Window::dataConnectorStartImpl(int data_set_id, QString url)
+{
+    dataConnectorStopImpl(data_set_id);
+    auto *cview = new QWebEngineView(this);
+    cview->setPage(new LoggingPage(cview));
+    cview->setFocusPolicy(Qt::NoFocus);
+    cview->setGeometry(0, 0, 1, 1);
+    cview->lower();
+    cview->show();
+    connector_views.insert(data_set_id, cview);
+    cview->page()->load(QUrl(url));
+    std::cout << "INFO : [arexibo::qt] data connector " << data_set_id << " started" << std::endl;
+}
+
+void Window::dataConnectorStopImpl(int data_set_id)
+{
+    auto *cview = connector_views.take(data_set_id);
+    if (!cview)
+        return;
+    // Load nothing first, so its timers and requests stop at once.
+    cview->page()->load(QUrl("about:blank"));
+    cview->deleteLater();
+    std::cout << "INFO : [arexibo::qt] data connector " << data_set_id << " stopped" << std::endl;
 }
 
 void Window::runJavascriptImpl(QString js)

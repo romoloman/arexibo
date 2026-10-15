@@ -21,6 +21,9 @@ pub mod faults;
 pub mod adspace;
 pub mod syncgroup;
 pub mod authcode;
+pub mod info;
+pub mod dataconnector;
+pub mod dcruntime;
 mod tls;
 
 use std::path::PathBuf;
@@ -204,8 +207,8 @@ fn main_inner() -> anyhow::Result<()> {
     // Shared across the main server AND every shard below (see
     // server::LocalDataStore's own doc comment) -- a single, genuinely
     // shared store, not one per shard.
-    let local_data: server::LocalDataStore = std::sync::Arc::new(std::sync::Mutex::new(
-        std::collections::HashMap::new()));
+    // The Data Connectors write to it (see dcruntime.rs).
+    let local_data: server::LocalDataStore = dcruntime::runtime().local_data();
     // Shared "Register via Code" splash-screen state.
     let registration_code: server::RegistrationCodeStore = std::sync::Arc::new(std::sync::Mutex::new(None));
     // Manual CMS address/key entry from the same splash screen.
