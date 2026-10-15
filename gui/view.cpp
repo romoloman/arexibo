@@ -65,7 +65,10 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
     // See LoggingPage's own doc comment -- must be set before
     // webChannel/devtools setup below, since those attach to whichever
     // page is current at that point.
-    auto *main_page = new LoggingPage(view);
+    // Stuck layout load: stop and retry (LoggingPage reloads on failure).
+    int load_timeout = qEnvironmentVariable("AREXIBO_LAYOUT_LOAD_TIMEOUT_S", "20").toInt();
+    auto *main_page = new LoggingPage(view, nullptr, load_timeout, /*hang_max_stops=*/2,
+                                      /*hang_any_progress=*/true);
     view->setPage(main_page);
     connect(main_page, &LoggingPage::loadFailedRepeatedly, this, [this](const QUrl &url) {
         QRegularExpressionMatch m =
@@ -476,6 +479,7 @@ void Window::clearNativeViews(bool overlay)
 {
     auto &views = overlay ? overlay_native_views : native_views;
     (overlay ? overlay_focus_on_load_views : focus_on_load_views).clear();
+    (overlay ? overlay_transparent_views : transparent_views).clear();
     for (auto nview : views) {
         nview->deleteLater();
     }
@@ -929,6 +933,12 @@ void Window::jsNativeWebShowImplNow(bool overlay, int mediaId, QString url, int 
             nview->setAttribute(Qt::WA_AlwaysStackOnTop);
         }
         views[mediaId] = nview;
+        // CMS "Background transparent?": same recipe as the overlay view.
+        auto &want_transparent = overlay ? overlay_transparent_views : transparent_views;
+        if (want_transparent.remove(mediaId)) {
+            nview->page()->setBackgroundColor(Qt::transparent);
+            nview->setAttribute(Qt::WA_TranslucentBackground);
+        }
         // [HasFocus] (stripped in Rust): focus once, on the first successful load.
         auto &want_focus = overlay ? overlay_focus_on_load_views : focus_on_load_views;
         if (want_focus.remove(mediaId)) {
@@ -1169,4 +1179,14 @@ void JSInterface::jsNativeWebFocusOnLoad(int mediaId)
 void Window::jsNativeWebFocusOnLoadImpl(bool overlay, int mediaId)
 {
     (overlay ? overlay_focus_on_load_views : focus_on_load_views).insert(mediaId);
+}
+
+void JSInterface::jsNativeWebTransparent(int mediaId)
+{
+    wnd->jsNativeWebTransparentImpl(is_overlay, mediaId);
+}
+
+void Window::jsNativeWebTransparentImpl(bool overlay, int mediaId)
+{
+    (overlay ? overlay_transparent_views : transparent_views).insert(mediaId);
 }

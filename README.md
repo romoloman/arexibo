@@ -124,6 +124,9 @@ pages loaded by the embedded browser.
   Without it a native page only gets focus when touched, and the page cannot take it by
   itself (`window.focus()` is not enough).  Meant for one page per layout: with several, the
   last one to finish loading holds focus until a touch moves it.  Only the first load counts.
+* The widget's "Background transparent?" option is honored: the native view gets a transparent background, so the layout
+  shows through wherever the page paints nothing.  The page itself must be transparent too (e.g. `html, body { background:
+  transparent }`).  Unchecked, the view stays opaque white, as before.
 
 ## Standalone setup with X server
 
@@ -167,6 +170,7 @@ Normal use:
     QTWEBENGINE_REMOTE_DEBUGGING: QTWEBENGINE_REMOTE_DEBUGGING=9222 as an environment variable lets you inspect the rendered page from another machine’s Chrome/Edge at http://<host>:9222 (via an SSH tunnel if not on the same network) – useful for confirming content renders correctly without needing eyes on the actual totem screen.
     AREXIBO_FORCE_WS_ADDRESS: forces the WebSocket XMR address used for push messages, regardless of what the CMS reports when the player registers (useful when the CMS's own WebSocket XMR eligibility check is unreliable). Leave unset to use the address the CMS provides.
     AREXIBO_SPLASH_MS: minimum time (default 1000) the startup splash screen stays on screen once it has loaded, before the first layout replaces it; 0 disables the minimum. Useful on a fast start from a full cache, where the first layout would otherwise replace the splash almost immediately.
+    AREXIBO_LAYOUT_LOAD_TIMEOUT_S: seconds a layout page may go without any load progress before it is stopped and retried (default 20, 0 disables). Widgets only start once the whole page has loaded, so one stuck resource (an iframe, a web font) would otherwise leave the screen blank. The first stop is followed by a reload; if the second attempt also stalls, the page is accepted as it is and the stuck widget stays empty.
 
 Diagnostic only – not for production use:
 

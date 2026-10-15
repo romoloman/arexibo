@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.7 - Oct 2026
 
 - The player's own HTTPS requests (CMS, media downloads) and the XMR
   WebSocket now also trust the Linux system CA store, besides the bundled
@@ -31,6 +31,11 @@
   URL (removed before loading) makes that page take keyboard focus once, when it first
   finishes loading.  Before, a native page only received focus on touch and keys typed
   earlier reached nobody.
+- Add a watchdog for stuck layout loads: a layout page with no load progress for 20 s (`AREXIBO_LAYOUT_LOAD_TIMEOUT_S`,
+  0 disables) is stopped and reloaded once, then accepted as it is. Regions only start on the page's `load` event, so one
+  resource that never completes (a web font, an iframe) used to leave the screen blank until the next reload.
+- Honor the Webpage widget's "Background transparent?" option in "Open Natively" mode: the native view is now transparent when
+  it is checked (it was always opaque white outside the overlay), so the layout shows through the page's transparent areas.
 
 ## 0.6.6 - Oct 2026
 
