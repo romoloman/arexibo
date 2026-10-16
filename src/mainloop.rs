@@ -381,6 +381,11 @@ pub struct Handler {
     /// (RsaPrivateKey is Clone) so a retry is possible without
     /// re-deriving/persisting it separately.
     xmr_retry_key: Option<RsaPrivateKey>,
+    /// What the running XMR connection was made with; `None` while it
+    /// isn't connected.
+    xmr_in_use: Option<XmrTarget>,
+    /// A different target seen at the last registration, to be confirmed.
+    xmr_change_pending: Option<XmrTarget>,
     /// Unlike `xmr_retry_key` (only `Some` while a retry is actually
     /// pending), this is *always* populated -- kept specifically so
     /// XMR can be restarted later even after it's already running
@@ -497,6 +502,64 @@ const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
 const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// See `Handler::consecutive_connection_failures`'s own doc comment.
 const MAX_CONSECUTIVE_CONNECTION_FAILURES: u32 = 3;
+
+/// How soon to register again once the CMS reports different XMR
+/// connection settings, to confirm them before restarting.
+const XMR_CHANGE_CONFIRM_DELAY: Duration = Duration::from_secs(60);
+
+/// What the XMR connection is made with: the settings `xmr::start` reads
+/// for the transport it picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XmrTarget {
+    WebSocket { address: String, key: String },
+    Zmq { address: String },
+}
+
+impl XmrTarget {
+    fn of(settings: &PlayerSettings) -> Self {
+        if settings.xmr_web_socket_address_in_use.is_empty() {
+            XmrTarget::Zmq { address: settings.xmr_network_address.clone() }
+        } else {
+            XmrTarget::WebSocket { address: settings.xmr_web_socket_address_in_use.clone(),
+                                   key: settings.xmr_cms_key.clone() }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            XmrTarget::WebSocket { address, .. } => format!("WebSocket {address}"),
+            XmrTarget::Zmq { address } => format!("TCP {address}"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum XmrChange {
+    None,
+    Pending,
+    Restart,
+}
+
+/// A target different from the one in use is acted on only when seen at two
+/// registrations in a row: the CMS has been seen to answer inconsistently,
+/// and a restart on every flip would loop. Nothing to do while XMR is not
+/// connected (`in_use` is `None`): its retry already uses the new settings.
+fn assess_xmr_change(in_use: Option<&XmrTarget>, observed: XmrTarget,
+                     pending: &mut Option<XmrTarget>) -> XmrChange {
+    let Some(current) = in_use else {
+        *pending = None;
+        return XmrChange::None;
+    };
+    if observed == *current {
+        *pending = None;
+        XmrChange::None
+    } else if pending.as_ref() == Some(&observed) {
+        XmrChange::Restart
+    } else {
+        *pending = Some(observed);
+        XmrChange::Pending
+    }
+}
 
 /// Whether any *media*, *layout*, or *dependency* file in a collection
 /// cycle's own per-file download results failed -- used by
@@ -701,6 +764,7 @@ impl Handler {
                 }
                 Err(e) => return Err(e),
             };
+            let xmr_in_use = xmr_retry_key.is_none().then(|| XmrTarget::of(&settings));
             settings.to_file(&setting_file).context("writing player settings")?;
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
@@ -732,7 +796,8 @@ impl Handler {
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
                                  debug_override, xmr_privkey: privkey.clone(),
-                                 xmr_retry_key, cms: cms.clone(), no_verify };
+                                 xmr_retry_key, xmr_in_use, xmr_change_pending: None,
+                                 cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
             if renamed_since_last_run {
@@ -795,6 +860,7 @@ impl Handler {
                                  screenshot_requested_seen: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
+                                 xmr_in_use: None, xmr_change_pending: None,
                                  cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
@@ -810,6 +876,8 @@ impl Handler {
         if self.pending_auth || self.pending_network
             || self.consecutive_connection_failures >= MAX_CONSECUTIVE_CONNECTION_FAILURES {
             PENDING_AUTH_RETRY_INTERVAL
+        } else if self.xmr_change_pending.is_some() {
+            XMR_CHANGE_CONFIRM_DELAY
         } else {
             Duration::from_secs(self.settings.collect_interval)
         }
@@ -1679,6 +1747,24 @@ impl Handler {
                             self.settings.embedded_server_allow_wan, settings.embedded_server_allow_wan);
                 return Err(RestartRequired.into());
             }
+            // The XMR connection is made once, at startup: a different
+            // transport, address or key needs a fresh start too.
+            let observed_xmr = XmrTarget::of(&settings);
+            let was_xmr = self.xmr_in_use.as_ref().map(XmrTarget::describe);
+            match assess_xmr_change(self.xmr_in_use.as_ref(), observed_xmr.clone(),
+                                    &mut self.xmr_change_pending) {
+                XmrChange::None => {}
+                XmrChange::Pending => log::warn!(
+                    "the CMS reports XMR connection settings different from the ones in use \
+                     ({} -> {}) -- will restart to apply them if the next registration \
+                     confirms it", was_xmr.unwrap_or_default(), observed_xmr.describe()),
+                XmrChange::Restart => {
+                    log::warn!("XMR connection settings changed ({} -> {}) and confirmed -- \
+                                exiting so the supervisor restarts us fresh and picks it up",
+                               was_xmr.unwrap_or_default(), observed_xmr.describe());
+                    return Err(RestartRequired.into());
+                }
+            }
             if !settings.sync_role.is_same_role_kind(&self.settings.sync_role) {
                 log::warn!("Sync Group role changed ({:?} -> {:?}) mid-session -- exiting so \
                             the supervisor restarts us fresh and picks it up",
@@ -1771,6 +1857,7 @@ impl Handler {
                     log::info!("XMR connection recovered, switching from offline mode \
                                 to real-time push updates");
                     self.xmr = xmr;
+                    self.xmr_in_use = Some(XmrTarget::of(&self.settings));
                 }
                 Err(e) => {
                     log::warn!("XMR still not reachable, will retry next collection: {e:#}");
@@ -2221,6 +2308,8 @@ impl Handler {
                     will restart it with fresh settings on the next \
                     collection cycle");
         self.xmr = never();
+        self.xmr_in_use = None;
+        self.xmr_change_pending = None;
         self.xmr_retry_key = Some(self.xmr_privkey.clone());
     }
 
@@ -4614,6 +4703,215 @@ mod port_change_forces_cache_purge_tests {
         assert!(err.root_cause().downcast_ref::<RestartRequired>().is_some(),
                 "must be specifically a RestartRequired, so main.rs can use its own \
                  distinct exit code (3) instead of a generic error exit (1)");
+    }
+
+    /// Every registration is answered with `answers[chosen]` -- (xmrType,
+    /// WebSocket address, TCP address, key) -- and the test picks `chosen`
+    /// before each collection (a collection registers more than once).
+    /// Anything else asked gets an empty answer, which fails the rest of a
+    /// collection.
+    fn start_mock_with_xmr_answers(answers: Vec<(&'static str, &'static str, &'static str, &'static str)>)
+                                   -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let chosen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chosen_by_test = chosen.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut sent = String::new();
+                let _ = std::io::Read::read_to_string(request.as_reader(), &mut sent);
+                let inner = if sent.contains("RegisterDisplay") {
+                    let (kind, ws, tcp, key) = answers[chosen.load(std::sync::atomic::Ordering::SeqCst)];
+                    format!("<ActivationMessage code=\"READY\"><embeddedServerPort>9696</embeddedServerPort>\
+                             <embeddedServerAllowWan type=\"checkbox\">0</embeddedServerAllowWan>\
+                             <xmrType>{kind}</xmrType><xmrWebSocketAddress>{ws}</xmrWebSocketAddress>\
+                             <xmrNetworkAddress>{tcp}</xmrNetworkAddress><xmrCmsKey>{key}</xmrCmsKey>\
+                             </ActivationMessage>").replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+                } else {
+                    String::new()
+                };
+                let body = format!("<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+                                    <soap:Body><RegisterDisplayResponse><ActivationMessage>{inner}\
+                                    </ActivationMessage></RegisterDisplayResponse></soap:Body></soap:Envelope>");
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        (port, chosen_by_test)
+    }
+
+    const XMR_A: (&str, &str, &str, &str) = ("zmq", "", "tcp://127.0.0.1:1", "k1");
+    const XMR_B: (&str, &str, &str, &str) = ("ws", "ws://127.0.0.1:1/xmr", "tcp://127.0.0.1:1", "k1");
+    const XMR_C: (&str, &str, &str, &str) = ("ws", "ws://127.0.0.1:2/xmr", "tcp://127.0.0.1:1", "k1");
+
+    fn zmq_target() -> XmrTarget { XmrTarget::Zmq { address: "tcp://127.0.0.1:1".into() } }
+
+    fn ws_target(port: u16) -> XmrTarget {
+        XmrTarget::WebSocket { address: format!("ws://127.0.0.1:{port}/xmr"), key: "k1".into() }
+    }
+
+    struct XmrCase {
+        handler: Handler,
+        chosen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        _gui: crossbeam_channel::Receiver<ToGui>,
+    }
+
+    impl XmrCase {
+        /// A handler whose XMR counts as connected to `in_use`; the first
+        /// answer is the one `Handler::new` itself registers with.
+        fn new(answers: Vec<(&'static str, &'static str, &'static str, &'static str)>,
+               in_use: Option<XmrTarget>) -> Self {
+            let (port, chosen) = start_mock_with_xmr_answers(answers);
+            let cms = test_cms_settings(port);
+            let envdir = test_envdir();
+            let (togui_tx, gui) = crossbeam_channel::unbounded();
+            let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+            let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+            let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+            let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+            let handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+            .expect("must construct successfully while pending");
+            let mut handler = handler;
+            handler.xmr_retry_key = None;
+            handler.xmr_in_use = in_use;
+            XmrCase { handler, chosen, _gui: gui }
+        }
+
+        /// One collection, with the CMS answering as `answers[answer]`.
+        fn collect(&mut self, answer: usize) -> Result<()> {
+            self.chosen.store(answer, std::sync::atomic::Ordering::SeqCst);
+            self.handler.collect_once()
+        }
+    }
+
+    fn restarts(result: &Result<()>) -> bool {
+        result.as_ref().err().is_some_and(|e| e.root_cause().downcast_ref::<RestartRequired>().is_some())
+    }
+
+    #[test]
+    fn a_new_xmr_target_is_acted_on_only_once_confirmed() {
+        let mut pending = None;
+        let (a, b, c) = (zmq_target(), ws_target(1), ws_target(2));
+        assert_eq!(assess_xmr_change(Some(&a), a.clone(), &mut pending), XmrChange::None);
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Restart);
+        // another target in between starts the count again
+        let mut pending = None;
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), c.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), c, &mut pending), XmrChange::Restart);
+        // going back to the one in use clears it
+        let mut pending = None;
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), a.clone(), &mut pending), XmrChange::None);
+        assert_eq!(pending, None);
+        assert_eq!(assess_xmr_change(Some(&a), b, &mut pending), XmrChange::Pending, "counted afresh");
+    }
+
+    #[test]
+    fn nothing_is_assessed_while_xmr_is_not_connected() {
+        let mut pending = Some(ws_target(1));
+        assert_eq!(assess_xmr_change(None, ws_target(2), &mut pending), XmrChange::None);
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn the_target_is_what_the_transport_in_use_connects_with() {
+        let ws = PlayerSettings { xmr_web_socket_address: "ws://raw:1".into(),
+            xmr_web_socket_address_in_use: "ws://used:2/xmr".into(), xmr_network_address: "tcp://t:3".into(),
+            xmr_cms_key: "key".into(), ..Default::default() };
+        assert_eq!(XmrTarget::of(&ws), XmrTarget::WebSocket { address: "ws://used:2/xmr".into(), key: "key".into() },
+                   "the address in use, not the raw one");
+        let zmq = PlayerSettings { xmr_network_address: "tcp://t:3".into(), xmr_cms_key: "key".into(), ..Default::default() };
+        assert_eq!(XmrTarget::of(&zmq), XmrTarget::Zmq { address: "tcp://t:3".into() });
+        // what the connection does not use does not make it a different one
+        let other_tcp = PlayerSettings { xmr_network_address: "tcp://elsewhere:9".into(), ..ws.clone() };
+        assert_eq!(XmrTarget::of(&other_tcp), XmrTarget::of(&ws), "TCP address while on WebSocket");
+        let other_key = PlayerSettings { xmr_cms_key: "other".into(), ..zmq.clone() };
+        assert_eq!(XmrTarget::of(&other_key), XmrTarget::of(&zmq), "key while on TCP");
+        let new_key = PlayerSettings { xmr_cms_key: "rotated".into(), ..ws.clone() };
+        assert_ne!(XmrTarget::of(&new_key), XmrTarget::of(&ws), "a new key matters on WebSocket");
+    }
+
+    #[test]
+    fn a_confirmed_xmr_change_restarts_the_player() {
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B], Some(zmq_target()));
+        let first = case.collect(1);
+        assert!(!restarts(&first), "not on the first sight");
+        assert_eq!(case.handler.xmr_change_pending, Some(ws_target(1)));
+        assert_eq!(case.handler.next_collect_interval(), XMR_CHANGE_CONFIRM_DELAY, "confirm soon");
+        assert!(restarts(&case.collect(1)), "confirmed at the next registration");
+    }
+
+    #[test]
+    fn a_cms_that_flips_between_two_websocket_addresses_never_restarts_the_player() {
+        // the one in use (B) and another (C), answered in turn
+        let mut case = XmrCase::new(vec![XMR_B, XMR_C], Some(ws_target(1)));
+        for round in 0..6 {
+            let answer = (round + 1) % 2; // C, B, C, B, C, B
+            assert!(!restarts(&case.collect(answer)), "round {round}");
+            assert_eq!(case.handler.xmr_change_pending.is_some(), answer == 1, "round {round}");
+        }
+        assert_eq!(case.handler.next_collect_interval(),
+                   Duration::from_secs(case.handler.settings.collect_interval), "back to the usual pace");
+    }
+
+    #[test]
+    fn once_a_websocket_was_offered_a_later_tcp_answer_counts_as_the_same_websocket() {
+        // The sticky address rule (an empty WebSocket address is not trusted
+        // over one already known) applies to what the CMS offered, even if it
+        // was never connected to: the answer "TCP" after "WebSocket B" is
+        // read as B again, which confirms it.
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B], Some(zmq_target()));
+        assert!(!restarts(&case.collect(1)));
+        assert!(restarts(&case.collect(0)));
+    }
+
+    #[test]
+    fn a_second_different_target_starts_the_confirmation_again() {
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B, XMR_C], Some(zmq_target()));
+        assert!(!restarts(&case.collect(1)));
+        assert_eq!(case.handler.xmr_change_pending, Some(ws_target(1)));
+        assert!(!restarts(&case.collect(2)));
+        assert_eq!(case.handler.xmr_change_pending, Some(ws_target(2)));
+        assert!(restarts(&case.collect(2)));
+    }
+
+    #[test]
+    fn an_unchanged_xmr_target_leaves_no_trace() {
+        let mut case = XmrCase::new(vec![XMR_A], Some(zmq_target()));
+        assert!(!restarts(&case.collect(0)));
+        assert_eq!(case.handler.xmr_change_pending, None);
+    }
+
+    #[test]
+    fn no_restart_is_asked_while_xmr_is_not_connected() {
+        // offline start, or the connection gave up: the retry that is already
+        // pending uses the settings as they are then
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B], None);
+        assert!(!restarts(&case.collect(1)));
+        assert!(!restarts(&case.collect(1)));
+        assert_eq!(case.handler.xmr_change_pending, None);
+    }
+
+    #[test]
+    fn a_flip_to_tcp_is_ignored_while_on_websocket() {
+        // the address kept by the sticky rule, so nothing changed
+        let mut case = XmrCase::new(vec![XMR_A], Some(ws_target(1)));
+        case.handler.settings.xmr_web_socket_address_in_use = "ws://127.0.0.1:1/xmr".into();
+        case.handler.settings.xmr_cms_key = "k1".into();
+        assert!(!restarts(&case.collect(0)));
+        assert!(!restarts(&case.collect(0)));
+        assert_eq!(case.handler.xmr_change_pending, None);
+    }
+
+    #[test]
+    fn giving_up_on_xmr_forgets_what_was_in_use_and_pending() {
+        let mut case = XmrCase::new(vec![XMR_A], Some(zmq_target()));
+        case.handler.xmr_change_pending = Some(ws_target(1));
+        case.handler.xmr_disconnected();
+        assert_eq!((case.handler.xmr_in_use.clone(), case.handler.xmr_change_pending.clone()), (None, None));
+        assert!(case.handler.xmr_retry_key.is_some());
     }
 
     #[test]
