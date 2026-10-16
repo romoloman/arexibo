@@ -150,6 +150,11 @@ pub enum SplashState {
 
 pub type SplashStateStore = Arc<Mutex<SplashState>>;
 
+/// True for loopback peers (all the shard addresses are loopback too).
+fn is_local_addr(addr: Option<&std::net::SocketAddr>) -> bool {
+    addr.is_some_and(|a| a.ip().is_loopback())
+}
+
 /// Latest video-wall state for one syncKey -- the page's JS polls
 /// `GET /sync/video-command?syncKey=X`. Symmetric for Lead and
 /// Follower: mainloop.rs fills it from its own orchestration (Lead) or
@@ -331,6 +336,15 @@ impl Server {
             thread::spawn(move || {
                 loop {
                     let mut req = server.recv().unwrap();
+                    // A connector's HTTP request can take up to 30s: it must not
+                    // tie up one of the few workers.
+                    if req.url() == "/dc/request" && *req.method() == tiny_http::Method::Post {
+                        thread::spawn(move || {
+                            let resp = crate::dcruntime::handle_request(&mut req);
+                            let _ = req.respond(resp);
+                        });
+                        continue;
+                    }
                     match Self::serve(&dir, &mut req, &duration_tx, &trigger_tx, &fault_tx,
                                        &manual_register_tx, &local_data, &registration_code,
                                        &video_sync, awaiting_registration, &splash_state) {
@@ -637,6 +651,27 @@ impl Server {
                 return Self::handle_video_position(req, &video_sync.position_tx),
 
 
+            // Data Connectors: the page that hosts a connector and the calls
+            // it makes (see dcruntime.rs).
+            p if p.starts_with("/dc/host/") => crate::dcruntime::host_page_response(
+                crate::dcruntime::runtime(), p),
+            "/dc/set" | "/dc/notify" | "/dc/criteria" | "/dc/log" | "/dc/error" => {
+                let action = path_only["/dc/".len()..].to_string();
+                crate::dcruntime::handle_bridge(crate::dcruntime::runtime(), &action, req)?
+            }
+
+            // Player info for widgets (xiboIC.info()); local requests only,
+            // as in the Windows player.
+            "/info" => {
+                if is_local_addr(req.remote_addr()) {
+                    Response::from_data(crate::info::json().into_bytes())
+                        .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                        .boxed()
+                } else {
+                    Response::empty(403).boxed()
+                }
+            }
+
             // Real-time DataSet data lookup -- confirmed from a real
             // `bundle.min.js` the user shared: `xiboIC.getData(dataKey,
             // {done, error})` makes a plain relative GET to
@@ -661,15 +696,20 @@ impl Server {
             // path to begin with).
             "/realtime" => {
                 let data_key = query.split('&')
-                    .find_map(|kv| kv.strip_prefix("dataKey="));
-                let value = data_key.and_then(|k| {
-                    local_data.lock().unwrap().get(k).cloned()
-                });
-                match value {
-                    Some(v) => Response::from_data(v.into_bytes())
-                        .with_header(Header::from_bytes(b"Content-Type", b"text/plain").unwrap())
-                        .boxed(),
-                    None => Response::empty(404).boxed(),
+                    .find_map(|kv| kv.strip_prefix("dataKey="))
+                    .map(|k| percent_decode(&k.replace('+', " ")))
+                    .filter(|k| !k.is_empty());
+                let json = |status: u16, body: String| Response::from_data(body.into_bytes())
+                    .with_status_code(status)
+                    .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                    .boxed();
+                match data_key {
+                    None => json(400, r#"{"success":false,"error":"dataKey is required"}"#.into()),
+                    Some(key) => match local_data.lock().unwrap().get(&key).cloned() {
+                        // The 404 is what makes the widget's own error callback fire.
+                        None => json(404, r#"{"success":false,"error":"No data for dataKey"}"#.into()),
+                        Some(value) => json(200, value),
+                    },
                 }
             }
 
@@ -990,6 +1030,213 @@ mod realtime_tests {
         match resp {
             Err(ureq::Error::StatusCode(404)) => {} // expected
             other => panic!("expected clean 404, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn info_returns_the_electron_player_fields_as_json() {
+        let (port, _local_data) = make_test_server();
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/info")).call().unwrap();
+        assert_eq!(resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+                   Some("application/json"));
+        let v: serde_json::Value =
+            serde_json::from_str(&resp.into_body().read_to_string().unwrap()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["currentLayoutId", "displayName", "displayStatus", "hardwareKey",
+                          "latitude", "longitude", "screenHeight", "screenWidth", "timeZone",
+                          "version"]);
+    }
+
+    #[test]
+    fn a_connector_page_is_served_only_while_it_is_registered() {
+        let (port, _local_data) = make_test_server();
+        let rt = crate::dcruntime::runtime();
+        let url = format!("http://127.0.0.1:{port}/dc/host/910001.html");
+        assert!(matches!(ureq::get(&url).call(), Err(ureq::Error::StatusCode(404))));
+        let payload = crate::dataconnector::ConnectorPayload {
+            data_set_id: 910001, schedule_id: 1, data_params: String::new(),
+            js: "dataSet_910001.js".into(), md5: "m".into() };
+        rt.sync(vec![payload], |_| Some("window.marker = 910001;".into()), |id| format!("http://x/{id}"));
+        let resp = ureq::get(&url).call().unwrap();
+        assert_eq!(resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+                   Some("text/html; charset=utf-8"));
+        assert!(resp.into_body().read_to_string().unwrap().contains("window.marker = 910001;"));
+        rt.stop(910001);
+        assert!(matches!(ureq::get(&url).call(), Err(ureq::Error::StatusCode(404))));
+    }
+
+    fn post_json(port: u16, path: &str, body: serde_json::Value) -> serde_json::Value {
+        let resp = ureq::post(&format!("http://127.0.0.1:{port}{path}"))
+            .header("Content-Type", "application/json").send(body.to_string()).unwrap();
+        serde_json::from_str(&resp.into_body().read_to_string().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_connector_can_publish_a_value_for_the_widgets() {
+        let (port, _local_data) = make_test_server();
+        let reply = post_json(port, "/dc/set", serde_json::json!(
+            {"dataSetId": 910002, "dataKey": "dc-test-publish", "data": "{\"t\":21}"}));
+        assert_eq!(reply["success"], true);
+        let stored = crate::dcruntime::runtime().local_data().lock().unwrap().get("dc-test-publish").cloned();
+        assert_eq!(stored.as_deref(), Some("{\"t\":21}"));
+        crate::dcruntime::runtime().stop(910002);
+    }
+
+    #[test]
+    fn a_connector_publishing_under_its_numeric_dataset_id_is_stored_as_text() {
+        let (port, _local_data) = make_test_server();
+        let reply = post_json(port, "/dc/set", serde_json::json!(
+            {"dataSetId": 910008, "dataKey": 910008, "data": "[1]"}));
+        assert_eq!(reply["success"], true);
+        let stored = crate::dcruntime::runtime().local_data().lock().unwrap().get("910008").cloned();
+        assert_eq!(stored.as_deref(), Some("[1]"), "readable at /realtime?dataKey=910008");
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/info")).call();
+        assert!(resp.is_ok());
+        crate::dcruntime::runtime().stop(910008);
+    }
+
+    #[test]
+    fn a_rejected_value_comes_back_as_a_failure() {
+        let (port, _local_data) = make_test_server();
+        let reply = post_json(port, "/dc/set", serde_json::json!(
+            {"dataSetId": 910003, "dataKey": "", "data": "x"}));
+        assert_eq!((reply["success"].as_bool(), reply["status"].as_i64()), (Some(false), Some(400)));
+    }
+
+    #[test]
+    fn a_connector_can_set_a_schedule_criterion() {
+        let (port, _local_data) = make_test_server();
+        let events = crate::dcruntime::runtime().events();
+        post_json(port, "/dc/criteria", serde_json::json!(
+            {"dataSetId": 910004, "dataKey": "dc-test-metric",
+             "data": {"metric": "dc-test-metric", "value": 7, "ttl": 90}}));
+        let found = events.try_iter().find(|e| matches!(e,
+            crate::dcruntime::DcEvent::Criteria { metric, .. } if metric == "dc-test-metric"));
+        assert_eq!(found, Some(crate::dcruntime::DcEvent::Criteria {
+            metric: "dc-test-metric".into(), value: "7".into(), ttl: 90 }));
+    }
+
+    #[test]
+    fn a_criterion_without_a_value_is_ignored_and_the_ttl_defaults() {
+        let (port, _local_data) = make_test_server();
+        let events = crate::dcruntime::runtime().events();
+        post_json(port, "/dc/criteria", serde_json::json!(
+            {"dataSetId": 910005, "dataKey": "dc-test-empty", "data": {"metric": "dc-test-empty", "value": null}}));
+        post_json(port, "/dc/criteria", serde_json::json!(
+            {"dataSetId": 910005, "dataKey": "dc-test-ttl", "data": {"metric": "dc-test-ttl", "value": "x"}}));
+        let all: Vec<_> = events.try_iter().collect();
+        assert!(!all.iter().any(|e| matches!(e, crate::dcruntime::DcEvent::Criteria { metric, .. } if metric == "dc-test-empty")));
+        assert!(all.contains(&crate::dcruntime::DcEvent::Criteria {
+            metric: "dc-test-ttl".into(), value: "x".into(), ttl: 300 }));
+    }
+
+    #[test]
+    fn a_connector_request_is_made_by_the_player_and_answered_in_the_bridge_format() {
+        let (port, _local_data) = make_test_server();
+        let target = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let target_port = target.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for req in target.incoming_requests() {
+                let status = if req.url() == "/ok" { 200 } else { 500 };
+                let _ = req.respond(Response::from_string("answer").with_status_code(status));
+            }
+        });
+        let ok = post_json(port, "/dc/request", serde_json::json!(
+            {"dataSetId": 910006, "path": format!("http://127.0.0.1:{target_port}/ok"), "options": {}}));
+        assert_eq!((ok["success"].as_bool(), ok["status"].as_i64(), ok["data"].as_str()),
+                   (Some(true), Some(200), Some("answer")));
+        let bad = post_json(port, "/dc/request", serde_json::json!(
+            {"dataSetId": 910006, "path": format!("http://127.0.0.1:{target_port}/bad"),
+             "options": {"type": "GET"}}));
+        assert_eq!((bad["success"].as_bool(), bad["status"].as_i64()), (Some(false), Some(500)));
+    }
+
+    #[test]
+    fn a_slow_connector_request_does_not_hold_up_the_other_requests() {
+        let (port, _local_data) = make_test_server();
+        let slow = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let slow_port = slow.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for req in slow.incoming_requests() {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let _ = req.respond(Response::from_string("late"));
+                });
+            }
+        });
+        let started = std::time::Instant::now();
+        let pending: Vec<_> = (0..6).map(|_| std::thread::spawn(move || post_json(port, "/dc/request",
+            serde_json::json!({"dataSetId": 910007, "path": format!("http://127.0.0.1:{slow_port}/"), "options": {}})))).collect();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // more slow requests than workers (4), yet this one is answered at once
+        let ok = ureq::get(&format!("http://127.0.0.1:{port}/info")).call();
+        assert!(ok.is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "answered while the slow ones wait");
+        for p in pending { let _ = p.join(); }
+    }
+
+    #[test]
+    fn an_unknown_connector_action_is_an_error() {
+        let (port, _local_data) = make_test_server();
+        let resp = ureq::post(&format!("http://127.0.0.1:{port}/dc/nope")).send("{}");
+        assert!(resp.is_err());
+    }
+
+    #[test]
+    fn info_is_only_served_to_local_peers() {
+        let local: std::net::SocketAddr = "127.0.0.5:40000".parse().unwrap();
+        let local6: std::net::SocketAddr = "[::1]:40000".parse().unwrap();
+        let lan: std::net::SocketAddr = "192.168.1.10:40000".parse().unwrap();
+        assert!(is_local_addr(Some(&local)));
+        assert!(is_local_addr(Some(&local6)));
+        assert!(!is_local_addr(Some(&lan)));
+        assert!(!is_local_addr(None));
+    }
+
+    #[test]
+    fn realtime_without_a_key_is_a_400_with_a_json_error() {
+        let (port, _local_data) = make_test_server();
+        for query in ["", "?dataKey=", "?other=1"] {
+            let resp = ureq::get(&format!("http://127.0.0.1:{port}/realtime{query}")).call();
+            match resp {
+                Err(ureq::Error::StatusCode(400)) => {}
+                other => panic!("{query:?}: expected 400, got {other:?}"),
+            }
+        }
+    }
+
+    fn realtime_error_body(port: u16, key: &str) -> (u16, String) {
+        let mut resp = ureq::get(&format!("http://127.0.0.1:{port}/realtime?dataKey={key}"))
+            .config().http_status_as_error(false).build().call().unwrap();
+        (resp.status().as_u16(), resp.body_mut().read_to_string().unwrap())
+    }
+
+    #[test]
+    fn realtime_miss_is_a_404_with_a_json_error() {
+        let (port, _local_data) = make_test_server();
+        let (status, body) = realtime_error_body(port, "nothing-here");
+        assert_eq!(status, 404);
+        assert_eq!(body, r#"{"success":false,"error":"No data for dataKey"}"#);
+    }
+
+    #[test]
+    fn realtime_hit_is_served_as_json() {
+        let (port, local_data) = make_test_server();
+        local_data.lock().unwrap().insert("k".to_string(), r#"{"t":21}"#.to_string());
+        let resp = ureq::get(&format!("http://127.0.0.1:{port}/realtime?dataKey=k")).call().unwrap();
+        assert_eq!(resp.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("application/json"));
+        assert_eq!(resp.into_body().read_to_string().unwrap(), r#"{"t":21}"#);
+    }
+
+    #[test]
+    fn realtime_key_is_decoded_like_a_query_parameter() {
+        let (port, local_data) = make_test_server();
+        local_data.lock().unwrap().insert("city weather".to_string(), "ok".to_string());
+        local_data.lock().unwrap().insert("caff\u{e8}".to_string(), "ok".to_string());
+        for key in ["city%20weather", "city+weather", "caff%C3%A8"] {
+            let (status, body) = realtime_error_body(port, key);
+            assert_eq!((status, body.as_str()), (200, "ok"), "{key}");
         }
     }
 

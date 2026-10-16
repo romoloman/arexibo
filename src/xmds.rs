@@ -60,6 +60,22 @@ pub struct Cms {
     default_ws_address: Option<String>,
 }
 
+/// CMS registration `status` (0 ready, 1 added, 2 waiting); from `code` if absent.
+fn register_status(tree: &Element, code: &str) -> i32 {
+    tree.get_attr("status").and_then(|s| s.trim().parse().ok())
+        .unwrap_or(if code == "READY" { 0 } else { 2 })
+}
+
+/// `<tags><tag><tagName/><tagValue/></tag></tags>`: name -> value, "" if it has none.
+fn parse_display_tags(tree: &Element) -> std::collections::BTreeMap<String, String> {
+    tree.find("tags").into_iter().flat_map(|tags| tags.find_all("tag"))
+        .filter_map(|tag| {
+            let name = tag.find("tagName")?.text().to_string();
+            let value = tag.find("tagValue").map(|v| v.text().to_string()).unwrap_or_default();
+            (!name.is_empty()).then_some((name, value))
+        }).collect()
+}
+
 impl Cms {
     pub fn new(cms: &CmsSettings, pub_key: String, no_verify: bool, xml_dir: PathBuf) -> Result<Self> {
         Ok(Self {
@@ -151,6 +167,7 @@ impl Cms {
 
         let tree = Element::from_reader(&mut xml.as_bytes()).context("parsing activation message")?;
         let code = tree.get_attr("code").context("no result code in activation")?;
+        crate::info::set_display_status(register_status(&tree, code));
         if code != "READY" {
             Ok(None)
         } else {
@@ -299,6 +316,7 @@ impl Cms {
                 download_end_window: tree.def_child::<String>("downloadEndWindow",
                                                                 String::new())?,
                 display_time_zone: tree.def_child::<String>("displayTimeZone", String::new())?,
+                display_tags: parse_display_tags(&tree),
                 expire_modified_layouts: tree.def_child::<i32>("expireModifiedLayouts", 0)? != 0,
                 screen_shot_requested: tree.def_child::<i32>("screenShotRequested", 0)? != 0,
                 new_cms_address: tree.def_child::<String>("newCmsAddress", String::new())?,
@@ -391,7 +409,8 @@ impl Cms {
                 // source (xibo-dotnetclient's RequiredFiles.cs) -- id
                 // is a string (e.g. a font/bundle name), not an int
                 // like every other file type, and there is no md5 to
-                // verify against (unlike media/layout).
+                // verify against (unlike media/layout) -- except that
+                // the CMS does send one, which a data connector needs.
                 res.push(ReqFile::Dependency {
                     id: file.parse_attr("id")?,
                     file_type: file.parse_attr("fileType")?,
@@ -399,6 +418,7 @@ impl Cms {
                     http: file.get_attr("download").context("missing download")? == "http",
                     path: file.parse_attr("path")?,
                     name: file.parse_attr("saveAs")?,
+                    md5: file.get_attr("md5").and_then(|s| hex::decode(s).ok()).unwrap_or_default(),
                 });
             } else {
                 continue;
@@ -1001,7 +1021,8 @@ mod required_files_dependency_tests {
         let (files, _purge) = cms.required_files().unwrap();
         assert_eq!(files.len(), 1, "the dependency entry must not be silently skipped");
         match &files[0] {
-            ReqFile::Dependency { id, file_type, size, http, path, name } => {
+            ReqFile::Dependency { id, file_type, size, http, path, name, md5 } => {
+                assert!(md5.is_empty(), "no md5 attribute: nothing kept");
                 assert_eq!(id, "roboto-regular.ttf");
                 assert_eq!(file_type, "font");
                 assert_eq!(*size, 12345);
@@ -1029,6 +1050,33 @@ mod required_files_dependency_tests {
                 assert!(*http, "download=\"http\" must be parsed as the http download path");
                 assert_eq!(path, "https://cms.example/bundle.js");
             }
+            other => panic!("expected ReqFile::Dependency, got a different variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dependency_md5_is_kept_when_the_cms_sends_one() {
+        let xml = r#"<files>
+            <file type="dependency" id="16" fileType="data_connector"
+                  size="25" download="xmds" path="dataSet_16.js" saveAs="dataSet_16.js"
+                  md5="0123456789abcdef0123456789abcdef"/>
+            <file type="dependency" id="bad" fileType="data_connector"
+                  size="25" download="xmds" path="x.js" saveAs="x.js" md5="not hex"/>
+        </files>"#;
+        let port = start_mock(xml);
+        let mut cms = test_cms(port);
+        let (files, _purge) = cms.required_files().unwrap();
+        assert_eq!(files.len(), 2);
+        match &files[0] {
+            ReqFile::Dependency { file_type, name, md5, .. } => {
+                assert_eq!(file_type, "data_connector");
+                assert_eq!(name, "dataSet_16.js");
+                assert_eq!(hex::encode(md5), "0123456789abcdef0123456789abcdef");
+            }
+            other => panic!("expected ReqFile::Dependency, got a different variant: {other:?}"),
+        }
+        match &files[1] {
+            ReqFile::Dependency { md5, .. } => assert!(md5.is_empty(), "an unreadable md5 is treated as none"),
             other => panic!("expected ReqFile::Dependency, got a different variant: {other:?}"),
         }
     }
@@ -1475,5 +1523,79 @@ mod media_inventory_tests {
         assert!(!sent.contains("lastChecked"),
                 "a non-dependency entry must not gain the dependency-only lastChecked \
                  attribute -- got:\n{sent}");
+    }
+}
+
+#[cfg(test)]
+mod register_status_tests {
+    use super::*;
+
+    fn status_of(xml: &str) -> i32 {
+        let tree = Element::from_reader(&mut xml.as_bytes()).unwrap();
+        let code = tree.get_attr("code").unwrap();
+        register_status(&tree, code)
+    }
+
+    #[test]
+    fn the_status_attribute_is_read_as_sent() {
+        assert_eq!(status_of(r#"<display status="0" code="READY"/>"#), 0);
+        assert_eq!(status_of(r#"<display status="1" code="ADDED"/>"#), 1);
+        assert_eq!(status_of(r#"<display status="2" code="WAITING"/>"#), 2);
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_status_falls_back_to_the_code() {
+        assert_eq!(status_of(r#"<display code="READY"/>"#), 0);
+        assert_eq!(status_of(r#"<display code="WAITING"/>"#), 2);
+        assert_eq!(status_of(r#"<display status="x" code="READY"/>"#), 0);
+    }
+}
+
+#[cfg(test)]
+mod display_tags_tests {
+    use super::*;
+
+    fn tags_of(xml: &str) -> Vec<(String, String)> {
+        let tree = Element::from_reader(xml.as_bytes()).unwrap();
+        parse_display_tags(&tree).into_iter().collect()
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) { (a.to_string(), b.to_string()) }
+
+    #[test]
+    fn tags_are_read_as_the_cms_sends_them() {
+        let tags = tags_of(r#"<display code="READY"><tags>
+            <tag><tagName>lat</tagName><tagValue>44.0355</tagValue></tag>
+            <tag><tagName>lon</tagName><tagValue>10.1397</tagValue></tag>
+        </tags></display>"#);
+        assert_eq!(tags, [pair("lat", "44.0355"), pair("lon", "10.1397")]);
+    }
+
+    #[test]
+    fn a_tag_without_a_value_has_an_empty_one() {
+        let tags = tags_of(r#"<display><tags><tag><tagName>lobby</tagName></tag></tags></display>"#);
+        assert_eq!(tags, [pair("lobby", "")]);
+    }
+
+    #[test]
+    fn values_are_kept_as_typed() {
+        let tags = tags_of(r#"<display><tags><tag><tagName>city</tagName>
+            <tagValue> Massa &amp; Carrara </tagValue></tag></tags></display>"#);
+        assert_eq!(tags, [pair("city", " Massa & Carrara ")]);
+    }
+
+    #[test]
+    fn no_tags_or_a_nameless_tag_gives_nothing() {
+        assert!(tags_of(r#"<display code="READY"/>"#).is_empty());
+        assert!(tags_of(r#"<display><tags/></display>"#).is_empty());
+        assert!(tags_of(r#"<display><tags><tag><tagValue>x</tagValue></tag><tag><tagName></tagName></tag></tags></display>"#).is_empty());
+    }
+
+    #[test]
+    fn the_last_of_two_tags_with_the_same_name_wins() {
+        let tags = tags_of(r#"<display><tags>
+            <tag><tagName>a</tagName><tagValue>1</tagValue></tag>
+            <tag><tagName>a</tagName><tagValue>2</tagValue></tag></tags></display>"#);
+        assert_eq!(tags, [pair("a", "2")]);
     }
 }

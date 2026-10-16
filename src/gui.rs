@@ -106,6 +106,13 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                         cpp::navigate(file.as_ptr());
                     }
                 }
+                ToGui::Jump(id) => {
+                    log::info!("jumping to layout: {id}");
+                    let file = CString::new(format!("{id}.xlf.html")).expect("ok");
+                    unsafe {
+                        cpp::navigate(file.as_ptr());
+                    }
+                }
                 ToGui::WebHook(code) => {
                     // Matches layout.rs's own `write_action` -- a
                     // triggerType="webhook" action registers itself as
@@ -125,6 +132,24 @@ pub fn run(settings: PlayerSettings, screen: String, inspect: bool, debug: bool,
                     unsafe {
                         cpp::run_js(code.as_ptr());
                     }
+                }
+                ToGui::DataConnectorStart(id, url) => {
+                    let url = CString::new(url).unwrap();
+                    unsafe { cpp::data_connector_start(id as i32, url.as_ptr()); }
+                }
+                ToGui::DataConnectorStop(id) => {
+                    unsafe { cpp::data_connector_stop(id as i32); }
+                }
+                ToGui::NotifyData(key) => {
+                    // xiboIC inside each widget turns this message into the
+                    // widget's own "new data" notification.
+                    let key = serde_json::to_string(&key).unwrap();
+                    let code = CString::new(format!(
+                        "document.querySelectorAll('iframe').forEach(function(f) {{ try {{ \
+                         f.contentWindow.postMessage({{ctrl: 'rtNotifyData', data: {{dataKey: {key}}}}}, '*'); \
+                         }} catch (e) {{}} }});"
+                    )).unwrap();
+                    unsafe { cpp::run_js(code.as_ptr()); }
                 }
                 ToGui::ReloadWidget(id) => {
                     // Only reload this one iframe in place -- not a full
@@ -277,12 +302,15 @@ extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _
             }
         }
         cpp::CB_LAYOUT_JUMP => {
-            log::info!("jumping to layout: {arg2}");
-            let file = CString::new(format!("{arg2}.xlf.html")).expect("ok");
-            unsafe {
-                cpp::navigate(file.as_ptr());
-            }
+            // Not navigated to blindly: the target may have been replaced
+            // or purged since the page was translated (see
+            // Cache::resolve_jump_target) -- the main loop decides.
+            let _ = cb_data.sender.send(FromGui::Jump(arg2 as i64));
         }
+        cpp::CB_LAYOUT_FAILED => {
+            let _ = cb_data.sender.send(FromGui::LayoutFailed(arg1 as i64));
+        }
+        cpp::CB_SCREEN_SIZE => crate::info::set_screen_size(arg1 as i32, arg2 as i32),
         cpp::CB_COMMAND | cpp::CB_SHELL => {
             let cmd = unsafe { CStr::from_ptr(arg1 as *const _) };
             let cmd = cmd.to_str().unwrap_or_default().to_owned();

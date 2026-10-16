@@ -1,10 +1,60 @@
 # Changelog
 
-## Unreleased
+## 0.6.8 - Oct 2026
+
+- Add the `/info` endpoint (`xiboIC.info()`), with the same fields as the official Electron player: `version`, `displayName`,
+  `hardwareKey`, `screenWidth`, `screenHeight`, `latitude`/`longitude` (always 0: no location source on Linux), `timeZone`,
+  `currentLayoutId` and `displayStatus` (the CMS registration status). Served to local requests only.
+- Add Data Connectors (real-time data), as in the official Electron player. A connector scheduled in the CMS runs in a
+  hidden page of its own, with the `xiboDC` API (`setData`, `notifyHost`, `makeRequest`, `setCriteria`); its data is served at
+  `/realtime`, the widgets are notified when it changes, and the criteria it sets drive the schedule. Its script is checked against the
+  md5 announced by the CMS before every run (and downloaded again when edited in the CMS). A connector tied to a geographic area
+  never runs, as there is no location source. See the README.
+- Read the display's tags from the registration (kept with the settings, so they survive a start from the cache) and give them to the
+  data connectors as `window.displayTags`, an object, before `onInit()`.
+- `/realtime` now answers as the Electron player does: the key is decoded like a query parameter (`%20` and `+` were not), a missing key is
+  a 400, a miss a 404 (the widget's error callback), both with a JSON error, and a hit is served as `application/json`.
+- Commands accept `[[tag]]` placeholders, filled with the display's tags when the command runs, as in the Electron player. See the README.
+- Restart by itself when the CMS changes how the XMR connection is made (TCP or WebSocket, its address, or the key): the change used
+  to apply only at the next manual restart. It must be reported by two registrations a minute apart, so a CMS that answers inconsistently
+  cannot cause restarts. As for the other settings that already restart the player, something must start it again (systemd `Restart=always`).
+
+## 0.6.7 - Oct 2026
 
 - The player's own HTTPS requests (CMS, media downloads) and the XMR
   WebSocket now also trust the Linux system CA store, besides the bundled
   Mozilla roots, so a CMS behind an internal CA no longer needs `--no-verify`.
+- By default (offline mode), a display that loses its connection to the CMS
+  mid-session now keeps playing its cached schedule instead of falling back
+  to the splash screen after 3 failed collection cycles; once 3 cycles have
+  failed it retries every 30 s, so a returning CMS is noticed promptly.
+  `--disallow-offline` keeps the splash screen fallback.
+- A display with a Sync Group role that starts from a valid cache (schedule
+  and settings) now starts or joins its Sync Group right away, even with the
+  CMS unreachable, instead of waiting for a first successful collection.
+- Fix the startup splash screen being cut short when a cached schedule arrives
+  within milliseconds of it: the first navigation could cancel the splash's own
+  initialisation, leaving a blank letterboxed strip (no logo, black bars) for as
+  long as the first layout took to load. Navigation now waits until the splash
+  has initialised (at most 3 s) and has then been shown for 1 s, adjustable with
+  the `AREXIBO_SPLASH_MS` environment variable (0 = no minimum).
+- Fix a Navigate Layout button sending the display to a layout that no longer
+  exists. The target id is fixed when the page is translated, so after the
+  target layout was republished (new id, same code) and the old one purged, the
+  already open page still pointed at the old id and the display got stuck
+  retrying the missing page until a purge-all. A jump now goes to the layout
+  that replaced it, or is ignored if there is none, and a jump target that
+  cannot be loaded after several tries sends the view back to the scheduled
+  layout (or the splash screen).
+- Add an opt-in focus on load for webpage widgets in "Open Natively" mode: `[HasFocus]` in the
+  URL (removed before loading) makes that page take keyboard focus once, when it first
+  finishes loading.  Before, a native page only received focus on touch and keys typed
+  earlier reached nobody.
+- Add a watchdog for stuck layout loads: a layout page with no load progress for 20 s (`AREXIBO_LAYOUT_LOAD_TIMEOUT_S`,
+  0 disables) is stopped and reloaded once, then accepted as it is. Regions only start on the page's `load` event, so one
+  resource that never completes (a web font, an iframe) used to leave the screen blank until the next reload.
+- Honor the Webpage widget's "Background transparent?" option in "Open Natively" mode: the native view is now transparent when
+  it is checked (it was always opaque white outside the overlay), so the layout shows through the page's transparent areas.
 
 ## 0.6.6 - Oct 2026
 

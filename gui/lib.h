@@ -21,6 +21,13 @@ const intptr_t CB_STOPSHELL   = 8;
 // treated as "the current layout" for CMS status reporting purposes
 // (see FromGui::Showing in mainloop.rs, only wired to CB_LAYOUT_INIT).
 const intptr_t CB_OVERLAY_LAYOUT_INIT = 9;
+// The main view's page failed to load several times in a row (arg1: the
+// layout id from its /<id>.xlf.html URL) -- e.g. a layout that was purged
+// while a stale page still linked to it. The view keeps retrying on its
+// own; this lets the Rust side move it elsewhere.
+const intptr_t CB_LAYOUT_FAILED = 10;
+// The window's size in real pixels (arg1: width, arg2: height).
+const intptr_t CB_SCREEN_SIZE = 11;
 
 void setup(const char *base_uri, const char *screen,
            int inspect, int debug, callback cb, void *cb_ptr);
@@ -39,6 +46,9 @@ void screenshot(int max_width);
 void set_title(const char *title);
 void set_size(int pos_x, int pos_y, int size_x, int size_y);
 void run_js(const char *js);
+// Data Connectors: a hidden page of its own per connector (see src/dcruntime.rs).
+void data_connector_start(int data_set_id, const char *url);
+void data_connector_stop(int data_set_id);
 // Show a layout as an overlay on top of whatever the main view is
 // currently displaying, without interrupting it -- XMR `overlayLayout`
 // action (see xmr::Message::OverlayLayout in mainloop.rs). `file` is the

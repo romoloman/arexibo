@@ -8,6 +8,7 @@
 #include <QTouchEvent>
 
 #include "view.h"
+#include <QRegularExpression>
 #include <algorithm>
 
 // (Separate QWebEngineProfile for native webpage widgets: tried and
@@ -64,7 +65,17 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
     // See LoggingPage's own doc comment -- must be set before
     // webChannel/devtools setup below, since those attach to whichever
     // page is current at that point.
-    view->setPage(new LoggingPage(view));
+    // Stuck layout load: stop and retry (LoggingPage reloads on failure).
+    int load_timeout = qEnvironmentVariable("AREXIBO_LAYOUT_LOAD_TIMEOUT_S", "20").toInt();
+    auto *main_page = new LoggingPage(view, nullptr, load_timeout, /*hang_max_stops=*/2,
+                                      /*hang_any_progress=*/true);
+    view->setPage(main_page);
+    connect(main_page, &LoggingPage::loadFailedRepeatedly, this, [this](const QUrl &url) {
+        QRegularExpressionMatch m =
+            QRegularExpression("/(\\d+)\\.xlf\\.html$").match(url.path());
+        if (m.hasMatch())
+            this->cb(this->cb_ptr, CB_LAYOUT_FAILED, m.captured(1).toLongLong(), 0, 0);
+    });
 
     channel = new QWebChannel(this);
     view->page()->setWebChannel(channel);
@@ -93,6 +104,9 @@ Window::Window(QString base_uri, QScreen *screen, int inspect, callback cb, void
             this, SLOT(runJavascriptImpl(QString)));
     connect(this, SIGNAL(overlayShow(QString)), this, SLOT(overlayShowImpl(QString)));
     connect(this, SIGNAL(overlayHide()), this, SLOT(overlayHideImpl()));
+    connect(this, SIGNAL(dataConnectorStart(int, QString)),
+            this, SLOT(dataConnectorStartImpl(int, QString)));
+    connect(this, SIGNAL(dataConnectorStop(int)), this, SLOT(dataConnectorStopImpl(int)));
 
     view->setUrl(QUrl(base_uri + "0.xlf.html"));
 
@@ -259,6 +273,7 @@ void Window::setSizeImpl(int pos_x, int pos_y, int size_x, int size_y)
                   << pos_x*ratio << "+" << pos_y*ratio << std::endl;
     }
 
+    cb(cb_ptr, CB_SCREEN_SIZE, std::lround(size_x * ratio), std::lround(size_y * ratio), 0);
     adjustScale(layout_width, layout_height);
 }
 
@@ -449,6 +464,36 @@ void Window::adjustOverlayScale(int layout_w, int layout_h)
     overlay_scale_applied_this_cycle = true;
 }
 
+// A data connector runs in a page of its own: no web channel (it cannot reach the
+// layout or this program), alive for as long as the connector is scheduled. It
+// gets a 1x1 view behind everything else: a page without a view counts as hidden
+// for the browser, which then slows its timers to one a second (and to one a
+// minute after a few minutes), while this one counts as visible and shows nothing.
+void Window::dataConnectorStartImpl(int data_set_id, QString url)
+{
+    dataConnectorStopImpl(data_set_id);
+    auto *cview = new QWebEngineView(this);
+    cview->setPage(new LoggingPage(cview));
+    cview->setFocusPolicy(Qt::NoFocus);
+    cview->setGeometry(0, 0, 1, 1);
+    cview->lower();
+    cview->show();
+    connector_views.insert(data_set_id, cview);
+    cview->page()->load(QUrl(url));
+    std::cout << "INFO : [arexibo::qt] data connector " << data_set_id << " started" << std::endl;
+}
+
+void Window::dataConnectorStopImpl(int data_set_id)
+{
+    auto *cview = connector_views.take(data_set_id);
+    if (!cview)
+        return;
+    // Load nothing first, so its timers and requests stop at once.
+    cview->page()->load(QUrl("about:blank"));
+    cview->deleteLater();
+    std::cout << "INFO : [arexibo::qt] data connector " << data_set_id << " stopped" << std::endl;
+}
+
 void Window::runJavascriptImpl(QString js)
 {
     // Gated behind --web-debug (see g_web_debug_enabled's own doc
@@ -467,6 +512,8 @@ void Window::runJavascriptImpl(QString js)
 void Window::clearNativeViews(bool overlay)
 {
     auto &views = overlay ? overlay_native_views : native_views;
+    (overlay ? overlay_focus_on_load_views : focus_on_load_views).clear();
+    (overlay ? overlay_transparent_views : transparent_views).clear();
     for (auto nview : views) {
         nview->deleteLater();
     }
@@ -920,6 +967,25 @@ void Window::jsNativeWebShowImplNow(bool overlay, int mediaId, QString url, int 
             nview->setAttribute(Qt::WA_AlwaysStackOnTop);
         }
         views[mediaId] = nview;
+        // CMS "Background transparent?": same recipe as the overlay view.
+        auto &want_transparent = overlay ? overlay_transparent_views : transparent_views;
+        if (want_transparent.remove(mediaId)) {
+            nview->page()->setBackgroundColor(Qt::transparent);
+            nview->setAttribute(Qt::WA_TranslucentBackground);
+        }
+        // [HasFocus] (stripped in Rust): focus once, on the first successful load.
+        auto &want_focus = overlay ? overlay_focus_on_load_views : focus_on_load_views;
+        if (want_focus.remove(mediaId)) {
+            auto conn = QSharedPointer<QMetaObject::Connection>::create();
+            *conn = connect(nview, &QWebEngineView::loadFinished, this,
+                            [mediaId, nview, conn](bool ok) {
+                if (!ok) return;    // LoggingPage retries
+                QObject::disconnect(*conn);
+                std::cout << "DEBUG: [arexibo::qt] native widget " << mediaId \
+                           << " loaded -- taking focus" << std::endl;
+                nview->setFocus();
+            });
+        }
     }
     // Position in the same coordinate space the relevant base view
     // (`view` for the main layout, `overlay_view` for the overlay) itself
@@ -1137,4 +1203,24 @@ void JSInterface::jsNativeWebShow(int mediaId, QString url, int x, int y, int w,
 void JSInterface::jsNativeWebHide(int mediaId)
 {
     wnd->jsNativeWebHideImpl(is_overlay, mediaId);
+}
+
+void JSInterface::jsNativeWebFocusOnLoad(int mediaId)
+{
+    wnd->jsNativeWebFocusOnLoadImpl(is_overlay, mediaId);
+}
+
+void Window::jsNativeWebFocusOnLoadImpl(bool overlay, int mediaId)
+{
+    (overlay ? overlay_focus_on_load_views : focus_on_load_views).insert(mediaId);
+}
+
+void JSInterface::jsNativeWebTransparent(int mediaId)
+{
+    wnd->jsNativeWebTransparentImpl(is_overlay, mediaId);
+}
+
+void Window::jsNativeWebTransparentImpl(bool overlay, int mediaId)
+{
+    (overlay ? overlay_transparent_views : transparent_views).insert(mediaId);
 }

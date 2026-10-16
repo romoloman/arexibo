@@ -104,6 +104,17 @@ pub enum ToGui {
     /// readers into thinking Sync Groups were involved even when
     /// `sync_role` was `None`.
     ForceReloadLayout(i64, ForceReloadReason),
+    /// Navigate to this layout without touching the schedule state (a
+    /// Navigate Layout action, or going back to the scheduled layout
+    /// after a jump target failed to load).
+    Jump(i64),
+    /// Start a data connector: load its page (the URL) in a hidden browser
+    /// page of its own -- see dcruntime.rs.
+    DataConnectorStart(i64, String),
+    DataConnectorStop(i64),
+    /// A data connector has new data behind this key: tell every widget on
+    /// screen (its `xiboIC` turns it into the widget's own notification).
+    NotifyData(String),
 }
 
 /// See `ToGui::ForceReloadLayout`'s own doc comment for why this exists.
@@ -142,6 +153,11 @@ pub enum FromGui {
     /// duration==0 revert case (see override_revert_on_completion's
     /// own doc comment) -- otherwise ignored.
     LayoutCompleted,
+    /// A Navigate Layout action asks for this layout id (CB_LAYOUT_JUMP).
+    Jump(i64),
+    /// The main view gave up waiting for this layout id to load
+    /// (CB_LAYOUT_FAILED); it keeps retrying by itself meanwhile.
+    LayoutFailed(i64),
     Screenshot(Vec<u8>),
     Command(String),
     Shell(String, bool),
@@ -400,6 +416,11 @@ pub struct Handler {
     /// (RsaPrivateKey is Clone) so a retry is possible without
     /// re-deriving/persisting it separately.
     xmr_retry_key: Option<RsaPrivateKey>,
+    /// What the running XMR connection was made with; `None` while it
+    /// isn't connected.
+    xmr_in_use: Option<XmrTarget>,
+    /// A different target seen at the last registration, to be confirmed.
+    xmr_change_pending: Option<XmrTarget>,
     /// Unlike `xmr_retry_key` (only `Some` while a retry is actually
     /// pending), this is *always* populated -- kept specifically so
     /// XMR can be restarted later even after it's already running
@@ -514,6 +535,64 @@ const RESOURCE_RETRY_MAX_ATTEMPTS: u32 = 8;
 const PENDING_AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// See `Handler::consecutive_connection_failures`'s own doc comment.
 const MAX_CONSECUTIVE_CONNECTION_FAILURES: u32 = 3;
+
+/// How soon to register again once the CMS reports different XMR
+/// connection settings, to confirm them before restarting.
+const XMR_CHANGE_CONFIRM_DELAY: Duration = Duration::from_secs(60);
+
+/// What the XMR connection is made with: the settings `xmr::start` reads
+/// for the transport it picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XmrTarget {
+    WebSocket { address: String, key: String },
+    Zmq { address: String },
+}
+
+impl XmrTarget {
+    fn of(settings: &PlayerSettings) -> Self {
+        if settings.xmr_web_socket_address_in_use.is_empty() {
+            XmrTarget::Zmq { address: settings.xmr_network_address.clone() }
+        } else {
+            XmrTarget::WebSocket { address: settings.xmr_web_socket_address_in_use.clone(),
+                                   key: settings.xmr_cms_key.clone() }
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            XmrTarget::WebSocket { address, .. } => format!("WebSocket {address}"),
+            XmrTarget::Zmq { address } => format!("TCP {address}"),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum XmrChange {
+    None,
+    Pending,
+    Restart,
+}
+
+/// A target different from the one in use is acted on only when seen at two
+/// registrations in a row: the CMS has been seen to answer inconsistently,
+/// and a restart on every flip would loop. Nothing to do while XMR is not
+/// connected (`in_use` is `None`): its retry already uses the new settings.
+fn assess_xmr_change(in_use: Option<&XmrTarget>, observed: XmrTarget,
+                     pending: &mut Option<XmrTarget>) -> XmrChange {
+    let Some(current) = in_use else {
+        *pending = None;
+        return XmrChange::None;
+    };
+    if observed == *current {
+        *pending = None;
+        XmrChange::None
+    } else if pending.as_ref() == Some(&observed) {
+        XmrChange::Restart
+    } else {
+        *pending = Some(observed);
+        XmrChange::Pending
+    }
+}
 
 /// Sync Group Phase 5 (video wall) -- see videowall::Round's own doc
 /// comment for what these mean. Not values confirmed with the user
@@ -663,6 +742,8 @@ impl Handler {
                             log::info!("using cached schedule, experience may be degraded");
                             schedule = cached_sched;
                             started_from_cache = true;
+                            // Cached settings only exist after a READY registration.
+                            crate::info::set_display_status(0);
                         }
 
                         Some(settings)
@@ -755,6 +836,7 @@ impl Handler {
                 }
                 Err(e) => return Err(e),
             };
+            let xmr_in_use = xmr_retry_key.is_none().then(|| XmrTarget::of(&settings));
             settings.to_file(&setting_file).context("writing player settings")?;
 
             let mut slf = Self { to_gui, from_gui, settings, cache, xmds, xmr, schedule,
@@ -790,7 +872,8 @@ impl Handler {
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
                                  debug_override, xmr_privkey: privkey.clone(),
-                                 xmr_retry_key, cms: cms.clone(), no_verify };
+                                 xmr_retry_key, xmr_in_use, xmr_change_pending: None,
+                                 cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
             if renamed_since_last_run {
@@ -857,6 +940,7 @@ impl Handler {
                                  screenshot_requested_seen: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
+                                 xmr_in_use: None, xmr_change_pending: None,
                                  cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
@@ -872,6 +956,8 @@ impl Handler {
         if self.pending_auth || self.pending_network
             || self.consecutive_connection_failures >= MAX_CONSECUTIVE_CONNECTION_FAILURES {
             PENDING_AUTH_RETRY_INTERVAL
+        } else if self.xmr_change_pending.is_some() {
+            XMR_CHANGE_CONFIRM_DELAY
         } else {
             Duration::from_secs(self.settings.collect_interval)
         }
@@ -928,6 +1014,9 @@ impl Handler {
         // within any given command's own due window, never silently
         // skipping past it between checks.
         let command_check = tick(Duration::from_secs(5));
+        let data_connectors = crate::dcruntime::runtime();
+        data_connectors.attach(self.to_gui.clone());
+        let data_connector_events = data_connectors.events();
         loop {
             select! {
                 // timer channel that fires when collect is needed
@@ -991,6 +1080,14 @@ impl Handler {
                 },
                 recv(command_check) -> _ => {
                     self.check_scheduled_commands();
+                },
+                // a data connector set a schedule criterion
+                recv(data_connector_events) -> event => {
+                    if let Ok(crate::dcruntime::DcEvent::Criteria { metric, value, ttl }) = event {
+                        log::info!("criteria update from a data connector: {metric}={value} (ttl {ttl}s)");
+                        self.criteria.set(metric, value, ttl);
+                        self.schedule_check();
+                    }
                 },
                 // timer channel that fires when the active overlay's
                 // requested duration has elapsed
@@ -1215,6 +1312,7 @@ impl Handler {
                         if let Err(e) = self.cache.purge() {
                             log::error!("during cache purge: {e:#}");
                         }
+                        crate::dcruntime::runtime().stop_all();
                         collect = after(Duration::from_secs(0));  // force re-download
                         // purge() deletes every file on disk
                         // immediately, including whatever a currently-
@@ -1398,6 +1496,7 @@ impl Handler {
                     }
                     Ok(FromGui::Showing(layout)) => {
                         self.current_layout = layout;
+                        crate::info::set_current_layout(layout);
                         self.record_layout_shown(layout);
                         if self.settings.send_current_layout_as_status_update {
                             self.send_status_update();
@@ -1502,6 +1601,8 @@ impl Handler {
                             }
                         }
                     }
+                    Ok(FromGui::Jump(id)) => self.on_jump(id),
+                    Ok(FromGui::LayoutFailed(id)) => self.on_layout_failed(id),
                     Ok(FromGui::Command(code)) =>
                         self.run_command(&code),
                     Ok(FromGui::Shell(code, with_shell)) =>
@@ -1555,7 +1656,7 @@ impl Handler {
             return;
         }
         if let Some(cmd) = self.settings.commands.get(code) {
-            let success = match cmd.run() {
+            let success = match cmd.run(&self.settings.display_tags) {
                 Ok(success) => success,
                 Err(e) => {
                     log::warn!("running command {code}: {e:#}");
@@ -1602,13 +1703,23 @@ impl Handler {
         // makes sense for genuine shell commands.
         if code.starts_with("http|") || code.starts_with("rs232|") {
             let adhoc = Command { command: code.to_string(), validate: String::new(), alerts: String::new() };
-            match adhoc.run() {
+            match adhoc.run(&self.settings.display_tags) {
                 Ok(_) => log::info!("ran ad-hoc {} command successfully",
                                      if code.starts_with("http|") { "HTTP" } else { "RS232" }),
                 Err(e) => log::error!("running ad-hoc command {code:?}: {e:#}"),
             }
             return;
         }
+        // The allowlist authorizes the command as configured; the display's
+        // tags fill in its `[[placeholders]]` just before it runs.
+        let resolved = match crate::command::resolve_shell(code, &self.settings.display_tags) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                log::error!("not running shell command {code:?}: {e:#}");
+                return;
+            }
+        };
+        let code = resolved.as_str();
         let config = Default::default();
         let res = if with_shell {
             Popen::create(&["/bin/sh", "-c", code], config)
@@ -1721,6 +1832,24 @@ impl Handler {
                             self.settings.embedded_server_allow_wan, settings.embedded_server_allow_wan);
                 return Err(RestartRequired.into());
             }
+            // The XMR connection is made once, at startup: a different
+            // transport, address or key needs a fresh start too.
+            let observed_xmr = XmrTarget::of(&settings);
+            let was_xmr = self.xmr_in_use.as_ref().map(XmrTarget::describe);
+            match assess_xmr_change(self.xmr_in_use.as_ref(), observed_xmr.clone(),
+                                    &mut self.xmr_change_pending) {
+                XmrChange::None => {}
+                XmrChange::Pending => log::warn!(
+                    "the CMS reports XMR connection settings different from the ones in use \
+                     ({} -> {}) -- will restart to apply them if the next registration \
+                     confirms it", was_xmr.unwrap_or_default(), observed_xmr.describe()),
+                XmrChange::Restart => {
+                    log::warn!("XMR connection settings changed ({} -> {}) and confirmed -- \
+                                exiting so the supervisor restarts us fresh and picks it up",
+                               was_xmr.unwrap_or_default(), observed_xmr.describe());
+                    return Err(RestartRequired.into());
+                }
+            }
             if !settings.sync_role.is_same_role_kind(&self.settings.sync_role) {
                 log::warn!("Sync Group role changed ({:?} -> {:?}) mid-session -- exiting so \
                             the supervisor restarts us fresh and picks it up",
@@ -1813,6 +1942,7 @@ impl Handler {
                     log::info!("XMR connection recovered, switching from offline mode \
                                 to real-time push updates");
                     self.xmr = xmr;
+                    self.xmr_in_use = Some(XmrTarget::of(&self.settings));
                 }
                 Err(e) => {
                     log::warn!("XMR still not reachable, will retry next collection: {e:#}");
@@ -2263,6 +2393,8 @@ impl Handler {
                     will restart it with fresh settings on the next \
                     collection cycle");
         self.xmr = never();
+        self.xmr_in_use = None;
+        self.xmr_change_pending = None;
         self.xmr_retry_key = Some(self.xmr_privkey.clone());
     }
 
@@ -2553,6 +2685,7 @@ impl Handler {
         // stale value doesn't keep a criteria-conditioned layout active
         // (or, for a `ne` condition, incorrectly inactive) past its ttl.
         self.criteria.prune_expired();
+        self.assess_data_connectors(crate::dcruntime::runtime());
 
         // A Sync Group override (see sync_layout_active's own doc
         // comment) has no fixed duration/completion signal of its own
@@ -3138,6 +3271,41 @@ impl Handler {
         }
     }
 
+    /// A Navigate Layout action asks for layout `id`. The id was baked
+    /// into the page when it was translated, so it can be stale: the
+    /// layout may have been republished (same code, new id) or purged
+    /// since. Goes to its replacement if there is one; otherwise stays
+    /// put instead of loading a page that does not exist.
+    fn on_jump(&mut self, id: i64) {
+        match self.cache.resolve_jump_target(id) {
+            Some(target) => {
+                if target != id {
+                    log::info!("jump to layout {id}: it was replaced -- going to {target}");
+                }
+                let _ = self.to_gui.send(ToGui::Jump(target));
+            }
+            None => log::warn!("ignoring jump to layout {id}: it is not available \
+                                (purged, or not downloaded yet)"),
+        }
+    }
+
+    /// The main view could not load layout `id` after several tries. A
+    /// scheduled layout is left to keep retrying (nothing better to show);
+    /// anything else (a jump target) sends the view back to the scheduled
+    /// layout, or the splash if there is none.
+    fn on_layout_failed(&mut self, id: i64) {
+        if self.layouts.contains(&id) {
+            log::warn!("scheduled layout {id} still fails to load -- the view keeps retrying");
+            return;
+        }
+        let fallback = self.layouts.first().copied()
+            .filter(|l| self.cache.get_layout(*l).is_some()).unwrap_or(0);
+        log::warn!("layout {id} failed to load repeatedly -- going back to {}",
+                   if fallback == 0 { "the splash screen".to_string() }
+                   else { format!("layout {fallback}") });
+        let _ = self.to_gui.send(ToGui::Jump(fallback));
+    }
+
     /// Apply new player settings.
     /// Re-runs the translator over every cached layout (no network).
     fn retranslate_cached_layouts(&mut self) {
@@ -3165,6 +3333,10 @@ impl Handler {
         // field name found, optional in the bid request anyway.
         self.cache.adspace_enabled = self.settings.is_adspace_enabled;
         self.cache.display_name = self.settings.display_name.clone();
+        let display = self.cache.display_info();
+        crate::info::set_identity(
+            &display.name, &display.hardware_key,
+            &timezone_to_report(&self.settings.display_time_zone, &util::timezone()));
 
         // Applies the CMS's own display_time_zone as *this process's*
         // local timezone (see apply_process_timezone's own doc comment
@@ -3486,6 +3658,28 @@ fn test_video_sync_receivers() -> server::VideoSyncReceivers {
         ready_rx: crossbeam_channel::unbounded().1,
         position_rx: crossbeam_channel::unbounded().1,
         item_rx: crossbeam_channel::unbounded().1,
+    }
+}
+
+impl Handler {
+    /// Starts, restarts and stops the data connectors the schedule wants right
+    /// now (a connector whose script is not downloaded and verified waits).
+    /// Run on every schedule check: once a minute, and on any schedule or
+    /// criteria change.
+    fn assess_data_connectors(&self, runtime: &crate::dcruntime::DcRuntime) {
+        runtime.set_display_tags(self.settings.display_tags.clone());
+        let eligible = self.schedule.data_connectors_now(&self.criteria);
+        let payloads = crate::dataconnector::payloads(&eligible, |js| {
+            self.cache.verified_connector_script(js).map(|(_, md5)| md5)
+        });
+        let port = server::effective_port(self.settings.embedded_server_port);
+        runtime.sync(
+            payloads,
+            |p| self.cache.connector_script_source(&p.js, &p.md5),
+            // On a loopback address of its own, as the widgets' pages are.
+            |id| format!("http://127.0.0.{}:{port}/dc/host/{id}.html",
+                         1 + (id as u32 % server::HTML_SHARD_COUNT)),
+        );
     }
 }
 
@@ -4212,6 +4406,86 @@ mod pending_network_tests {
         assert!(!f.handler.first_collection_done);
         assert!(f.handler.sync_group.is_none());
     }
+
+    fn layout_req(id: i64, code: &str) -> ReqFile {
+        ReqFile::File { id, typ: "layout", size: 0, md5: vec![], http: false,
+                        path: String::new(), name: format!("{id}.xlf"),
+                        code: Some(code.to_string()) }
+    }
+
+    fn drain(rx: &crossbeam_channel::Receiver<ToGui>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn a_jump_to_a_layout_republished_under_the_same_code_goes_to_the_new_id() {
+        // Real report: "documenti" was republished (1700 -> 1701) while the
+        // home layout, whose button still carries 1700, was on screen.
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        let h = &mut f.handler;
+        h.cache.insert_fake_layout_with_code_for_test(1700, "documenti");
+        h.cache.update_code_map(&[layout_req(1700, "documenti")]).unwrap();
+        h.cache.update_code_map(&[layout_req(1701, "documenti")]).unwrap();
+        h.cache.purge_some(&["1700.xlf".to_string()]).unwrap();
+        h.cache.insert_fake_layout_with_code_for_test(1701, "documenti");
+        drain(&f.togui_rx);
+        h.on_jump(1700);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(1701))));
+        assert!(f.togui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_jump_to_an_available_layout_goes_there() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.cache.insert_fake_layout_for_test(1699);
+        drain(&f.togui_rx);
+        f.handler.on_jump(1699);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(1699))));
+    }
+
+    #[test]
+    fn a_jump_to_a_layout_that_does_not_exist_is_ignored() {
+        // Used to navigate anyway and retry the 404 forever.
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        drain(&f.togui_rx);
+        f.handler.on_jump(1700);
+        assert!(f.togui_rx.try_recv().is_err(), "nothing must be sent to the GUI");
+    }
+
+    #[test]
+    fn a_scheduled_layout_that_fails_to_load_is_left_to_retry() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.layouts = vec![1699];
+        f.handler.cache.insert_fake_layout_for_test(1699);
+        drain(&f.togui_rx);
+        f.handler.on_layout_failed(1699);
+        assert!(f.togui_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_jump_target_that_fails_to_load_sends_the_view_back_to_the_scheduled_layout() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.layouts = vec![1699];
+        f.handler.cache.insert_fake_layout_for_test(1699);
+        drain(&f.togui_rx);
+        f.handler.on_layout_failed(1700);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(1699))));
+    }
+
+    #[test]
+    fn a_failing_jump_target_with_nothing_scheduled_falls_back_to_the_splash() {
+        let envdir = test_envdir();
+        let mut f = offline_fixture(&envdir, true);
+        f.handler.layouts = vec![1699];       // scheduled, but not in the cache
+        drain(&f.togui_rx);
+        f.handler.on_layout_failed(1700);
+        assert!(matches!(f.togui_rx.try_recv(), Ok(ToGui::Jump(0))));
+    }
 }
 
 #[cfg(test)]
@@ -4698,6 +4972,216 @@ mod port_change_forces_cache_purge_tests {
         assert!(err.root_cause().downcast_ref::<RestartRequired>().is_some(),
                 "must be specifically a RestartRequired, so main.rs can use its own \
                  distinct exit code (3) instead of a generic error exit (1)");
+    }
+
+    /// Every registration is answered with `answers[chosen]` -- (xmrType,
+    /// WebSocket address, TCP address, key) -- and the test picks `chosen`
+    /// before each collection (a collection registers more than once).
+    /// Anything else asked gets an empty answer, which fails the rest of a
+    /// collection.
+    fn start_mock_with_xmr_answers(answers: Vec<(&'static str, &'static str, &'static str, &'static str)>)
+                                   -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let chosen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chosen_by_test = chosen.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut sent = String::new();
+                let _ = std::io::Read::read_to_string(request.as_reader(), &mut sent);
+                let inner = if sent.contains("RegisterDisplay") {
+                    let (kind, ws, tcp, key) = answers[chosen.load(std::sync::atomic::Ordering::SeqCst)];
+                    format!("<ActivationMessage code=\"READY\"><embeddedServerPort>9696</embeddedServerPort>\
+                             <embeddedServerAllowWan type=\"checkbox\">0</embeddedServerAllowWan>\
+                             <xmrType>{kind}</xmrType><xmrWebSocketAddress>{ws}</xmrWebSocketAddress>\
+                             <xmrNetworkAddress>{tcp}</xmrNetworkAddress><xmrCmsKey>{key}</xmrCmsKey>\
+                             </ActivationMessage>").replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+                } else {
+                    String::new()
+                };
+                let body = format!("<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+                                    <soap:Body><RegisterDisplayResponse><ActivationMessage>{inner}\
+                                    </ActivationMessage></RegisterDisplayResponse></soap:Body></soap:Envelope>");
+                let _ = request.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        (port, chosen_by_test)
+    }
+
+    const XMR_A: (&str, &str, &str, &str) = ("zmq", "", "tcp://127.0.0.1:1", "k1");
+    const XMR_B: (&str, &str, &str, &str) = ("ws", "ws://127.0.0.1:1/xmr", "tcp://127.0.0.1:1", "k1");
+    const XMR_C: (&str, &str, &str, &str) = ("ws", "ws://127.0.0.1:2/xmr", "tcp://127.0.0.1:1", "k1");
+
+    fn zmq_target() -> XmrTarget { XmrTarget::Zmq { address: "tcp://127.0.0.1:1".into() } }
+
+    fn ws_target(port: u16) -> XmrTarget {
+        XmrTarget::WebSocket { address: format!("ws://127.0.0.1:{port}/xmr"), key: "k1".into() }
+    }
+
+    struct XmrCase {
+        handler: Handler,
+        chosen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        _gui: crossbeam_channel::Receiver<ToGui>,
+    }
+
+    impl XmrCase {
+        /// A handler whose XMR counts as connected to `in_use`; the first
+        /// answer is the one `Handler::new` itself registers with.
+        fn new(answers: Vec<(&'static str, &'static str, &'static str, &'static str)>,
+               in_use: Option<XmrTarget>) -> Self {
+            let (port, chosen) = start_mock_with_xmr_answers(answers);
+            let cms = test_cms_settings(port);
+            let envdir = test_envdir();
+            let (togui_tx, gui) = crossbeam_channel::unbounded();
+            let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+            let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+            let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+            let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+            let handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading)))
+            .expect("must construct successfully while pending");
+            let mut handler = handler;
+            handler.xmr_retry_key = None;
+            handler.xmr_in_use = in_use;
+            XmrCase { handler, chosen, _gui: gui }
+        }
+
+        /// One collection, with the CMS answering as `answers[answer]`.
+        fn collect(&mut self, answer: usize) -> Result<()> {
+            self.chosen.store(answer, std::sync::atomic::Ordering::SeqCst);
+            self.handler.collect_once()
+        }
+    }
+
+    fn restarts(result: &Result<()>) -> bool {
+        result.as_ref().err().is_some_and(|e| e.root_cause().downcast_ref::<RestartRequired>().is_some())
+    }
+
+    #[test]
+    fn a_new_xmr_target_is_acted_on_only_once_confirmed() {
+        let mut pending = None;
+        let (a, b, c) = (zmq_target(), ws_target(1), ws_target(2));
+        assert_eq!(assess_xmr_change(Some(&a), a.clone(), &mut pending), XmrChange::None);
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Restart);
+        // another target in between starts the count again
+        let mut pending = None;
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), c.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), c, &mut pending), XmrChange::Restart);
+        // going back to the one in use clears it
+        let mut pending = None;
+        assert_eq!(assess_xmr_change(Some(&a), b.clone(), &mut pending), XmrChange::Pending);
+        assert_eq!(assess_xmr_change(Some(&a), a.clone(), &mut pending), XmrChange::None);
+        assert_eq!(pending, None);
+        assert_eq!(assess_xmr_change(Some(&a), b, &mut pending), XmrChange::Pending, "counted afresh");
+    }
+
+    #[test]
+    fn nothing_is_assessed_while_xmr_is_not_connected() {
+        let mut pending = Some(ws_target(1));
+        assert_eq!(assess_xmr_change(None, ws_target(2), &mut pending), XmrChange::None);
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn the_target_is_what_the_transport_in_use_connects_with() {
+        let ws = PlayerSettings { xmr_web_socket_address: "ws://raw:1".into(),
+            xmr_web_socket_address_in_use: "ws://used:2/xmr".into(), xmr_network_address: "tcp://t:3".into(),
+            xmr_cms_key: "key".into(), ..Default::default() };
+        assert_eq!(XmrTarget::of(&ws), XmrTarget::WebSocket { address: "ws://used:2/xmr".into(), key: "key".into() },
+                   "the address in use, not the raw one");
+        let zmq = PlayerSettings { xmr_network_address: "tcp://t:3".into(), xmr_cms_key: "key".into(), ..Default::default() };
+        assert_eq!(XmrTarget::of(&zmq), XmrTarget::Zmq { address: "tcp://t:3".into() });
+        // what the connection does not use does not make it a different one
+        let other_tcp = PlayerSettings { xmr_network_address: "tcp://elsewhere:9".into(), ..ws.clone() };
+        assert_eq!(XmrTarget::of(&other_tcp), XmrTarget::of(&ws), "TCP address while on WebSocket");
+        let other_key = PlayerSettings { xmr_cms_key: "other".into(), ..zmq.clone() };
+        assert_eq!(XmrTarget::of(&other_key), XmrTarget::of(&zmq), "key while on TCP");
+        let new_key = PlayerSettings { xmr_cms_key: "rotated".into(), ..ws.clone() };
+        assert_ne!(XmrTarget::of(&new_key), XmrTarget::of(&ws), "a new key matters on WebSocket");
+    }
+
+    #[test]
+    fn a_confirmed_xmr_change_restarts_the_player() {
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B], Some(zmq_target()));
+        let first = case.collect(1);
+        assert!(!restarts(&first), "not on the first sight");
+        assert_eq!(case.handler.xmr_change_pending, Some(ws_target(1)));
+        assert_eq!(case.handler.next_collect_interval(), XMR_CHANGE_CONFIRM_DELAY, "confirm soon");
+        assert!(restarts(&case.collect(1)), "confirmed at the next registration");
+    }
+
+    #[test]
+    fn a_cms_that_flips_between_two_websocket_addresses_never_restarts_the_player() {
+        // the one in use (B) and another (C), answered in turn
+        let mut case = XmrCase::new(vec![XMR_B, XMR_C], Some(ws_target(1)));
+        for round in 0..6 {
+            let answer = (round + 1) % 2; // C, B, C, B, C, B
+            assert!(!restarts(&case.collect(answer)), "round {round}");
+            assert_eq!(case.handler.xmr_change_pending.is_some(), answer == 1, "round {round}");
+        }
+        assert_eq!(case.handler.next_collect_interval(),
+                   Duration::from_secs(case.handler.settings.collect_interval), "back to the usual pace");
+    }
+
+    #[test]
+    fn once_a_websocket_was_offered_a_later_tcp_answer_counts_as_the_same_websocket() {
+        // The sticky address rule (an empty WebSocket address is not trusted
+        // over one already known) applies to what the CMS offered, even if it
+        // was never connected to: the answer "TCP" after "WebSocket B" is
+        // read as B again, which confirms it.
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B], Some(zmq_target()));
+        assert!(!restarts(&case.collect(1)));
+        assert!(restarts(&case.collect(0)));
+    }
+
+    #[test]
+    fn a_second_different_target_starts_the_confirmation_again() {
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B, XMR_C], Some(zmq_target()));
+        assert!(!restarts(&case.collect(1)));
+        assert_eq!(case.handler.xmr_change_pending, Some(ws_target(1)));
+        assert!(!restarts(&case.collect(2)));
+        assert_eq!(case.handler.xmr_change_pending, Some(ws_target(2)));
+        assert!(restarts(&case.collect(2)));
+    }
+
+    #[test]
+    fn an_unchanged_xmr_target_leaves_no_trace() {
+        let mut case = XmrCase::new(vec![XMR_A], Some(zmq_target()));
+        assert!(!restarts(&case.collect(0)));
+        assert_eq!(case.handler.xmr_change_pending, None);
+    }
+
+    #[test]
+    fn no_restart_is_asked_while_xmr_is_not_connected() {
+        // offline start, or the connection gave up: the retry that is already
+        // pending uses the settings as they are then
+        let mut case = XmrCase::new(vec![XMR_A, XMR_B], None);
+        assert!(!restarts(&case.collect(1)));
+        assert!(!restarts(&case.collect(1)));
+        assert_eq!(case.handler.xmr_change_pending, None);
+    }
+
+    #[test]
+    fn a_flip_to_tcp_is_ignored_while_on_websocket() {
+        // the address kept by the sticky rule, so nothing changed
+        let mut case = XmrCase::new(vec![XMR_A], Some(ws_target(1)));
+        case.handler.settings.xmr_web_socket_address_in_use = "ws://127.0.0.1:1/xmr".into();
+        case.handler.settings.xmr_cms_key = "k1".into();
+        assert!(!restarts(&case.collect(0)));
+        assert!(!restarts(&case.collect(0)));
+        assert_eq!(case.handler.xmr_change_pending, None);
+    }
+
+    #[test]
+    fn giving_up_on_xmr_forgets_what_was_in_use_and_pending() {
+        let mut case = XmrCase::new(vec![XMR_A], Some(zmq_target()));
+        case.handler.xmr_change_pending = Some(ws_target(1));
+        case.handler.xmr_disconnected();
+        assert_eq!((case.handler.xmr_in_use.clone(), case.handler.xmr_change_pending.clone()), (None, None));
+        assert!(case.handler.xmr_retry_key.is_some());
     }
 
     #[test]
@@ -5303,6 +5787,188 @@ mod handle_trigger_code_tests {
             path: String::new(), name: String::new(), code: Some(layout_code.into()),
         };
         handler.cache.update_code_map(&[file]).unwrap();
+    }
+
+    fn connector_schedule(criteria: &str) -> Schedule {
+        let xml = format!(
+            r#"<schedule generated="2026-01-01 00:00:00" filterFrom="2026-01-01 00:00:00" filterTo="2026-01-02 00:00:00">
+  <dataConnectors><connector fromdt="1970-01-01 01:00:00" todt="2038-01-19 04:14:07" scheduleid="7"
+    priority="0" duration="0" isGeoAware="0" geoLocation="" dataSetId="16" dataParams="a%3D1"
+    js="dataSet_16.js">{criteria}</connector></dataConnectors>
+</schedule>"#);
+        Schedule::parse(&elementtree::Element::from_reader(xml.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// Puts a connector script in the handler's cache as a download would.
+    fn cache_connector_script(handler: &mut Handler, script: &str) {
+        use md5::{Digest, Md5};
+        std::fs::write(handler.cache.dir().join("dataSet_16.js"), script).unwrap();
+        handler.cache.commit(crate::resource::FetchedContent::Dependency {
+            name: "dataSet_16.js".into(),
+            info: crate::resource::DependencyInfo {
+                id: "16".into(), file_type: "data_connector".into(),
+                size: script.len() as u64, md5: Md5::digest(script.as_bytes()).to_vec() },
+        }).unwrap();
+    }
+
+    fn connector_runtime() -> (crate::dcruntime::DcRuntime, crossbeam_channel::Receiver<ToGui>) {
+        let runtime = crate::dcruntime::DcRuntime::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        runtime.attach(tx);
+        (runtime, rx)
+    }
+
+    fn connector_messages(rx: &crossbeam_channel::Receiver<ToGui>) -> Vec<String> {
+        rx.try_iter().map(|m| match m {
+            ToGui::DataConnectorStart(id, url) => format!("start {id} {url}"),
+            ToGui::DataConnectorStop(id) => format!("stop {id}"),
+            ToGui::NotifyData(key) => format!("notify {key}"),
+            _ => "other".to_string(),
+        }).collect()
+    }
+
+    #[test]
+    fn a_scheduled_connector_with_a_verified_script_is_started() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        let messages = connector_messages(&rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].starts_with("start 16 http://127.0.0."), "{messages:?}");
+        assert!(messages[0].ends_with("/dc/host/16.html"), "{messages:?}");
+        assert!(runtime.host_page(16).unwrap().contains("var a = 1;"));
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty(), "already running: nothing more");
+    }
+
+    #[test]
+    fn a_connector_whose_script_is_not_downloaded_waits() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty());
+        cache_connector_script(&mut handler, "var a = 1;");
+        handler.assess_data_connectors(&runtime);
+        assert_eq!(connector_messages(&rx).len(), 1, "started once the script arrived");
+    }
+
+    #[test]
+    fn a_script_changed_on_disk_is_not_run() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        std::fs::write(handler.cache.dir().join("dataSet_16.js"), "var a = 'tampered';").unwrap();
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty());
+        assert!(runtime.host_page(16).is_none());
+    }
+
+    #[test]
+    fn a_connector_waits_for_its_criteria() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule(
+            r#"<criteria metric="weather" condition="equals" type="weather">rain</criteria>"#);
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty());
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        handler.assess_data_connectors(&runtime);
+        assert_eq!(connector_messages(&rx).len(), 1);
+    }
+
+    #[test]
+    fn an_edited_script_restarts_the_connector() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        connector_messages(&rx);
+        cache_connector_script(&mut handler, "var a = 2;");
+        handler.assess_data_connectors(&runtime);
+        let messages = connector_messages(&rx);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0], "stop 16");
+        assert!(messages[1].starts_with("start 16 "));
+        assert!(runtime.host_page(16).unwrap().contains("var a = 2;"));
+    }
+
+    #[test]
+    fn leaving_the_schedule_stops_the_connector_after_three_checks() {
+        let mut handler = test_handler();
+        handler.schedule = connector_schedule("");
+        cache_connector_script(&mut handler, "var a = 1;");
+        let (runtime, rx) = connector_runtime();
+        handler.assess_data_connectors(&runtime);
+        connector_messages(&rx);
+        handler.schedule = Schedule::default();
+        handler.assess_data_connectors(&runtime);
+        handler.assess_data_connectors(&runtime);
+        assert!(connector_messages(&rx).is_empty(), "two misses: still running");
+        handler.assess_data_connectors(&runtime);
+        assert_eq!(connector_messages(&rx), ["stop 16"]);
+    }
+
+    fn with_command(handler: &mut Handler, command: &str, validate: &str, tags: &[(&str, &str)]) {
+        handler.settings.enable_shell_commands = true;
+        handler.settings.commands.insert("c1".into(), Command {
+            command: command.into(), validate: validate.into(), alerts: String::new() });
+        handler.settings.display_tags = tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    }
+
+    #[test]
+    fn a_command_by_code_runs_with_the_displays_tags() {
+        let mut handler = test_handler();
+        with_command(&mut handler, "printf '%s' '[[city]]'", "^Massa$", &[("city", "Massa")]);
+        handler.run_command("c1");
+        assert_eq!(handler.last_command_success, Some(true));
+        handler.settings.display_tags.insert("city".into(), "Pisa".into());
+        handler.run_command("c1");
+        assert_eq!(handler.last_command_success, Some(false), "the new value is used at once");
+    }
+
+    #[test]
+    fn a_command_by_code_with_an_unresolvable_tag_is_reported_as_failed() {
+        let mut handler = test_handler();
+        with_command(&mut handler, "printf '%s' '[[city]]'", "", &[]);
+        handler.run_command("c1");
+        assert_eq!(handler.last_command_success, Some(false));
+    }
+
+    #[test]
+    fn a_layout_command_takes_the_tags_too() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let _ = tx.send(req.url().to_string());
+                let _ = req.respond(tiny_http::Response::from_string("ok"));
+            }
+        });
+        let mut handler = test_handler();
+        handler.settings.enable_shell_commands = true;
+        handler.settings.display_tags = [("city".to_string(), "Massa Carrara".to_string())].into();
+        let command = format!(r#"http|http://127.0.0.1:{port}/[[city]]|text/plain|{{"method":"GET","headers":"{{}}","body":"{{}}"}}"#);
+        handler.run_shell(&command, true);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "/Massa%20Carrara");
+    }
+
+    #[test]
+    fn a_layout_shell_command_with_an_unresolvable_tag_does_not_start() {
+        let mut handler = test_handler();
+        handler.settings.enable_shell_commands = true;
+        handler.run_shell("echo [[nothing]]", true);
+        assert!(handler.shell_process.is_none());
+        handler.settings.display_tags = [("nothing".to_string(), "x".to_string())].into();
+        handler.run_shell("sleep 5", true);
+        assert!(handler.shell_process.is_some(), "an ordinary command still starts");
+        if let Some(child) = handler.shell_process.as_mut() { let _ = child.kill(); }
     }
 
     #[test]

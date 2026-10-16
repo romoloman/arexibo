@@ -97,7 +97,7 @@ display is authorized.
 
 ## Other configuration parameters
 
-* `--disallow-offline`: requires a live CMS connection at startup, instead of the default of falling back to the cached settings/content (if available) when the CMS is unreachable.
+* `--disallow-offline`: requires a live CMS connection, instead of the default of falling back to the cached settings/content (if available) when the CMS is unreachable. With it, a display that loses the connection later also falls back to the splash screen after 3 consecutive failed collection cycles; by default it keeps playing the cached content and keeps retrying.
 * `--allow-offline`: deprecated and ignored (falling back to the cache is now the default); kept so existing scripts don't break.
 * `--no-verify`: skips TLS certificate verification – only for testing against a CMS with a self-signed certificate, never for production.
 
@@ -118,6 +118,48 @@ pages loaded by the embedded browser.
 * A touch or click on the page restarts the widget's duration countdown, so the layout
   doesn't expire or reload while someone is using the page.  This applies to the main
   layout only; keyboard, mouse wheel and dragging don't count.
+* Add `[HasFocus]` to the URL (at the very end is cleanest) to make that page take keyboard
+  focus once, when it first finishes loading, so a text field the page focuses itself is
+  ready for typing without a first touch.  The marker is removed before the page is loaded.
+  Without it a native page only gets focus when touched, and the page cannot take it by
+  itself (`window.focus()` is not enough).  Meant for one page per layout: with several, the
+  last one to finish loading holds focus until a touch moves it.  Only the first load counts.
+* The widget's "Background transparent?" option is honored: the native view gets a transparent background, so the layout
+  shows through wherever the page paints nothing.  The page itself must be transparent too (e.g. `html, body { background:
+  transparent }`).  Unchecked, the view stays opaque white, as before.
+
+## Data Connectors
+
+A Data Connector (a JavaScript file scheduled in the CMS against a DataSet) publishes real-time data that widgets read through
+`/realtime`. It follows the official Electron player:
+
+- It runs in a hidden page of its own, for as long as it is scheduled (inside its dates, with its criteria met, the highest priority
+  one per DataSet). A connector tied to a geographic area never runs: there is no location source.
+- The script is downloaded like any other file and checked against the md5 announced by the CMS before every run; one edited in the
+  CMS is downloaded again. A connector that is no longer scheduled stops after three schedule checks, and its data goes with it.
+- It has `xiboDC.setData(key, data, {done, error})` (at most one stored write per key every 500 ms, 2 MB a value, 100 keys a connector),
+  `notifyHost(key)` (tells the widgets on screen), `makeRequest(url, {type, headers, data, done, error})` (made by the player, no CORS,
+  30 s timeout) and `setCriteria(metric, value, ttl)` (a schedule criterion, as from the CMS). The `dataParams` of the event arrive as
+  variables of the page, and `onInit()` is called once it is loaded.
+- `window.displayTags` is the display's tags in the CMS, as an object (`{name: value}`), set before `onInit()`. The Electron player defines
+  `setDisplayTags` but never calls it, so a connector relying on it works here only.
+- Widgets read the data at `/realtime?dataKey=...`: JSON, a 404 when there is none (the widget's error callback), a 400 without a key.
+- Not supported: geographic areas.
+
+## Display tags in commands
+
+A command (one defined in the CMS and run by code or by a schedule, or one in a shell command widget) can contain `[[name]]`, replaced by
+the value of the display's tag of that name when the command runs, so a change in the CMS applies at once. The name is matched exactly
+(letters, digits and `_`).
+
+- In an `http|...` or `rs232|...` command each `|`-separated part is filled in on its own, so a value containing `|` cannot move a boundary.
+  In a URL (`http://...`) the value is percent-encoded like JavaScript's `encodeURIComponent`; in a JSON part (such as the options of an
+  HTTP command, including the body inside them) it is escaped for the string it sits in; elsewhere it is used as typed.
+- A shell command is one piece and takes the value as typed: quote the placeholder where the shell needs it (`echo '[[name]]'`). A value
+  is trusted as much as the command itself, as both are set in the CMS.
+- A tag that is missing, or set without a value, stops the command: it does not run, and is reported to the CMS as failed.
+- The list of allowed shell commands is checked on the command as written, before the placeholders are filled in.
+- Not supported: the macros of the Electron player (`[EPOCH]`, `[UNIX_TIMESTAMP]`, `[TIMESTAMP]`, `[LAT]`, `[LNG]`); they stay as written.
 
 ## Standalone setup with X server
 
@@ -160,6 +202,8 @@ Normal use:
     QTWEBENGINE_CHROMIUM_FLAGS: standard Qt/Chromium mechanism for passing extra Chromium command-line flags (e.g. GPU-related tuning for a specific graphics driver). arexibo appends its own required flag (--disable-pinch, needed to disable pinch-to-zoom on multitouch panels) to whatever you set here, rather than overwriting it – both apply together.
     QTWEBENGINE_REMOTE_DEBUGGING: QTWEBENGINE_REMOTE_DEBUGGING=9222 as an environment variable lets you inspect the rendered page from another machine’s Chrome/Edge at http://<host>:9222 (via an SSH tunnel if not on the same network) – useful for confirming content renders correctly without needing eyes on the actual totem screen.
     AREXIBO_FORCE_WS_ADDRESS: forces the WebSocket XMR address used for push messages, regardless of what the CMS reports when the player registers (useful when the CMS's own WebSocket XMR eligibility check is unreliable). Leave unset to use the address the CMS provides.
+    AREXIBO_SPLASH_MS: minimum time (default 1000) the startup splash screen stays on screen once it has loaded, before the first layout replaces it; 0 disables the minimum. Useful on a fast start from a full cache, where the first layout would otherwise replace the splash almost immediately.
+    AREXIBO_LAYOUT_LOAD_TIMEOUT_S: seconds a layout page may go without any load progress before it is stopped and retried (default 20, 0 disables). Widgets only start once the whole page has loaded, so one stuck resource (an iframe, a web font) would otherwise leave the screen blank. The first stop is followed by a reload; if the second attempt also stalls, the page is accepted as it is and the stuck widget stays empty.
 
 Diagnostic only – not for production use:
 

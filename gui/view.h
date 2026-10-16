@@ -8,6 +8,7 @@
 #include <QMainWindow>
 #include <QScreen>
 #include <QMap>
+#include <QSet>
 #include <QVector>
 #include <QRect>
 #include <QEvent>
@@ -53,13 +54,22 @@ inline bool g_web_debug_enabled = false;
 class LoggingPage : public QWebEnginePage
 {
     Q_OBJECT
+signals:
+    // Emitted once per streak of failed loads of the same URL.
+    void loadFailedRepeatedly(const QUrl &url);
+private:
+    int load_failures = 0;
+    QUrl failing_url;
 public:
     // `profile`: explicit profile override (unused currently; see
     // status doc). `hang_watchdog_secs`: forces a stuck navigation to
     // stop (and retry) after this many seconds with no progress; 0
     // disables it (see status doc for why/where it's used).
+    // `hang_max_stops` > 0 caps the stops per navigation; `hang_any_progress`
+    // drops the "mostly loaded" exemption (layouts start on `load`).
     LoggingPage(QObject *parent = nullptr, QWebEngineProfile *profile = nullptr,
-                int hang_watchdog_secs = 0)
+                int hang_watchdog_secs = 0, int hang_max_stops = 0,
+                bool hang_any_progress = false)
         : QWebEnginePage(profile ? profile : QWebEngineProfile::defaultProfile(), parent)
     {
         // BUG fix (found from a real report: a touch controller
@@ -118,13 +128,26 @@ public:
         // destroyed first (e.g. widget removed from layout).
         connect(this, &QWebEnginePage::loadFinished, this, [this](bool ok) {
             if (!ok) {
+                QUrl failed = url();
+                if (failed != failing_url) {
+                    failing_url = failed;
+                    load_failures = 0;
+                }
+                load_failures++;
                 std::cout << "WARN : [arexibo::qt] page failed to load (" \
-                           << url().toString().toStdString() << ") -- retrying in 2.5s" << std::endl;
-                QTimer::singleShot(2500, this, [this]() {
-                    triggerAction(QWebEnginePage::Reload);
+                           << failed.toString().toStdString() << ") -- retrying in 2.5s" << std::endl;
+                if (load_failures == 4)
+                    emit loadFailedRepeatedly(failed);
+                QTimer::singleShot(2500, this, [this, failed]() {
+                    // The owner may have navigated elsewhere meanwhile:
+                    // never reload an unrelated page.
+                    if (url() == failed)
+                        triggerAction(QWebEnginePage::Reload);
                 });
                 return;
             }
+            load_failures = 0;
+            failing_url = QUrl();
             std::cout << "DEBUG: [arexibo::qt] page finished loading (" \
                        << url().toString().toStdString() << ")" << std::endl;
         });
@@ -136,23 +159,57 @@ public:
             // slow trailing subresource, not a genuine stall).
             auto generation = std::make_shared<int>(0);
             auto last_progress = std::make_shared<int>(0);
+            auto stops = std::make_shared<int>(0);
+            auto stopped = std::make_shared<bool>(false);
+            auto watched = std::make_shared<QUrl>();
             auto arm_watchdog = std::make_shared<std::function<void()>>();
-            *arm_watchdog = [this, generation, last_progress, hang_watchdog_secs, arm_watchdog]() {
+            *arm_watchdog = [this, generation, last_progress, stops, stopped, hang_watchdog_secs,
+                             hang_max_stops, hang_any_progress, arm_watchdog]() {
                 int my_generation = ++(*generation);
                 QTimer::singleShot(hang_watchdog_secs * 1000, this,
-                                    [this, generation, my_generation, last_progress,
-                                     hang_watchdog_secs]() {
+                                    [this, generation, my_generation, last_progress, stops, stopped,
+                                     hang_watchdog_secs, hang_max_stops, hang_any_progress]() {
                     if (*generation != my_generation) return;
-                    if (*last_progress >= 80) return;
+                    if (!hang_any_progress && *last_progress >= 80) return;
+                    if (hang_max_stops > 0 && *stops >= hang_max_stops) {
+                        if (*stops == hang_max_stops) {
+                            ++(*stops);
+                            std::cout << "WARN : [arexibo::qt] page still loading (" \
+                                       << url().toString().toStdString() << ") after "
+                                       << hang_max_stops << " stops -- leaving it" << std::endl;
+                        }
+                        return;
+                    }
+                    ++(*stops);
                     std::cout << "WARN : [arexibo::qt] page still loading (" \
                                << url().toString().toStdString() << ") with no progress for " \
                                << hang_watchdog_secs << "s -- forcing it to stop" << std::endl;
+                    *stopped = true;
                     triggerAction(QWebEnginePage::Stop);
                 });
             };
-            connect(this, &QWebEnginePage::loadStarted, this, [arm_watchdog, last_progress]() {
+            connect(this, &QWebEnginePage::loadStarted, this,
+                    [this, arm_watchdog, last_progress, stops, watched]() {
+                if (url() != *watched) { *watched = url(); *stops = 0; }
                 *last_progress = 0;
                 (*arm_watchdog)();
+            });
+            // A finished load cancels the pending timer. A Stop can still end
+            // in a "successful" load (stuck subresource aborted): with stops
+            // left, retry it; on the last one keep the partial page.
+            connect(this, &QWebEnginePage::loadFinished, this,
+                    [this, generation, stops, stopped, hang_max_stops](bool ok) {
+                ++(*generation);
+                bool by_watchdog = *stopped;
+                *stopped = false;
+                if (!ok) return;
+                if (by_watchdog && hang_max_stops > 0 && *stops < hang_max_stops) {
+                    std::cout << "WARN : [arexibo::qt] stuck load aborted -- retrying (" \
+                               << url().toString().toStdString() << ")" << std::endl;
+                    QTimer::singleShot(0, this, [this]() { triggerAction(QWebEnginePage::Reload); });
+                    return;
+                }
+                *stops = 0;
             });
             // Re-arm on progress too, so a slow-but-working page isn't
             // killed -- only a genuine stall (no progress at all) is.
@@ -278,6 +335,14 @@ private:
     // from the main view's `native_views` so overlayHideImpl() tears down
     // exactly its own without touching the main layout's.
     QMap<int, QWebEngineView*> overlay_native_views;
+    // Media ids whose native view takes focus on first load ([HasFocus]).
+    QSet<int> focus_on_load_views;
+    QSet<int> overlay_focus_on_load_views;
+    // Media ids whose native view gets a transparent background.
+    QSet<int> transparent_views;
+    // Data Connector views by dataSetId: 1x1, behind everything, never seen.
+    QMap<int, QWebEngineView *> connector_views;
+    QSet<int> overlay_transparent_views;
 
     // Touch/click passthrough for an active Overlay Layout (found from
     // a real report, compared directly against the Windows client's own
@@ -350,6 +415,8 @@ public:
     void jsNativeWebShowImplNow(bool overlay, int, QString, int, int, int, int);
     void processNextPendingNativeWebShow();
     void jsNativeWebHideImpl(bool overlay, int);
+    void jsNativeWebFocusOnLoadImpl(bool overlay, int);
+    void jsNativeWebTransparentImpl(bool overlay, int);
     // Destroys any native_views left over from the *previous* layout --
     // called before navigating to a new one, since those widgets don't
     // exist in the new page at all and would otherwise leak/linger on
@@ -364,6 +431,8 @@ signals:
     void runJavascript(QString);
     void overlayShow(QString);
     void overlayHide();
+    void dataConnectorStart(int, QString);
+    void dataConnectorStop(int);
 
 public slots:
     void navigateToImpl(QString);
@@ -372,6 +441,8 @@ public slots:
     void runJavascriptImpl(QString);
     void overlayShowImpl(QString);
     void overlayHideImpl();
+    void dataConnectorStartImpl(int, QString);
+    void dataConnectorStopImpl(int);
 };
 
 class JSInterface : public QObject
@@ -401,6 +472,8 @@ public slots:
     void jsStopShell(int);
     void jsNativeWebShow(int, QString, int, int, int, int);
     void jsNativeWebHide(int);
+    void jsNativeWebFocusOnLoad(int);
+    void jsNativeWebTransparent(int);
 };
 
 #endif
