@@ -24,6 +24,7 @@ pub mod authcode;
 pub mod info;
 pub mod dataconnector;
 pub mod dcruntime;
+pub mod clock;
 mod tls;
 
 use std::path::PathBuf;

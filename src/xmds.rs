@@ -163,6 +163,7 @@ impl Cms {
                 xmrPubKey: &self.pub_key,
             }
         ).context("registering display")?.ActivationMessage;
+        crate::clock::check_against_cms(self.service.last_server_date());
         let _ = fs::write(self.xml_dir.join("register.xml"), &xml);
 
         let tree = Element::from_reader(&mut xml.as_bytes()).context("parsing activation message")?;
@@ -1597,5 +1598,50 @@ mod display_tags_tests {
             <tag><tagName>a</tagName><tagValue>1</tagValue></tag>
             <tag><tagName>a</tagName><tagValue>2</tagValue></tag></tags></display>"#);
         assert_eq!(tags, [pair("a", "2")]);
+    }
+}
+
+#[cfg(test)]
+mod server_date_tests {
+    use super::*;
+
+    fn start_mock_with_date(date: &'static str) -> u16 {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><RegisterDisplayResponse><ActivationMessage>&lt;ActivationMessage code="READY"/&gt;</ActivationMessage></RegisterDisplayResponse></soap:Body>
+</soap:Envelope>"#;
+                let response = tiny_http::Response::from_string(body)
+                    .with_header(tiny_http::Header::from_bytes(&b"Date"[..], date).unwrap());
+                let _ = request.respond(response);
+            }
+        });
+        port
+    }
+
+    fn test_cms(port: u16) -> Cms {
+        let cms_settings = crate::config::CmsSettings {
+            address: format!("http://127.0.0.1:{port}"),
+            key: "testkey".into(),
+            display_id: "test-display".into(),
+            display_name: None,
+            proxy: None,
+        };
+        let xml_dir = std::env::temp_dir().join(format!(
+            "arexibo_server_date_test_{}_{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&xml_dir).unwrap();
+        Cms::new(&cms_settings, "dummy-pub-key".into(), true, xml_dir).unwrap()
+    }
+
+    #[test]
+    fn the_date_the_cms_answers_with_is_kept() {
+        let mut cms = test_cms(start_mock_with_date("Tue, 20 Oct 2026 08:31:44 GMT"));
+        assert_eq!(cms.service.last_server_date(), None, "nothing before the first answer");
+        cms.register_display().unwrap();
+        assert_eq!(cms.service.last_server_date(), Some("Tue, 20 Oct 2026 08:31:44 GMT"));
+        assert!(crate::clock::parse_http_date(cms.service.last_server_date().unwrap()).is_some());
     }
 }

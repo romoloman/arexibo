@@ -386,6 +386,10 @@ pub struct Handler {
     xmr_in_use: Option<XmrTarget>,
     /// A different target seen at the last registration, to be confirmed.
     xmr_change_pending: Option<XmrTarget>,
+    /// How many dropped XMR messages were already reported to the CMS.
+    xmr_drops_reported: u64,
+    /// A fault for them is open at the CMS.
+    xmr_fault_open: bool,
     /// Unlike `xmr_retry_key` (only `Some` while a retry is actually
     /// pending), this is *always* populated -- kept specifically so
     /// XMR can be restarted later even after it's already running
@@ -433,6 +437,9 @@ pub struct Handler {
     /// Edge-triggered: fires once when screen_shot_requested goes
     /// false->true, not on every cycle it stays true.
     screenshot_requested_seen: bool,
+    /// A capture the CMS asked for through its settings, waiting for the
+    /// run loop to schedule it.
+    screenshot_wanted: bool,
     /// Timer for hiding/advancing the currently-shown overlay. Moved
     /// here (was local to `run()`) since `schedule_check()` needs to
     /// (re)schedule it too, not just XMR's `overlayLayout` handling.
@@ -506,6 +513,26 @@ const MAX_CONSECUTIVE_CONNECTION_FAILURES: u32 = 3;
 /// How soon to register again once the CMS reports different XMR
 /// connection settings, to confirm them before restarting.
 const XMR_CHANGE_CONFIRM_DELAY: Duration = Duration::from_secs(60);
+
+/// The player fault for dropped XMR messages is cleared at the CMS after
+/// this long without any more.
+const XMR_FAULT_QUIET: Duration = Duration::from_secs(3600);
+
+/// A screenshot the CMS asked for while this player was off is taken this
+/// long after the start: right after it the window has drawn nothing.
+const STARTUP_SCREENSHOT_DELAY: Duration = Duration::from_secs(60);
+
+/// When the first screenshot is due: the pending request of the CMS, else
+/// the first of the periodic ones.
+fn first_screenshot_delay(wanted: bool, interval_minutes: u64) -> Option<Duration> {
+    if wanted {
+        Some(STARTUP_SCREENSHOT_DELAY)
+    } else if interval_minutes != 0 {
+        Some(Duration::from_secs(interval_minutes * 60))
+    } else {
+        None
+    }
+}
 
 /// What the XMR connection is made with: the settings `xmr::start` reads
 /// for the transport it picks.
@@ -795,8 +822,11 @@ impl Handler {
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
+                                 screenshot_wanted: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key, xmr_in_use, xmr_change_pending: None,
+ xmr_drops_reported: 0,
+ xmr_fault_open: false,
                                  cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
@@ -858,9 +888,12 @@ impl Handler {
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
+                                 screenshot_wanted: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
                                  xmr_in_use: None, xmr_change_pending: None,
+ xmr_drops_reported: 0,
+ xmr_fault_open: false,
                                  cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
@@ -923,11 +956,9 @@ impl Handler {
     /// Run the main collect loop.
     pub fn run(mut self) -> Result<()> {
         let mut collect = after(Duration::from_secs(0));  // do first collect immediately
-        let mut screenshot = if self.settings.screenshot_interval != 0 {
-            after(Duration::from_secs(self.settings.screenshot_interval * 60))
-        } else {
-            never()
-        };
+        let mut screenshot = first_screenshot_delay(
+            std::mem::take(&mut self.screenshot_wanted), self.settings.screenshot_interval,
+        ).map_or_else(never, after);
         let schedule_check = tick(Duration::from_secs(60));
         // 5s, comfortably under commands_due's own 10s window (see its
         // own doc comment) -- guarantees at least one check happens
@@ -954,6 +985,9 @@ impl Handler {
                             return Err(e);
                         }
                         log::error!("during collect: {e:#}");
+                    }
+                    if std::mem::take(&mut self.screenshot_wanted) {
+                        screenshot = after(Duration::from_secs(0));
                     }
                     // A fresh collection may have discovered new data
                     // widgets (v7 GetData polling) whose own interval
@@ -1968,6 +2002,7 @@ impl Handler {
         self.send_status_update();
 
         self.flush_stats();
+        self.report_xmr_drops(xmr::last_drop(), std::time::Instant::now());
         self.flush_faults();
 
         // See `first_collection_done`'s own doc comment for the full
@@ -3139,8 +3174,8 @@ impl Handler {
         if self.settings.screen_shot_requested {
             if !self.screenshot_requested_seen {
                 log::info!("CMS has a pending screenshot request (screenShotRequested) -- \
-                            likely lost while offline/disconnected, fulfilling it now");
-                self.to_gui.send(ToGui::Screenshot).unwrap();
+                            likely lost while offline/disconnected, taking it a minute after the start");
+                self.screenshot_wanted = true;
                 self.screenshot_requested_seen = true;
             }
         } else {
@@ -3410,6 +3445,39 @@ fn timezone_to_report(cms_display_time_zone: &str, system_timezone: &str) -> Str
 }
 
 impl Handler {
+    /// Tells the CMS, as a player fault (an alert for the display there),
+    /// that XMR messages are being dropped as expired, and clears it after
+    /// `XMR_FAULT_QUIET` without more. The CMS replaces what it has for the
+    /// display with each report, and ends the alert of a code that is no
+    /// longer in it.
+    fn report_xmr_drops(&mut self, drops: Option<xmr::DropSummary>, now: std::time::Instant) {
+        let Some(drops) = drops else { return };
+        if drops.total != self.xmr_drops_reported {
+            self.xmr_drops_reported = drops.total;
+            self.xmr_fault_open = true;
+            self.faults.record(faults::Fault::new(faults::FAULT_CODE_XMR_MESSAGE_EXPIRED,
+                                                  drops.fault_reason()));
+        } else if self.xmr_fault_open && now.duration_since(drops.last) >= XMR_FAULT_QUIET {
+            self.clear_faults_at_the_cms();
+        }
+    }
+
+    /// An empty list: the CMS closes its Player Fault alert (and any other
+    /// fault it holds for this display).
+    fn clear_faults_at_the_cms(&mut self) {
+        if !xmds::xmds_supports_v6_v7_methods() {
+            self.xmr_fault_open = false;
+            return;
+        }
+        match self.xmds.report_faults("[]") {
+            Ok(()) => {
+                log::info!("no more XMR messages dropped as expired -- player faults cleared at the CMS");
+                self.xmr_fault_open = false;
+            }
+            Err(e) => log::error!("clearing the player faults at the CMS (will try again): {e:#}"),
+        }
+    }
+
     /// Starts, restarts and stops the data connectors the schedule wants right
     /// now (a connector whose script is not downloaded and verified waits).
     /// Run on every schedule check: once a minute, and on any schedule or
@@ -6575,38 +6643,53 @@ mod screenshot_requested_tests {
     }
 
     #[test]
-    fn fulfills_a_pending_request_exactly_once_while_the_flag_stays_true() {
+    fn asks_for_a_pending_request_exactly_once_while_the_flag_stays_true() {
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
-        let (togui_tx, togui_rx) = crossbeam_channel::bounded(10);
+        let (togui_tx, togui_rx) = crossbeam_channel::unbounded();
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
-
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         let _ = count_screenshot_messages(&togui_rx);
+        handler.screenshot_wanted = false;
 
         handler.settings.screen_shot_requested = true;
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 1);
+        assert!(std::mem::take(&mut handler.screenshot_wanted));
+        assert_eq!(count_screenshot_messages(&togui_rx), 0,
+                   "the run loop decides when to take it: nothing goes to the GUI from here");
 
-        // Flag stays true for a second cycle -- must not fire again.
+        // Flag stays true for a second cycle -- must not ask again.
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 0);
+        assert!(!handler.screenshot_wanted);
 
         // CMS resets the flag once it receives our submission.
         handler.settings.screen_shot_requested = false;
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 0);
+        assert!(!handler.screenshot_wanted);
 
-        // A genuinely new request later must fire again.
+        // A genuinely new request later must ask again.
         handler.settings.screen_shot_requested = true;
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 1,
-                   "a new request (flag re-transitioning false -> true) must fire again");
+        assert!(handler.screenshot_wanted,
+                "a new request (flag re-transitioning false -> true) must ask again");
+    }
+
+    #[test]
+    fn a_pending_request_is_taken_a_minute_after_the_start() {
+        assert_eq!(first_screenshot_delay(true, 0), Some(Duration::from_secs(60)));
+        assert_eq!(first_screenshot_delay(true, 5), Some(Duration::from_secs(60)),
+                   "the pending request does not wait for the periodic one");
+    }
+
+    #[test]
+    fn without_a_pending_request_the_first_screenshot_is_the_periodic_one() {
+        assert_eq!(first_screenshot_delay(false, 5), Some(Duration::from_secs(300)));
+        assert_eq!(first_screenshot_delay(false, 0), None, "none asked for, none scheduled");
     }
 }
 
@@ -7385,6 +7468,145 @@ mod flush_faults_tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A CMS that keeps the body of each ReportFaults and answers it with
+    /// a valid response, or (`works` false) with something unreadable.
+    fn start_capturing_mock(works: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_thread = captured.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                if body.contains("ReportFaults") {
+                    for_thread.lock().unwrap().push(body);
+                }
+                let response = if works {
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><ReportFaultsResponse><success>true</success></ReportFaultsResponse></soap:Body>
+</soap:Envelope>"#
+                } else {
+                    "this is not a SOAP answer"
+                };
+                let _ = request.respond(tiny_http::Response::from_string(response));
+            }
+        });
+        (port, captured)
+    }
+
+    fn handler_for(port: u16) -> (Handler, crossbeam_channel::Receiver<ToGui>) {
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::unbounded();
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+        (handler, togui_rx)
+    }
+
+    fn drops(total: u64, last: std::time::Instant) -> xmr::DropSummary {
+        xmr::DropSummary { total, action: "screenShot".into(), age_secs: 7199, last }
+    }
+
+    fn pending(handler: &mut Handler) -> Vec<(i32, String)> {
+        let (_json, faults) = handler.faults.build_and_clear();
+        faults.into_iter().map(|f| (f.code, f.reason)).collect()
+    }
+
+    #[test]
+    fn new_dropped_xmr_messages_become_a_fault_with_its_own_code() {
+        let (port, _seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let now = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, now)), now);
+        let faults = pending(&mut handler);
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].0, faults::FAULT_CODE_XMR_MESSAGE_EXPIRED);
+        assert!(faults[0].1.contains("3 so far") && faults[0].1.contains("screenShot"), "{}", faults[0].1);
+        assert!(handler.xmr_fault_open);
+    }
+
+    #[test]
+    fn the_same_drops_are_not_reported_twice_but_new_ones_are() {
+        let (port, _seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let now = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, now)), now);
+        assert_eq!(pending(&mut handler).len(), 1);
+        handler.report_xmr_drops(Some(drops(3, now)), now + Duration::from_secs(600));
+        assert!(pending(&mut handler).is_empty(), "nothing new since the last collection");
+        handler.report_xmr_drops(Some(drops(5, now + Duration::from_secs(700))), now + Duration::from_secs(900));
+        let faults = pending(&mut handler);
+        assert_eq!(faults.len(), 1);
+        assert!(faults[0].1.contains("5 so far"));
+    }
+
+    #[test]
+    fn nothing_dropped_nothing_reported() {
+        let (port, seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.report_xmr_drops(None, std::time::Instant::now());
+        assert!(pending(&mut handler).is_empty());
+        assert!(!handler.xmr_fault_open);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_hour_without_drops_clears_the_fault_at_the_cms_with_an_empty_list() {
+        let (port, seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let last = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, last)), last);
+        let _ = pending(&mut handler);
+        assert!(handler.xmr_fault_open);
+
+        handler.report_xmr_drops(Some(drops(3, last)), last + XMR_FAULT_QUIET - Duration::from_secs(1));
+        assert!(seen.lock().unwrap().is_empty(), "not yet: still within the hour");
+        assert!(handler.xmr_fault_open);
+
+        handler.report_xmr_drops(Some(drops(3, last)), last + XMR_FAULT_QUIET);
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one ReportFaults");
+        assert!(sent[0].contains("<![CDATA[[]]]>"), "an empty list: {}", sent[0]);
+        assert!(!handler.xmr_fault_open);
+
+        handler.report_xmr_drops(Some(drops(3, last)), last + XMR_FAULT_QUIET * 2);
+        assert_eq!(seen.lock().unwrap().len(), 1, "cleared once, not again");
+    }
+
+    #[test]
+    fn a_clearing_that_fails_is_tried_again_at_the_next_collection() {
+        let (port, seen) = start_capturing_mock(false);
+        let (mut handler, _rx) = handler_for(port);
+        let last = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, last)), last);
+        let _ = pending(&mut handler);
+        let later = last + XMR_FAULT_QUIET;
+        handler.report_xmr_drops(Some(drops(3, last)), later);
+        assert!(handler.xmr_fault_open, "the CMS did not take it: still open here");
+        handler.report_xmr_drops(Some(drops(3, last)), later + Duration::from_secs(600));
+        assert_eq!(seen.lock().unwrap().len(), 2, "tried again");
+    }
+
+    #[test]
+    fn new_drops_after_a_clearing_open_a_new_fault() {
+        let (port, _seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let t0 = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, t0)), t0);
+        let _ = pending(&mut handler);
+        handler.report_xmr_drops(Some(drops(3, t0)), t0 + XMR_FAULT_QUIET);
+        assert!(!handler.xmr_fault_open);
+        let t1 = t0 + XMR_FAULT_QUIET * 2;
+        handler.report_xmr_drops(Some(drops(4, t1)), t1);
+        assert_eq!(pending(&mut handler).len(), 1);
+        assert!(handler.xmr_fault_open);
     }
 
     // Sanity check for the *current*, real configuration
