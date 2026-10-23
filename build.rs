@@ -25,11 +25,17 @@ use crate::util::Base64Field;
 const SERVICE_IMPL: &str = r##"pub struct Service {
     baseuri: String,
     agent: Agent,
+    last_server_date: Option<String>,
 }
 
 impl Service {
     pub fn new(baseuri: String, agent: Agent) -> Self {
-        Self { baseuri, agent }
+        Self { baseuri, agent, last_server_date: None }
+    }
+
+    /// The `Date` header of the last answer.
+    pub fn last_server_date(&self) -> Option<&str> {
+        self.last_server_date.as_deref()
     }
 
     fn request<T: FromStr<Err = anyhow::Error> + fmt::Debug>(&mut self, name: &str, body: impl fmt::Display) -> Result<T>
@@ -68,10 +74,12 @@ impl Service {
             // genuine problem worth failing fast on.
             cfg = cfg.timeout_global(Some(std::time::Duration::from_secs(90)));
         }
-        cfg.build()
+        let response = cfg.build()
             .send(&data)
-            .with_context(|| format!("sending {name} SOAP request"))?
-            .into_body().read_to_string().with_context(|| format!("decoding {name} SOAP response"))?
+            .with_context(|| format!("sending {name} SOAP request"))?;
+        self.last_server_date = response.headers().get("date")
+            .and_then(|v| v.to_str().ok()).map(str::to_string);
+        response.into_body().read_to_string().with_context(|| format!("decoding {name} SOAP response"))?
             .parse().with_context(|| format!("parsing {name} SOAP response"))
     }
 "##;
