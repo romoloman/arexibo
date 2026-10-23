@@ -61,6 +61,12 @@ pub fn set_screen_size(width: i32, height: i32) {
     });
 }
 
+/// The screen size, (0, 0) until the window has reported it.
+pub fn screen_size() -> (i32, i32) {
+    let info = INFO.lock().unwrap_or_else(|e| e.into_inner());
+    (info.screen_width, info.screen_height)
+}
+
 pub fn set_current_layout(layout_id: i64) {
     update(|i| i.current_layout_id = layout_id);
 }

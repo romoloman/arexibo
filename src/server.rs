@@ -476,6 +476,19 @@ impl Server {
                 }
             }
 
+            // What the splash screen shows for debugging; local requests
+            // only, like /info (which keeps the Electron player's fields).
+            "/splash-info" => {
+                if is_local_addr(req.remote_addr()) {
+                    Response::from_data(crate::splashinfo::json().into_bytes())
+                        .with_header(Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                        .with_header(Header::from_bytes(b"Cache-Control", b"no-store").unwrap())
+                        .boxed()
+                } else {
+                    Response::empty(403).boxed()
+                }
+            }
+
             // Real-time DataSet data lookup -- confirmed from a real
             // `bundle.min.js` the user shared: `xiboIC.getData(dataKey,
             // {done, error})` makes a plain relative GET to
@@ -632,7 +645,53 @@ impl Server {
 // `awaiting_registration` value, but a *test* binary calling it with
 // both in the same run must see each one reflected correctly, which
 // whole-page OnceLock caching would have broken.
+/// The line at the bottom of the splash: version, date and time (ticking),
+/// disk space and the last collection, read from `/splash-info`.
+const SPLASH_INFO_SECTION: &str = r#"<div id="splash-info" style="position: fixed; bottom: 10px; left: 0; right: 0;
+     text-align: center; font-family: monospace; font-size: 18px; color: #888888;"></div>
+<script>
+(function() {
+  var info = {};
+  function two(n) { return (n < 10 ? '0' : '') + n; }
+  function hms(d) { return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()); }
+  function gb(bytes) { return (bytes / 1073741824).toFixed(1); }
+  function render() {
+    var now = new Date();
+    var parts = [];
+    if (info.version) parts.push('v' + info.version);
+    parts.push(now.getFullYear() + '-' + two(now.getMonth() + 1) + '-' + two(now.getDate()) + ' ' + hms(now));
+    if (info.diskFreeBytes != null && info.diskTotalBytes != null) {
+      parts.push('disk ' + gb(info.diskFreeBytes) + ' / ' + gb(info.diskTotalBytes) + ' GB free');
+    }
+    if (info.lastCollectAt) {
+      parts.push('last collection ' + hms(new Date(info.lastCollectAt)) + ' ' + info.lastCollectResult);
+    } else if (info.version) {
+      parts.push('last collection: never');
+    }
+    document.getElementById('splash-info').textContent = parts.join('  \u00b7  ');
+  }
+  function poll() {
+    fetch('/splash-info').then(function(r) { return r.json(); })
+      .then(function(data) { info = data; render(); }).catch(function() {});
+  }
+  render();
+  setInterval(render, 1000);
+  poll();
+  setInterval(poll, 5000);
+})();
+</script>"#;
+
+/// `AREXIBO_SPLASH_INFO=0` (or `false`, `no`, `off`) hides that line.
+fn splash_info_enabled_from(value: Option<&str>) -> bool {
+    !matches!(value.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "no" | "off"))
+}
+
 fn splash_html(awaiting_registration: bool, splash_state: SplashState) -> Vec<u8> {
+    let show_info = splash_info_enabled_from(std::env::var("AREXIBO_SPLASH_INFO").ok().as_deref());
+    splash_page(awaiting_registration, splash_state, show_info)
+}
+
+fn splash_page(awaiting_registration: bool, splash_state: SplashState, show_info: bool) -> Vec<u8> {
     static HOSTNAME_LINE: OnceLock<String> = OnceLock::new();
     let hostname_line = HOSTNAME_LINE.get_or_init(|| {
         let hostname = crate::util::get_display_name();
@@ -726,6 +785,7 @@ pollRegistrationCode();
     } else {
         ""
     };
+    let splash_info_section = if show_info { SPLASH_INFO_SECTION } else { "" };
     let status_line = match splash_state {
         SplashState::Loading => "LOADING...",
         SplashState::AwaitingAuthorization => "REGISTERING TO CMS...",
@@ -761,6 +821,7 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
   {hostname_line}
 </div>
 {registration_section}
+{splash_info_section}
 </body>
 </html>
 "#).into_bytes()
@@ -1564,5 +1625,53 @@ mod local_file_tests {
             Err(ureq::Error::StatusCode(404)) => {} // expected
             other => panic!("expected clean 404, got: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod splash_info_tests {
+    use super::*;
+
+    fn page(awaiting_registration: bool, show_info: bool) -> String {
+        String::from_utf8(splash_page(awaiting_registration, SplashState::Loading, show_info)).unwrap()
+    }
+
+    #[test]
+    fn the_splash_has_the_info_line_and_still_says_what_it_did() {
+        let html = page(false, true);
+        assert!(html.contains("id=\"splash-info\""));
+        assert!(html.contains("fetch('/splash-info')"));
+        assert!(html.contains("LOADING..."));
+    }
+
+    #[test]
+    fn the_line_comes_with_the_registration_form_too() {
+        let html = page(true, true);
+        assert!(html.contains("registration-code-section") && html.contains("id=\"splash-info\""));
+    }
+
+    #[test]
+    fn switched_off_the_splash_has_nothing_of_it() {
+        let html = page(false, false);
+        assert!(!html.contains("splash-info"), "no element, no script, no request");
+        assert!(html.contains("LOADING..."));
+    }
+
+    #[test]
+    fn the_variable_switches_the_line_off() {
+        for on in [None, Some(""), Some("1"), Some("yes"), Some("anything")] {
+            assert!(splash_info_enabled_from(on), "{on:?}");
+        }
+        for off in ["0", "false", "False", " no ", "OFF", "off"] {
+            assert!(!splash_info_enabled_from(Some(off)), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_script_asks_only_for_what_the_endpoint_gives() {
+        for field in ["version", "diskFreeBytes", "diskTotalBytes", "lastCollectAt", "lastCollectResult"] {
+            assert!(SPLASH_INFO_SECTION.contains(&format!("info.{field}")), "{field}");
+        }
+        assert!(!SPLASH_INFO_SECTION.contains("hardwareKey"), "no identifying data on a public screen");
     }
 }

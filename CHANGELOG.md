@@ -2,6 +2,18 @@
 
 ## 0.6.9 - Oct 2026
 
+- Send the details of the machine in the registration, as the Windows player does: `operatingSystem` as JSON, with the OS name from
+  `/etc/os-release` as `version`, the kernel release as `sdk`, and the manufacturer, brand and model from the firmware's DMI data (the
+  motherboard's if those are placeholders such as `To Be Filled By O.E.M.`, the device tree on a Raspberry Pi), which the CMS shows in the
+  display's details. It received the plain string `linux`. The value is escaped for the request, which the generated SOAP code does not do.
+- Send the screen size (`width`, `height`) in the status notification, as the Windows player does: the CMS works the display's resolution
+  and orientation out from it, and had neither for these players.
+- Show on the splash screen, in small type at the bottom, the version, the date and time (ticking), the free and total space of the disk
+  and the time and result of the last collection, as an aid for whoever installs or debugs a totem. `AREXIBO_SPLASH_INFO=0` hides it.
+  It reads a new local-only `/splash-info`; `/info` keeps the Electron player's fields.
+- Log `main loop started` when the main loop starts, and, if it has not begun its first collection 90 seconds later, an error with what each
+  thread of the process is waiting on (it was seen staying silent for minutes at boot, with the splash screen up), then exit, so that
+  systemd (`Restart=always`) starts the player again.
 - Say so in the log when an XMR message is dropped for being past its time to live (it was dropped silently), with its action and age,
   at most once every five minutes. A message that is hours old means this player's clock and the CMS's disagree.
 - Tell the CMS, as a player fault (a Player Fault alert for the display), when XMR messages are being dropped as expired: screenshots,

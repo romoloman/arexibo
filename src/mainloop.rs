@@ -519,6 +519,52 @@ const MAX_CONSECUTIVE_CONNECTION_FAILURES: u32 = 3;
 /// connection settings, to confirm them before restarting.
 const XMR_CHANGE_CONFIRM_DELAY: Duration = Duration::from_secs(60);
 
+/// Set when the first collection begins.
+static FIRST_COLLECT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the main loop has to begin its first collection, which it
+/// does at once, before the player says it did not.
+const STARTUP_WATCHDOG: Duration = Duration::from_secs(90);
+
+/// The exit status of the player when it gives up for that reason.
+const STARTUP_STALLED_EXIT_CODE: i32 = 70;
+
+/// What each thread of the process is doing, as (tid, name, kernel wait
+/// point), from a /proc directory: tells a wait on a lock from a wait on
+/// the network or a file.
+fn thread_snapshot(proc: &std::path::Path) -> String {
+    let mut threads: Vec<(u32, String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(proc.join("task")) {
+        for entry in entries.flatten() {
+            let Ok(tid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+            let read = |name: &str| std::fs::read_to_string(entry.path().join(name))
+                .map(|text| text.trim().to_string()).unwrap_or_else(|_| "?".to_string());
+            threads.push((tid, read("comm"), read("wchan")));
+        }
+    }
+    threads.sort();
+    threads.iter().map(|(tid, comm, wchan)| format!("  {tid} {comm} {wchan}")).collect::<Vec<_>>().join("\n")
+}
+
+/// If the main loop has not begun its first collection after
+/// `STARTUP_WATCHDOG`, logs it with what the threads are waiting on -- it was
+/// seen staying silent for minutes at boot -- and exits, for systemd
+/// (`Restart=always`) to start the player again.
+fn startup_watchdog() {
+    let _ = std::thread::Builder::new().name("startup-watchdog".into()).spawn(|| {
+        std::thread::sleep(STARTUP_WATCHDOG);
+        if !FIRST_COLLECT_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
+            log::error!("the main loop has not begun its first collection {}s after it started; \
+                         threads (tid, name, waiting in):\n{}",
+                        STARTUP_WATCHDOG.as_secs(), thread_snapshot(std::path::Path::new("/proc/self")));
+            log::error!("exiting, for systemd to start the player again");
+            // _exit, not exit: Qt's teardown is for the main thread and can
+            // wait forever when run from this one.
+            unsafe { nix::libc::_exit(STARTUP_STALLED_EXIT_CODE) };
+        }
+    });
+}
+
 /// The player fault for dropped XMR messages is cleared at the CMS after
 /// this long without any more.
 const XMR_FAULT_QUIET: Duration = Duration::from_secs(3600);
@@ -962,6 +1008,9 @@ impl Handler {
 
     /// Run the main collect loop.
     pub fn run(mut self) -> Result<()> {
+        log::info!("main loop started");
+        crate::splashinfo::set_disk_path(self.cache.dir().to_path_buf());
+        startup_watchdog();
         let mut collect = after(Duration::from_secs(0));  // do first collect immediately
         let mut screenshot = first_screenshot_delay(
             std::mem::take(&mut self.screenshot_wanted), self.settings.screenshot_interval,
@@ -991,6 +1040,7 @@ impl Handler {
                         if e.root_cause().downcast_ref::<RestartRequired>().is_some() {
                             return Err(e);
                         }
+                        crate::splashinfo::collect_finished(false);
                         log::error!("during collect: {e:#}");
                     }
                     if std::mem::take(&mut self.screenshot_wanted) {
@@ -1697,6 +1747,8 @@ impl Handler {
 
     /// Do a single collection cycle.
     fn collect_once(&mut self) -> Result<()> {
+        FIRST_COLLECT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::splashinfo::collect_started();
         log::info!("doing collection");
 
         // A blank placeholder address (Register via Code/manual entry
@@ -2036,6 +2088,7 @@ impl Handler {
             self.update_sync_group();
         }
 
+        crate::splashinfo::collect_finished(true);
         log::info!("collection successful");
         Ok(())
     }
@@ -2358,6 +2411,7 @@ impl Handler {
         // comment); an empty result here just means the field gets
         // omitted below, not sent as an empty string.
         let local_ips = util::get_local_ips();
+        let (screen_width, screen_height) = crate::info::screen_size();
         let status = xmds::Status {
             currentLayoutId: self.current_layout,
             availableSpace: avail,
@@ -2366,6 +2420,8 @@ impl Handler {
             deviceName: &self.settings.display_name,
             timeZone: &reported_tz,
             lanIpAddress: local_ips.first().map(String::as_str),
+            width: (screen_width > 0).then_some(screen_width),
+            height: (screen_height > 0).then_some(screen_height),
         };
         if let Err(e) = self.xmds.notify_status(&status) {
             log::error!("sending status update: {e:#}");
@@ -9156,5 +9212,60 @@ mod parallel_download_tests {
         assert_eq!(max_seen.load(Ordering::SeqCst), 1,
                    "max_concurrent_downloads=1 must never let more than one download run \
                     at the same time");
+    }
+}
+
+#[cfg(test)]
+mod startup_watchdog_tests {
+    use super::*;
+
+    fn fake_proc(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("arexibo_proc_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("task")).unwrap();
+        dir
+    }
+
+    fn add_thread(proc: &std::path::Path, tid: u32, comm: Option<&str>, wchan: Option<&str>) {
+        let dir = proc.join("task").join(tid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(comm) = comm {
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+        }
+        if let Some(wchan) = wchan {
+            std::fs::write(dir.join("wchan"), wchan).unwrap();
+        }
+    }
+
+    #[test]
+    fn each_thread_is_listed_with_its_name_and_where_it_waits() {
+        let proc = fake_proc("list");
+        add_thread(&proc, 200, Some("startup-watchdog"), Some("hrtimer_nanosleep"));
+        add_thread(&proc, 100, Some("arexibo"), Some("futex_wait_queue"));
+        add_thread(&proc, 150, Some("QtWebEngine"), Some("do_epoll_wait"));
+        assert_eq!(thread_snapshot(&proc),
+                   "  100 arexibo futex_wait_queue\n  150 QtWebEngine do_epoll_wait\n  200 startup-watchdog hrtimer_nanosleep");
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_a_question_mark() {
+        let proc = fake_proc("missing");
+        add_thread(&proc, 7, None, None);
+        add_thread(&proc, 8, Some("arexibo"), None);
+        std::fs::create_dir_all(proc.join("task").join("not-a-thread")).unwrap();
+        assert_eq!(thread_snapshot(&proc), "  7 ? ?\n  8 arexibo ?");
+    }
+
+    #[test]
+    fn no_task_directory_is_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("arexibo_proc_{}_none", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(thread_snapshot(&dir), "");
+    }
+
+    #[test]
+    fn the_real_process_lists_at_least_this_thread() {
+        let snapshot = thread_snapshot(std::path::Path::new("/proc/self"));
+        assert!(snapshot.lines().count() >= 1, "{snapshot:?}");
     }
 }

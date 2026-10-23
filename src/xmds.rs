@@ -145,9 +145,9 @@ impl Cms {
                     log::warn!("AREXIBO_FAKE_CLIENTTYPE={other:?} not a supported \
                                 override value, ignoring (only \"windows\"/\"android\" \
                                 are implemented) -- using real clientType \"linux\"");
-                    ("linux", 407, "linux")
+                    ("linux", 407, crate::osinfo::json_for_soap())
                 }
-                _ => ("linux", 407, "linux"),
+                _ => ("linux", 407, crate::osinfo::json_for_soap()),
             };
         let xml = self.service.RegisterDisplay(
             soap::RegisterDisplayRequest {
@@ -743,6 +743,14 @@ pub struct Status<'s> {
     // value with nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lanIpAddress: Option<&'s str>,
+    // The screen size: the CMS works the display's resolution and its
+    // orientation out from it (landscape if the width is at least the
+    // height), as for the Windows player. Omitted until the window has
+    // reported its size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<i32>,
     // pub latitude: f64,
     // pub longitude: f64,
 }
@@ -1644,5 +1652,29 @@ mod server_date_tests {
         cms.register_display().unwrap();
         assert_eq!(cms.service.last_server_date(), Some("Tue, 20 Oct 2026 08:31:44 GMT"));
         assert!(crate::clock::parse_http_date(cms.service.last_server_date().unwrap()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod status_size_tests {
+    use super::*;
+
+    fn status(width: Option<i32>, height: Option<i32>) -> Status<'static> {
+        Status {
+            currentLayoutId: 1, availableSpace: 2, totalSpace: 3, lastCommandSuccess: true,
+            deviceName: "totem", timeZone: "Europe/Rome", lanIpAddress: None, width, height,
+        }
+    }
+
+    #[test]
+    fn the_screen_size_is_sent_as_width_and_height() {
+        let json = serde_json::to_string(&status(Some(1080), Some(1920))).unwrap();
+        assert!(json.contains("\"width\":1080,\"height\":1920"), "{json}");
+    }
+
+    #[test]
+    fn an_unknown_size_is_left_out_not_sent_as_zero() {
+        let json = serde_json::to_string(&status(None, None)).unwrap();
+        assert!(!json.contains("width") && !json.contains("height"), "{json}");
     }
 }
