@@ -15,7 +15,10 @@ const GENERIC: [&str; 5] =
 
 fn is_generic(value: &str) -> bool {
     let value = value.trim().to_ascii_lowercase();
-    value.is_empty() || GENERIC.iter().any(|placeholder| value.contains(&placeholder.to_ascii_lowercase()))
+    // "O.E.M." or "OEM" alone is a placeholder too, but a name that has them
+    // in it is a name.
+    value.is_empty() || value == "o.e.m." || value == "oem"
+        || GENERIC.iter().any(|placeholder| value.contains(&placeholder.to_ascii_lowercase()))
 }
 
 #[derive(Debug, Default, PartialEq, Serialize)]
@@ -165,10 +168,10 @@ mod tests {
     fn firmware_placeholders_are_not_names() {
         for placeholder in ["System Product Name", "To Be Filled By O.E.M.", "to be filled by o.e.m.", "Default string",
                             "Not Applicable", "System Version", "  Default string  ", "", "   ",
-                            "xx To Be Filled By O.E.M. xx"] {
+                            "xx To Be Filled By O.E.M. xx", "O.E.M.", "o.e.m.", "OEM", " oem "] {
             assert!(is_generic(placeholder), "{placeholder:?}");
         }
-        for name in ["PP7600 A", "Dell Inc.", "ThinkCentre M920q", "Raspberry Pi 4 Model B Rev 1.4"] {
+        for name in ["PP7600 A", "Dell Inc.", "ThinkCentre M920q", "Raspberry Pi 4 Model B Rev 1.4", "Dell OEM Parts", "OEM Industrial Co", "O.E.M. Systems"] {
             assert!(!is_generic(name), "{name}");
         }
     }
@@ -223,6 +226,21 @@ mod tests {
         assert_eq!(back, json, "what the CMS reads back from the XML");
         let value: Value = serde_json::from_str(&back).unwrap();
         assert_eq!(value["manufacturer"], "A & B <C> \"D\"");
+    }
+
+    #[test]
+    fn a_firmware_that_says_oem_everywhere_leaves_the_names_empty() {
+        let pairs = [("sys_vendor", "O.E.M."), ("product_name", "O.E.M."), ("board_vendor", "O.E.M."), ("board_name", "O.E.M.")];
+        let os = build(Some("PRETTY_NAME=\"Ubuntu 26.04.1 LTS\"\n"), Some("7.0.0-29-generic"), dmi(&pairs), None);
+        assert_eq!(json_of(&os), "{\"manufacturer\":\"\",\"brand\":\"\",\"model\":\"\",\
+                                  \"version\":\"Ubuntu 26.04.1 LTS\",\"sdk\":\"7.0.0-29-generic\"}");
+    }
+
+    #[test]
+    fn a_real_board_name_is_used_when_the_system_says_oem() {
+        let pairs = [("sys_vendor", "O.E.M."), ("product_name", "O.E.M."), ("board_vendor", "Board Co"), ("board_name", "EKL-1")];
+        let os = build(None, None, dmi(&pairs), None);
+        assert_eq!((os.manufacturer.as_str(), os.brand.as_str(), os.model.as_str()), ("Board Co", "Board Co", "EKL-1"));
     }
 
     #[test]

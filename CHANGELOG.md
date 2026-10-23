@@ -4,7 +4,7 @@
 
 - Send the details of the machine in the registration, as the Windows player does: `operatingSystem` as JSON, with the OS name from
   `/etc/os-release` as `version`, the kernel release as `sdk`, and the manufacturer, brand and model from the firmware's DMI data (the
-  motherboard's if those are placeholders such as `To Be Filled By O.E.M.`, the device tree on a Raspberry Pi), which the CMS shows in the
+  motherboard's if those are placeholders such as `To Be Filled By O.E.M.` or just `O.E.M.`, the device tree on a Raspberry Pi), which the CMS shows in the
   display's details. It received the plain string `linux`. The value is escaped for the request, which the generated SOAP code does not do.
 - Send the screen size (`width`, `height`) in the status notification, as the Windows player does: the CMS works the display's resolution
   and orientation out from it, and had neither for these players.

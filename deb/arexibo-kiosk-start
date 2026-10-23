@@ -95,4 +95,4 @@ if [ -n "${FONT_SCALE:-}" ]; then
     export AREXIBO_FONT_SCALE="$FONT_SCALE"
 fi
 
-exec /usr/bin/arexibo --allow-offline /var/lib/arexibo
+exec /usr/bin/arexibo /var/lib/arexibo
