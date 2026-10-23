@@ -20,6 +20,7 @@ pub const CB_STOPSHELL: isize = 8;
 pub const CB_OVERLAY_LAYOUT_INIT: isize = 9;
 pub const CB_LAYOUT_FAILED: isize = 10;
 pub const CB_SCREEN_SIZE: isize = 11;
+pub const CB_WIDGET_STAT: isize = 12;
 extern "C" {
     pub fn setup(
         base_uri: *const ::std::os::raw::c_char,

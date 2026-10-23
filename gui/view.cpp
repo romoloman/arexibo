@@ -1161,6 +1161,13 @@ void JSInterface::jsLayoutPrev(int id)
     wnd->cb(wnd->cb_ptr, CB_LAYOUT_PREV, id, 0, 0);
 }
 
+void JSInterface::jsWidgetStat(int layout, int widget, int start)
+{
+    // Proof of Play is of the main view: an overlay's widgets are not counted.
+    if (is_overlay) return;
+    wnd->cb(wnd->cb_ptr, CB_WIDGET_STAT, widget, start, layout);
+}
+
 void JSInterface::jsLayoutJump(int id, int which)
 {
     // JUDGEMENT CALL, not verified against the C# client: a touch-driven

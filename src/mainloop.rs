@@ -16,7 +16,7 @@ use crate::{logger, schedule, server, syncgroup, util, xmds, xmr};
 use crate::resource::{Cache, FetchedContent, ReqFile};
 use crate::faults;
 use crate::schedule::{Schedule, CycleState};
-use crate::stats::{StatCollector, LayoutStat};
+use crate::stats::{Aggregation, Play, StatCollector, StatKind};
 use crate::criteria::CriteriaStore;
 use crate::command::Command;
 use crate::util::percent_decode;
@@ -146,6 +146,9 @@ pub enum Kill {
 /// Messages received from the GUI thread
 pub enum FromGui {
     Showing(i64),
+    /// A widget of the main view started or stopped showing (CB_WIDGET_STAT),
+    /// at `at`: for Proof of Play.
+    Widget { layout: i64, widget: i64, start: bool, at: OffsetDateTime },
     /// Sent when the currently-shown layout completes one natural
     /// cycle of its own regions/widgets (CB_LAYOUT_NEXT, matching
     /// jsLayoutDone) -- distinct from `Showing`, which fires when a
@@ -332,6 +335,8 @@ pub struct Handler {
     /// Proof of Play accumulator (layout-level records only, see
     /// stats.rs). Flushed to the CMS at the end of every collection.
     stats: StatCollector,
+    /// Widget plays in progress: (layout, widget) -> (scheduleid, start).
+    open_widgets: std::collections::HashMap<(i64, i64), (i64, OffsetDateTime)>,
     /// Player fault reports (see faults.rs) -- currently only recorded
     /// for layout translation/download failures. Flushed alongside
     /// `stats` at the end of every collection.
@@ -339,8 +344,8 @@ pub struct Handler {
     /// The layout currently being timed for Proof of Play purposes:
     /// (layout id, scheduleid, start time) -- `None` before the very
     /// first `FromGui::Showing` arrives. Closed out into a `LayoutStat`
-    /// (see `record_layout_shown`) whenever a *different* layout starts
-    /// showing.
+    /// (see `record_layout_shown`) when a *different* layout starts
+    /// showing, or (see `close_layout_play`) when it finishes its cycle.
     layout_playing_since: Option<(i64, i64, OffsetDateTime)>,
     /// Runtime state for Schedule Criteria (XMR `criteriaUpdate`) -- see
     /// criteria.rs. Deliberately not persisted across restarts.
@@ -799,7 +804,8 @@ impl Handler {
                                  envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
                                  deferred_layout_file: None,
                                  override_layout: None, overlay_layout: None,
-                                 stats: StatCollector::default(),
+                                 stats: StatCollector::load(envdir.join("stats.json"), &cms.address),
+                                 open_widgets: Default::default(),
                                  faults: faults::FaultCollector::default(),
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
@@ -865,7 +871,8 @@ impl Handler {
                                  envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
                                  deferred_layout_file: None,
                                  override_layout: None, overlay_layout: None,
-                                 stats: StatCollector::default(),
+                                 stats: StatCollector::load(envdir.join("stats.json"), &cms.address),
+                                 open_widgets: Default::default(),
                                  faults: faults::FaultCollector::default(),
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
@@ -1443,6 +1450,9 @@ impl Handler {
                             log::error!("submitting screenshot: {e:#}");
                         }
                     }
+                    Ok(FromGui::Widget { layout, widget, start, at }) => {
+                        self.widget_event(layout, widget, start, at);
+                    }
                     Ok(FromGui::Showing(layout)) => {
                         self.current_layout = layout;
                         crate::info::set_current_layout(layout);
@@ -1536,6 +1546,7 @@ impl Handler {
                                 };
                                 log::info!("layout {} completed its own natural cycle -- \
                                             reloading it fresh ({reason:?})", available[0]);
+                                self.close_layout_play(available[0]);
                                 self.to_gui.send(ToGui::ForceReloadLayout(
                                     available[0], reason)).unwrap();
                             } else if available != self.layouts {
@@ -2219,25 +2230,102 @@ impl Handler {
         result
     }
 
-    /// Proof of Play (layout-level, see stats.rs): close out the
-    /// previously-playing layout's timing session (if its `enableStat`
-    /// XLF attribute allows it) and start a new one for the layout that
+    /// The aggregation of the Proof of Play records: the CMS's
+    /// `aggregationLevel` (only offered to its Android and Windows
+    /// profiles) unless `AREXIBO_STATS_AGGREGATION` says otherwise.
+    fn aggregation_level(&self) -> Aggregation {
+        if !cfg!(test) {
+            if let Ok(level) = std::env::var("AREXIBO_STATS_AGGREGATION") {
+                return Aggregation::parse(&level);
+            }
+        }
+        Aggregation::parse(&self.settings.aggregation_level)
+    }
+
+    /// Proof of Play (see stats.rs): close out the previously-playing
+    /// layout's timing session and start a new one for the layout that
     /// just started showing. Called from `FromGui::Showing`, which only
-    /// fires for the *main* view (the overlay view's own layout inits are
-    /// deliberately not wired to it -- see CB_OVERLAY_LAYOUT_INIT in
-    /// gui.rs -- so overlay plays are intentionally NOT counted here;
-    /// they aren't part of the normal schedule the CMS is asking about).
+    /// fires for the *main* view (overlay plays are intentionally not
+    /// counted). The same layout showing again is not a new play here (a
+    /// reload after a stuck load shows it again); a layout that restarts
+    /// after finishing its own cycle is closed by `close_layout_play`.
+    /// The widgets still open belonged to the page that is gone.
     fn record_layout_shown(&mut self, new_layout: i64) {
         let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        self.close_open_widgets(now);
         if let Some((prev_id, prev_sid, start)) = self.layout_playing_since.take() {
-            if prev_id != new_layout && self.cache.layout_enable_stat(prev_id) {
-                self.stats.record_layout(LayoutStat {
-                    fromdt: start, todt: now, layoutid: prev_id, scheduleid: prev_sid,
-                });
+            if prev_id != new_layout {
+                self.record_play(prev_id, prev_sid, start, now);
             }
         }
         let sid = self.schedule.scheduleid_for(new_layout);
         self.layout_playing_since = Some((new_layout, sid, now));
+    }
+
+    /// `layout` finished its own cycle and starts over: that was a play of
+    /// its own, and the next one begins now.
+    fn close_layout_play(&mut self, layout: i64) {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        if let Some((id, sid, start)) = self.layout_playing_since {
+            if id == layout {
+                self.close_open_widgets(now);
+                self.record_play(id, sid, start, now);
+                self.layout_playing_since = Some((id, sid, now));
+            }
+        }
+    }
+
+    /// Records one play, unless the CMS has stats off for this display or
+    /// for the layout.
+    fn record_play(&mut self, layout: i64, scheduleid: i64, from: OffsetDateTime, to: OffsetDateTime) {
+        if layout == 0 || !self.settings.stats_enabled || !self.cache.layout_enable_stat(layout) {
+            return;
+        }
+        let level = self.aggregation_level();
+        self.stats.record(Play {
+            kind: StatKind::Layout, layoutid: layout, scheduleid, widgetid: 0, from, to,
+            criteria: crate::stats::criteria_tag(&self.criteria.active()),
+        }, level);
+    }
+
+    /// A widget of the main view started (`start`) or stopped showing.
+    /// A start for a widget that is already open closes that play first:
+    /// the region showed it again without hiding it (a single widget that
+    /// loops has no hide logic). Events of another layout (an overlay, or
+    /// a page that is already gone) are not for the play in progress.
+    fn widget_event(&mut self, layout: i64, widget: i64, start: bool, at: OffsetDateTime) {
+        let Some((current, scheduleid, _)) = self.layout_playing_since else { return };
+        if current != layout {
+            return;
+        }
+        if let Some((sid, from)) = self.open_widgets.remove(&(layout, widget)) {
+            self.record_widget_play(layout, widget, sid, from, at);
+        }
+        if start {
+            self.open_widgets.insert((layout, widget), (scheduleid, at));
+        }
+    }
+
+    /// The widgets still showing stop with their page.
+    fn close_open_widgets(&mut self, at: OffsetDateTime) {
+        let open: Vec<_> = self.open_widgets.drain().collect();
+        for ((layout, widget), (sid, from)) in open {
+            self.record_widget_play(layout, widget, sid, from, at);
+        }
+    }
+
+    /// The widget's own `enableStat` was already applied by the page,
+    /// which reports only the widgets that have it on.
+    fn record_widget_play(&mut self, layout: i64, widget: i64, scheduleid: i64,
+                          from: OffsetDateTime, to: OffsetDateTime) {
+        if !self.settings.stats_enabled || !self.cache.layout_enable_stat(layout) {
+            return;
+        }
+        let level = self.aggregation_level();
+        self.stats.record(Play {
+            kind: StatKind::Media, layoutid: layout, scheduleid, widgetid: widget, from, to,
+            criteria: crate::stats::criteria_tag(&self.criteria.active()),
+        }, level);
     }
 
     /// Send a NotifyStatus update to the CMS with the current layout
@@ -2290,13 +2378,22 @@ impl Handler {
     /// for a first-cut implementation; records naturally accumulate
     /// between collections and get sent in a batch.
     fn flush_stats(&mut self) {
+        self.stats.flush_dirty();
         if self.stats.is_empty() {
             return;
         }
-        let (xml, recs) = self.stats.build_and_clear();
-        if let Err(e) = self.xmds.submit_stats(&xml) {
-            log::error!("submitting Proof of Play stats: {e:#}");
-            self.stats.requeue(recs);
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let level = self.aggregation_level();
+        let (xml, recs) = self.stats.take_ready(now, level);
+        if recs.is_empty() {
+            return;
+        }
+        match self.xmds.submit_stats(&xml) {
+            Ok(()) => self.stats.confirm_sent(),
+            Err(e) => {
+                log::error!("submitting Proof of Play stats: {e:#}");
+                self.stats.requeue(recs);
+            }
         }
     }
 
@@ -7607,6 +7704,296 @@ mod flush_faults_tests {
         handler.report_xmr_drops(Some(drops(4, t1)), t1);
         assert_eq!(pending(&mut handler).len(), 1);
         assert!(handler.xmr_fault_open);
+    }
+
+    /// A CMS that keeps the body of each SubmitStats, and answers it or
+    /// (`works` false) with something unreadable.
+    fn start_stats_mock(works: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_thread = captured.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                if body.contains("SubmitStats") {
+                    for_thread.lock().unwrap().push(body);
+                }
+                let response = if works {
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><SubmitStatsResponse><success>true</success></SubmitStatsResponse></soap:Body>
+</soap:Envelope>"#
+                } else {
+                    "this is not a SOAP answer"
+                };
+                let _ = request.respond(tiny_http::Response::from_string(response));
+            }
+        });
+        (port, captured)
+    }
+
+    /// The plays recorded so far, as (layout, criteria).
+    fn plays(handler: &mut Handler) -> Vec<(i64, String)> {
+        handler.stats.take_all().into_iter()
+            .filter(|r| r.kind == StatKind::Layout)
+            .map(|r| (r.layoutid, r.engagements.keys().next().cloned().unwrap_or_default()))
+            .collect()
+    }
+
+    /// The widget plays recorded so far, as (widget, layout).
+    fn widget_plays(handler: &mut Handler) -> Vec<(i64, i64)> {
+        handler.stats.take_all().into_iter()
+            .filter(|r| r.kind == StatKind::Media)
+            .map(|r| (r.widgetid, r.layoutid))
+            .collect()
+    }
+
+    #[test]
+    fn a_layout_that_finishes_its_cycle_and_starts_over_is_a_play_each_time() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        for _ in 0..3 {
+            handler.close_layout_play(1757);
+            handler.record_layout_shown(1757); // the reload showing it again
+        }
+        assert_eq!(plays(&mut handler), vec![(1757, String::new()); 3]);
+    }
+
+    #[test]
+    fn a_second_showing_of_the_same_layout_without_a_cycle_is_not_a_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.record_layout_shown(1757); // e.g. the load was retried after a stuck one
+        assert!(plays(&mut handler).is_empty());
+    }
+
+    #[test]
+    fn closing_the_play_of_another_layout_changes_nothing() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let before = handler.layout_playing_since;
+        handler.close_layout_play(1758);
+        assert!(plays(&mut handler).is_empty());
+        assert_eq!(handler.layout_playing_since, before, "still timing the same play");
+    }
+
+    #[test]
+    fn the_splash_is_not_a_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(0);
+        handler.record_layout_shown(1757);
+        assert!(plays(&mut handler).is_empty(), "layout 0 is the splash screen");
+        handler.record_layout_shown(0);
+        handler.record_layout_shown(1757);
+        assert_eq!(plays(&mut handler), vec![(1757, String::new())], "and a real layout after it still is");
+    }
+
+    #[test]
+    fn layouts_that_alternate_each_get_their_plays() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        for layout in [1758, 1759, 1758, 1759] {
+            handler.record_layout_shown(layout);
+        }
+        let ids: Vec<i64> = plays(&mut handler).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, [1758, 1759, 1758]);
+    }
+
+    #[test]
+    fn nothing_is_recorded_when_the_cms_has_stats_off() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.settings.stats_enabled = false;
+        handler.record_layout_shown(1757);
+        handler.close_layout_play(1757);
+        handler.record_layout_shown(1758);
+        assert!(plays(&mut handler).is_empty());
+        handler.settings.stats_enabled = true;
+        handler.close_layout_play(1758);
+        assert_eq!(plays(&mut handler).len(), 1, "and recording starts again when it is back on");
+    }
+
+    #[test]
+    fn the_criteria_in_force_are_recorded_with_the_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        handler.criteria.set("meteo_temp".into(), "21".into(), 300);
+        handler.close_layout_play(1757);
+        handler.criteria.set("weather".into(), "sun".into(), 300);
+        handler.close_layout_play(1757);
+        assert_eq!(plays(&mut handler), vec![
+            (1757, "CRITERIA|meteo_temp:21, weather:rain".to_string()),
+            (1757, "CRITERIA|meteo_temp:21, weather:sun".to_string())]);
+    }
+
+    #[test]
+    fn a_play_goes_to_the_cms_with_duration_and_count_and_then_leaves_the_file() {
+        let (port, seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        handler.close_layout_play(1757);
+        let path = handler.stats.path().expect("a file").to_path_buf();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("1757"), "kept until the CMS has it");
+
+        handler.flush_stats();
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        for part in ["layoutid=\"1757\"", "duration=\"", "count=\"1\"", "CRITERIA|weather:rain"] {
+            assert!(sent[0].contains(part), "{part}: {}", sent[0]);
+        }
+        assert!(handler.stats.is_empty());
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["records"].as_array().unwrap().len(), 0, "nothing left to send after a restart");
+    }
+
+    #[test]
+    fn plays_the_cms_does_not_take_are_kept_for_later_and_survive_a_restart() {
+        let (port, seen) = start_stats_mock(false);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.close_layout_play(1757);
+        handler.flush_stats();
+        assert_eq!(seen.lock().unwrap().len(), 1, "it tried");
+        assert!(!handler.stats.is_empty(), "and kept the play");
+        let path = handler.stats.path().unwrap().to_path_buf();
+        let after_restart = crate::stats::StatCollector::load(path, &handler.cms.address);
+        assert!(!after_restart.is_empty());
+    }
+
+    #[test]
+    fn a_widget_that_starts_and_stops_is_a_play_of_its_own() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, false, t + time::Duration::seconds(12));
+        let records = handler.stats.take_all();
+        let widget = records.iter().find(|r| r.kind == StatKind::Media).expect("a widget record");
+        assert_eq!((widget.widgetid, widget.layoutid, widget.duration), (4670, 1757, 12));
+        assert!(handler.open_widgets.is_empty());
+    }
+
+    #[test]
+    fn a_widget_started_again_without_stopping_closes_the_first_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, true, t + time::Duration::seconds(10));
+        assert_eq!(widget_plays(&mut handler), vec![(4670, 1757)], "the first play, the second is still open");
+        assert_eq!(handler.open_widgets.len(), 1);
+    }
+
+    #[test]
+    fn a_stop_for_a_widget_that_never_started_is_nothing() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.widget_event(1757, 4670, false, OffsetDateTime::now_utc());
+        assert!(widget_plays(&mut handler).is_empty());
+    }
+
+    #[test]
+    fn widgets_still_showing_when_the_layout_changes_are_closed_with_it() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4671, true, t);
+        handler.record_layout_shown(1758);
+        let mut plays = widget_plays(&mut handler);
+        plays.sort();
+        assert_eq!(plays, vec![(4670, 1757), (4671, 1757)]);
+        assert!(handler.open_widgets.is_empty());
+    }
+
+    #[test]
+    fn widgets_still_showing_when_the_layout_starts_over_are_closed_with_it() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.widget_event(1757, 4670, true, OffsetDateTime::now_utc());
+        handler.close_layout_play(1757);
+        assert_eq!(widget_plays(&mut handler), vec![(4670, 1757)]);
+        assert!(handler.open_widgets.is_empty());
+    }
+
+    #[test]
+    fn the_events_of_another_layout_are_not_for_the_play_in_progress() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.widget_event(1757, 4670, true, OffsetDateTime::now_utc());
+        assert!(handler.open_widgets.is_empty(), "nothing is showing yet");
+        handler.record_layout_shown(1757);
+        handler.widget_event(9999, 4670, true, OffsetDateTime::now_utc());
+        assert!(handler.open_widgets.is_empty(), "an overlay, or a page that is gone");
+    }
+
+    #[test]
+    fn no_widget_is_recorded_when_the_cms_has_stats_off() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.settings.stats_enabled = false;
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, false, t + time::Duration::seconds(5));
+        assert!(widget_plays(&mut handler).is_empty());
+    }
+
+    #[test]
+    fn a_widget_play_carries_the_criteria_in_force() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, false, t + time::Duration::seconds(5));
+        let records = handler.stats.take_all();
+        assert_eq!(records[0].engagements.keys().next().unwrap(), "CRITERIA|weather:rain");
+    }
+
+    #[test]
+    fn the_level_comes_from_the_setting() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        assert_eq!(handler.aggregation_level(), Aggregation::Individual, "the default");
+        for (text, level) in [("Hourly", Aggregation::Hourly), ("Daily", Aggregation::Daily),
+                              ("individual", Aggregation::Individual), ("nonsense", Aggregation::Individual)] {
+            handler.settings.aggregation_level = text.to_string();
+            assert_eq!(handler.aggregation_level(), level, "{text}");
+        }
+    }
+
+    #[test]
+    fn with_hourly_aggregation_the_current_hour_is_kept_for_later() {
+        let (port, seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.settings.aggregation_level = "Hourly".to_string();
+        handler.record_layout_shown(1757);
+        handler.close_layout_play(1757);
+        handler.close_layout_play(1757);
+        handler.flush_stats();
+        assert!(seen.lock().unwrap().is_empty(), "this hour is not over: nothing is sent");
+        assert!(!handler.stats.is_empty(), "and the plays wait");
+        handler.settings.aggregation_level = "Individual".to_string();
+        handler.flush_stats();
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "back to individual: sent at once");
+        assert!(sent[0].contains("count=\"2\""), "the two plays as one record: {}", sent[0]);
     }
 
     // Sanity check for the *current*, real configuration

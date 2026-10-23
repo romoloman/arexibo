@@ -28,6 +28,9 @@ const intptr_t CB_OVERLAY_LAYOUT_INIT = 9;
 const intptr_t CB_LAYOUT_FAILED = 10;
 // The window's size in real pixels (arg1: width, arg2: height).
 const intptr_t CB_SCREEN_SIZE = 11;
+// A widget of the main view started (arg2 1) or stopped (arg2 0) showing:
+// arg1 widget id, arg3 layout id. For Proof of Play (see stats.rs).
+const intptr_t CB_WIDGET_STAT = 12;
 
 void setup(const char *base_uri, const char *screen,
            int inspect, int debug, callback cb, void *cb_ptr);

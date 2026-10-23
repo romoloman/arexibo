@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.9 - Oct 2026
+
+- Say so in the log when an XMR message is dropped for being past its time to live (it was dropped silently), with its action and age,
+  at most once every five minutes. A message that is hours old means this player's clock and the CMS's disagree.
+- Tell the CMS, as a player fault (a Player Fault alert for the display), when XMR messages are being dropped as expired: screenshots,
+  collect now and the CMS's other messages were being lost with no sign there. It is cleared after an hour without any more, by sending
+  an empty list of faults, which also clears the other faults the CMS holds for the display.
+- Proof of Play: a layout that is alone in the schedule (or the only member of a cycle group) is now recorded each time it finishes its
+  cycle and starts over; such plays were lost, as a record was made only when a different layout came next.
+- Proof of Play: send the `duration` (seconds) and `count` of each record, as the Windows and Electron players do (the CMS worked a
+  missing duration out from the two dates; the count is what an aggregate needs).
+- Proof of Play: honour the display's `statsEnabled` setting, which was ignored (nothing is recorded while it is off).
+- Proof of Play: tag each record with the schedule criteria in force during the play (an engagement, as the Electron player does), and
+  keep the records not yet sent in `stats.json`, so a restart does not lose them.
+- Proof of Play of the widgets: a record (type `media`, `mediaid` the widget) for each time a widget of the main view is shown, for the
+  widgets whose `enableStat` is on. Widgets still showing when the layout changes or starts over are closed with it. Needs the layouts to
+  be translated again, which happens by itself at the first start.
+- Proof of Play aggregation, `Hourly` and `Daily`, as the Windows player does but keyed by layout and widget too (the Windows key has
+  neither, which adds up the layouts of a campaign under the first one): one record per layout and widget and hour or day, sent when
+  that hour or day is over, with the count and the added duration (the CMS counts impressions of ad campaigns from the count). The level
+  is the display's `aggregationLevel` setting, which the CMS only offers to its Android and Windows profiles, so there is also the
+  environment variable `AREXIBO_STATS_AGGREGATION`.
+- Warn when this player's clock differs from the CMS's by more than a minute (from the `Date` header of the answers to the registration),
+  again at most once an hour, and say when they agree again: XMR messages (screenshots, collect now, ...) are dropped and what is
+  scheduled by time starts at the wrong time otherwise.
+- Take a screenshot the CMS asked for while the player was off a minute after the start: it was taken before anything was drawn
+  and sent a blank image. One asked for through XMR in the first minute is not delayed.
+
 ## 0.6.8 - Oct 2026
 
 - Add the `/info` endpoint (`xiboIC.info()`), with the same fields as the official Electron player: `version`, `displayName`,

@@ -265,6 +265,7 @@ impl Cms {
                 // be surprising, not safe, so default to the CMS's own
                 // usual behavior instead.
                 stats_enabled: tree.def_child::<i32>("statsEnabled", 1)? != 0,
+                aggregation_level: tree.def_child::<String>("aggregationLevel", "Individual".to_string())?,
                 prevent_sleep: tree.def_child::<i32>("preventSleep", 0)? != 0,
                 // 300s (5 minutes) matches Xibo's own commonly-documented
                 // default collection interval.
