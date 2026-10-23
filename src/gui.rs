@@ -260,13 +260,20 @@ pub fn quit() {
     }
 }
 
-extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, _arg3: isize) {
+extern "C" fn callback(ptr: *mut c_void, typ: isize, arg1: isize, arg2: isize, arg3: isize) {
     let cb_data = unsafe { &*(ptr as *const CallbackData) };
 
     match typ {
         cpp::CB_SCREENSHOT => {
             let data = unsafe { std::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
             let _ = cb_data.sender.send(FromGui::Screenshot(data.to_vec()));
+        }
+        cpp::CB_WIDGET_STAT => {
+            // Stamped here, not when the mainloop gets to it, which can be busy.
+            let at = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+            let _ = cb_data.sender.send(FromGui::Widget {
+                layout: arg3 as _, widget: arg1 as _, start: arg2 != 0, at,
+            });
         }
         cpp::CB_LAYOUT_INIT => {
             if arg1 > 0 {  // don't announce the splash screen

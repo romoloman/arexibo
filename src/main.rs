@@ -24,6 +24,9 @@ pub mod authcode;
 pub mod info;
 pub mod dataconnector;
 pub mod dcruntime;
+pub mod clock;
+pub mod splashinfo;
+pub mod osinfo;
 mod tls;
 pub mod videowall;
 

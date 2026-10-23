@@ -94,6 +94,10 @@ pub struct PlayerSettings {
     // would get, not silently to off.
     #[serde(default = "default_true")]
     pub stats_enabled: bool,
+    /// `Individual`, `Hourly` or `Daily` (see stats.rs). The CMS only
+    /// offers it to Android and Windows display profiles.
+    #[serde(default = "crate::stats::default_aggregation_level")]
+    pub aggregation_level: String,
     #[serde(default)]
     pub xmr_network_address: String,
     #[serde(default)]
@@ -271,6 +275,7 @@ impl Default for PlayerSettings {
             collect_interval: default_collect_interval(),
             max_concurrent_downloads: default_max_concurrent_downloads(),
             stats_enabled: true,
+            aggregation_level: crate::stats::default_aggregation_level(),
             xmr_network_address: String::new(),
             xmr_web_socket_address: String::new(),
             xmr_web_socket_address_in_use: String::new(),
@@ -340,6 +345,7 @@ impl fmt::Debug for PlayerSettings {
             .field("download_end_window", &self.download_end_window)
             .field("display_time_zone", &self.display_time_zone)
             .field("display_tags", &self.display_tags)
+            .field("aggregation_level", &self.aggregation_level)
             .field("expire_modified_layouts", &self.expire_modified_layouts)
             .field("screen_shot_requested", &self.screen_shot_requested)
             .field("new_cms_address", &self.new_cms_address)
@@ -857,6 +863,7 @@ mod tests {
         let original = PlayerSettings {
             collect_interval: 300,
             stats_enabled: true,
+            aggregation_level: "Daily".to_string(),
             log_level: "info".into(),
             display_name: "Test Display".into(),
             ..Default::default()

@@ -5,9 +5,10 @@
 //! account.xibosignage.com/docs/developer/creating-a-player/xmds, fetched
 //! and read in full during development, not from memory).
 //!
-//! SCOPE: only the collection/submission infrastructure plus a single
-//! concrete call site (layout translation/download failures, see
-//! resource.rs) are wired up here. Xibo's own players also report faults
+//! SCOPE: only the collection/submission infrastructure plus two
+//! concrete call sites (layout translation/download failures, see
+//! resource.rs; XMR messages dropped as expired, see mainloop.rs) are
+//! wired up here. Xibo's own players also report faults
 //! for e.g. individual video/media playback errors -- NOT implemented
 //! here, deliberately scoped out rather than attempted half-done; the
 //! `FaultCollector`/`record_fault` machinery is reusable for a follow-up
@@ -38,6 +39,10 @@ use crate::util::TIME_FMT;
 /// (not overlapping likely-official low numbers like 1000/2001 seen in
 /// passing) rather than to match a real registry.
 pub const FAULT_CODE_LAYOUT_TRANSLATE_FAILED: i32 = 9001;
+
+/// Same caveat as above: a local code, not an official one. "XMR messages
+/// are being dropped for being past their time to live" -- see xmr.rs.
+pub const FAULT_CODE_XMR_MESSAGE_EXPIRED: i32 = 9002;
 
 /// Reason strings longer than this get truncated before submission --
 /// a real, confirmed bug (xibosignage/xibo#3230) causes the CMS to

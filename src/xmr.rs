@@ -12,6 +12,8 @@ use crate::util::fingerprint;
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Deserializer, de::Error};
 use serde_json::{from_slice, from_str};
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
 use time::{OffsetDateTime, Duration};
 use tungstenite::{WebSocket, http::uri::Uri, stream::MaybeTlsStream};
 use crate::config::{CmsSettings, PlayerSettings};
@@ -281,7 +283,7 @@ impl WsConnector {
             }
             log::debug!("got XMR WebSocket message: {:?}", msg);
             if let Ok(json_msg) = from_str::<JsonMessage>(msg.to_text()?) {
-                if let Some(msg) = json_msg.into_msg() {
+                if let Some(msg) = json_msg.accept() {
                     self.sender.send(msg).unwrap();
                 }
             }
@@ -371,12 +373,86 @@ impl ZmqConnector {
         if channel != HEARTBEAT.as_bytes() {
             let json_msg = JsonMessage::decrypt(&self.private_key, &key, &content)?;
             log::debug!("got XMR message: {:?}", json_msg);
-            if let Some(msg) = json_msg.into_msg() {
+            if let Some(msg) = json_msg.accept() {
                 self.sender.send(msg).unwrap();
             }
         }
         Ok(())
     }
+}
+
+/// Spaces the warnings about dropped messages: a CMS or a player with a wrong
+/// clock would otherwise log one for each of the many data updates.
+#[derive(Default)]
+struct DropReports {
+    last: Option<std::time::Instant>,
+    suppressed: u32,
+    summary: Option<DropSummary>,
+}
+
+/// What is known of the XMR messages dropped as expired, for the report to
+/// the CMS (see `Handler::report_xmr_drops`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSummary {
+    /// How many, since this process started.
+    pub total: u64,
+    /// The last one's action and age.
+    pub action: String,
+    pub age_secs: i64,
+    pub last: std::time::Instant,
+}
+
+impl DropSummary {
+    /// The text of the player fault: what an admin reads at the CMS.
+    pub fn fault_reason(&self) -> String {
+        format!("XMR messages are being dropped as expired ({} so far; the last, {}, was {} old) \
+                 -- check the clock and the time zone of this player and of the CMS",
+                self.total, self.action, crate::clock::human_duration(self.age_secs))
+    }
+}
+
+/// The last drop, if any message was ever dropped.
+pub fn last_drop() -> Option<DropSummary> {
+    DROPS.lock().unwrap_or_else(|e| e.into_inner()).summary.clone()
+}
+
+impl DropReports {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+    fn record(&mut self, action: &str, age_secs: i64, now: std::time::Instant) {
+        let total = self.summary.as_ref().map_or(0, |s| s.total) + 1;
+        self.summary = Some(DropSummary { total, action: action.to_string(), age_secs, last: now });
+    }
+
+    /// `Some(n)` when a warning is due, `n` messages having been dropped
+    /// without one since the last.
+    fn next(&mut self, now: std::time::Instant) -> Option<u32> {
+        match self.last {
+            Some(at) if now.duration_since(at) < Self::EVERY => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
+
+static DROPS: Lazy<Mutex<DropReports>> = Lazy::new(|| Mutex::new(DropReports::default()));
+
+fn dropped_message_text(action: &str, created: OffsetDateTime, ttl: i64, age_secs: i64,
+                        suppressed: u32) -> String {
+    let more = if suppressed > 0 {
+        format!(" ({suppressed} more dropped since the last warning)")
+    } else {
+        String::new()
+    };
+    format!("dropping an XMR message past its time to live (action {action}, created {created}, \
+             ttl {ttl}s, age {}){more} -- an age far over the ttl, often a round number of hours, \
+             means the clocks or the time zones of this player and the CMS disagree",
+            crate::clock::human_duration(age_secs))
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,8 +516,33 @@ impl JsonMessage {
         Ok(from_slice(&msg)?)
     }
 
+    /// How old the message is, if that is past its `ttl`.
+    fn expired_age(&self, now: OffsetDateTime) -> Option<Duration> {
+        let age = now - self.created;
+        (age > Duration::seconds(self.ttl)).then_some(age)
+    }
+
     fn is_expired(&self) -> bool {
-        self.created + Duration::seconds(self.ttl) < OffsetDateTime::now_utc()
+        self.expired_age(OffsetDateTime::now_utc()).is_some()
+    }
+
+    /// `into_msg`, saying so when the message is dropped for being expired.
+    fn accept(self) -> Option<Message> {
+        if let Some(age) = self.expired_age(OffsetDateTime::now_utc()) {
+            log::debug!("dropping expired XMR message: {self:?}");
+            let now = std::time::Instant::now();
+            let report = {
+                let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
+                drops.record(&self.action, age.whole_seconds(), now);
+                drops.next(now)
+            };
+            if let Some(suppressed) = report {
+                log::warn!("{}", dropped_message_text(&self.action, self.created, self.ttl,
+                                                       age.whole_seconds(), suppressed));
+            }
+            return None;
+        }
+        self.into_msg()
     }
 
     fn into_msg(self) -> Option<Message> {
@@ -1272,5 +1373,118 @@ mod describe_close_tests {
             reason: "Server restarting".into(),
         }));
         assert_ne!(invalid_key, going_away);
+    }
+}
+
+#[cfg(test)]
+mod dropped_message_tests {
+    use super::*;
+    fn at(text: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    fn message(action: &str, created: OffsetDateTime, ttl: i64) -> JsonMessage {
+        JsonMessage {
+            action: action.into(), created, ttl, trigger_code: None, command_code: None,
+            widget_id: None, layout_id: None, change_mode: None, duration: None,
+            criteria_updates: None,
+        }
+    }
+
+    #[test]
+    fn an_expired_message_reports_its_age() {
+        let now = at("2026-10-20T10:25:57Z");
+        let two_hours_old = message("screenShot", at("2026-10-20T08:25:58Z"), 120);
+        assert_eq!(two_hours_old.expired_age(now), Some(Duration::seconds(7199)));
+        let fresh = message("screenShot", at("2026-10-20T10:25:00Z"), 120);
+        assert_eq!(fresh.expired_age(now), None);
+    }
+
+    #[test]
+    fn a_message_exactly_at_its_ttl_is_still_valid() {
+        let now = at("2026-10-20T10:25:57Z");
+        assert_eq!(message("collectNow", now - Duration::seconds(120), 120).expired_age(now), None);
+        assert!(message("collectNow", now - Duration::seconds(121), 120).expired_age(now).is_some());
+    }
+
+    #[test]
+    fn a_message_from_the_future_is_not_expired() {
+        let now = at("2026-10-20T10:25:57Z");
+        assert_eq!(message("collectNow", now + Duration::hours(2), 120).expired_age(now), None);
+    }
+
+    #[test]
+    fn accept_drops_the_expired_and_passes_the_fresh() {
+        let old = message("screenShot", OffsetDateTime::now_utc() - Duration::hours(2), 120);
+        assert!(old.accept().is_none());
+        let fresh = message("screenShot", OffsetDateTime::now_utc(), 120);
+        assert!(matches!(fresh.accept(), Some(Message::Screenshot)));
+    }
+
+    #[test]
+    fn dropped_messages_are_warned_about_now_and_then_with_a_count() {
+        let mut reports = DropReports::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(reports.next(t0), Some(0), "the first one is reported at once");
+        for second in [1, 2, 10, 299] {
+            assert_eq!(reports.next(t0 + std::time::Duration::from_secs(second)), None);
+        }
+        assert_eq!(reports.next(t0 + std::time::Duration::from_secs(300)), Some(4),
+                   "after five minutes: reported, with what was left out");
+        assert_eq!(reports.next(t0 + std::time::Duration::from_secs(301)), None);
+        assert_eq!(reports.next(t0 + std::time::Duration::from_secs(700)), Some(1));
+    }
+
+    #[test]
+    fn the_warning_names_the_action_the_age_and_the_clocks() {
+        let text = dropped_message_text("screenShot", at("2026-10-20T08:25:58Z"), 120, 7199, 0);
+        for part in ["screenShot", "ttl 120s", "age 1h 59m 59s", "clocks", "time zones"] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        assert!(!text.contains("more dropped"));
+        assert!(dropped_message_text("screenShot", at("2026-10-20T08:25:58Z"), 120, 7199, 12)
+                    .contains("(12 more dropped since the last warning)"));
+    }
+}
+
+#[cfg(test)]
+mod drop_summary_tests {
+    use super::*;
+
+    #[test]
+    fn the_summary_counts_every_drop_and_keeps_the_last() {
+        let mut drops = DropReports::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(drops.summary, None);
+        drops.record("screenShot", 7199, t0);
+        drops.record("collectNow", 7210, t0 + std::time::Duration::from_secs(5));
+        let summary = drops.summary.clone().unwrap();
+        assert_eq!((summary.total, summary.action.as_str(), summary.age_secs), (2, "collectNow", 7210));
+        assert_eq!(summary.last, t0 + std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_fault_text_says_what_how_many_and_what_to_check() {
+        let summary = DropSummary { total: 12, action: "screenShot".into(), age_secs: 7199,
+                                    last: std::time::Instant::now() };
+        let reason = summary.fault_reason();
+        for part in ["dropped as expired", "12 so far", "screenShot", "1h 59m 59s old", "clock", "time zone"] {
+            assert!(reason.contains(part), "{part}: {reason}");
+        }
+        assert!(reason.len() < 255, "the CMS refuses a longer reason: {}", reason.len());
+    }
+
+    #[test]
+    fn dropping_a_message_is_visible_to_the_report() {
+        let before = last_drop().map_or(0, |s| s.total);
+        let old = JsonMessage {
+            action: "unit-test-action".into(), created: OffsetDateTime::now_utc() - Duration::hours(2), ttl: 120,
+            trigger_code: None, command_code: None, widget_id: None, layout_id: None, change_mode: None,
+            duration: None, criteria_updates: None,
+        };
+        assert!(old.accept().is_none());
+        let after = last_drop().expect("a drop was recorded");
+        assert!(after.total > before);
+        assert!(after.age_secs >= 7199);
     }
 }

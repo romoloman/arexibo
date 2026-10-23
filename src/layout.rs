@@ -18,7 +18,7 @@ use crate::util::{ElementExt, percent_decode, percent_encode};
 
 /// Bump when the generated page changes: cached layouts translated with an
 /// older version are re-downloaded and retranslated.
-pub const TRANSLATOR_VERSION: u32 = 33;
+pub const TRANSLATOR_VERSION: u32 = 34;
 
 const LAYOUT_CSS: &str = r##"
 body { margin: 0; background-repeat: no-repeat; overflow: hidden; }
@@ -102,6 +102,7 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
   window.arexiboGui.jsLayoutInit(window.arexibo.id,
                                  window.arexibo.width, window.arexibo.height,
                                  JSON.stringify(window.arexibo.region_geometry || []));
+  window.arexibo.flushWidgetStats();
 });
 
 window.arexibo = {
@@ -112,6 +113,23 @@ window.arexibo = {
   regions_total: 0,
   triggers: {},
   regions: {},
+
+  // Proof of Play of the widgets: told to Rust when a widget starts or
+  // stops showing (see CB_WIDGET_STAT). Only for the widgets with stats
+  // enabled (`statWidgets`, written at the end of the page); events
+  // before the channel is open wait for it.
+  statWidgets: [],
+  pendingWidgetStats: [],
+  widgetStat: function(mid, start) {
+    if (!this.statWidgets.includes(mid)) return;
+    if (window.arexiboGui) window.arexiboGui.jsWidgetStat(this.id, mid, start);
+    else this.pendingWidgetStats.push([mid, start]);
+  },
+  flushWidgetStats: function() {
+    for (const [mid, start] of this.pendingWidgetStats)
+      window.arexiboGui.jsWidgetStat(this.id, mid, start);
+    this.pendingWidgetStats = [];
+  },
   // Overwritten immediately below, in this exact same synchronous
   // script block, right alongside id/width/height -- an array of
   // {x, y, w, h} rectangles, one per region that actually has at
@@ -621,6 +639,9 @@ pub struct Translator<'a> {
     /// of Play (see stats.rs/mainloop.rs) to decide whether a "layout"
     /// stat record should be recorded at all for this layout.
     enable_stat: bool,
+    /// The widgets whose own `enableStat` is on: the page reports only
+    /// those (see `widgetStat` in SCRIPT).
+    stat_widgets: Vec<i32>,
     /// `Some` only if Adspace Exchange is enabled (see
     /// `resource::Cache::adspace_enabled`) -- used to resolve `ssp`
     /// widgets synchronously during translation (see `write_media`'s
@@ -677,7 +698,7 @@ impl<'a> Translator<'a> {
                   widget_regions: HashMap::new(), drawer_widgets: std::collections::HashSet::new(),
                   swap_target_regions: std::collections::HashSet::new(),
                   region_geom: HashMap::new(),
-                  enable_stat: true, adspace, html_port, display: None,
+                  enable_stat: true, stat_widgets: Vec::new(), adspace, html_port, display: None,
                   sync_keys: std::collections::HashSet::new(),
                   region_sync_key: HashMap::new(), vw_video_urls: HashMap::new(),
                   vw_regions: Vec::new() })
@@ -966,6 +987,11 @@ impl<'a> Translator<'a> {
 
     fn write_footer(&mut self) -> Result<()> {
         self.write_video_wall_runtime()?;
+        // the widgets that report their stats (see `widgetStat`)
+        self.stat_widgets.sort_unstable();
+        let ids: Vec<String> = self.stat_widgets.iter().map(|id| id.to_string()).collect();
+        writeln!(self.out, "<script type='text/javascript'>window.arexibo.statWidgets = [{}];</script>",
+                 ids.join(","))?;
         // start all regions' first item
         writeln!(self.out, "<script type='text/javascript'>\n\
                             window.addEventListener('load', function() {{")?;
@@ -1168,6 +1194,7 @@ impl<'a> Translator<'a> {
         // network-reachable remote debugging.
         writeln!(self.out, "        if (window.arexiboDebug) console.log(\
                                     'arexibo-show: widget {mid}');")?;
+        writeln!(self.out, "        window.arexibo.widgetStat({mid}, 1);")?;
         let el = format!("document.getElementById('m{mid}')");
         match trans_in {
             Trans::Fade => {
@@ -1206,6 +1233,7 @@ impl<'a> Translator<'a> {
         }
         writeln!(self.out, "        {add_start}")?;
         writeln!(self.out, "      }}, function() {{")?;
+        writeln!(self.out, "        window.arexibo.widgetStat({mid}, 0);")?;
         // if only one item is present, don't need to hide the others
         if always_hide {
             match trans_out {
@@ -1373,9 +1401,18 @@ impl<'a> Translator<'a> {
         Ok(())
     }
 
+    /// Defaults to enabled if absent, as the layout's own attribute does.
+    fn note_widget_stat(&mut self, mid: i32, media: &Element) {
+        let enabled = media.get_attr("enableStat").map(|s| s != "0").unwrap_or(true);
+        if enabled && !self.stat_widgets.contains(&mid) {
+            self.stat_widgets.push(mid);
+        }
+    }
+
     fn write_media(&mut self, rid: i32, [x, y, w, h]: [i32; 4], (abs_x, abs_y): (i32, i32),
                    media: &Element, region_fallback: ((Trans, u32), (Trans, u32))) -> Result<Option<MediaInfo>> {
         let mid = media.parse_attr("id")?;
+        self.note_widget_stat(mid, media);
         let opts = media.find("options").context("no options")?;
         let mut duration = format!(
             "() => {}", media.def_attr("duration", "").parse::<i32>().unwrap_or(10));
@@ -2129,6 +2166,67 @@ mod image_alignment_tests {
         let mut html = String::new();
         fs::File::open(html_path).unwrap().read_to_string(&mut html).unwrap();
         html
+    }
+
+    fn widgets_xlf() -> String {
+        r##"<layout width="1080" height="1920" bgcolor="#dfe3e8" schemaVersion="4">
+            <region id="1" width="512" height="560" top="76" left="20" zindex="1"><options/>
+              <media id="9" type="image" render="native" duration="10" fileId="1" enableStat="1">
+                <options><uri>1.png</uri></options><raw/></media>
+              <media id="10" type="image" render="native" duration="10" fileId="2" enableStat="0">
+                <options><uri>2.png</uri></options><raw/></media>
+              <media id="11" type="image" render="native" duration="10" fileId="3">
+                <options><uri>3.png</uri></options><raw/></media></region></layout>"##.to_string()
+    }
+
+    #[test]
+    fn the_page_lists_the_widgets_with_stats_enabled() {
+        let html = translate_xlf(&widgets_xlf());
+        assert!(html.contains("window.arexibo.statWidgets = [9,11];"),
+                "9 is on, 10 is off, 11 has no attribute (on, as for a layout): {html}");
+    }
+
+    #[test]
+    fn a_layout_with_no_widget_has_an_empty_list() {
+        let html = translate_xlf(r##"<layout width="1080" height="1920" bgcolor="#ffffff" schemaVersion="4"></layout>"##);
+        assert!(html.contains("window.arexibo.statWidgets = [];"));
+    }
+
+    #[test]
+    fn every_widget_tells_when_it_starts_and_when_it_stops() {
+        let html = translate_xlf(&widgets_xlf());
+        for id in [9, 10, 11] {
+            let start = html.find(&format!("window.arexibo.widgetStat({id}, 1);")).unwrap_or_else(|| panic!("start {id}"));
+            let stop = html.find(&format!("window.arexibo.widgetStat({id}, 0);")).unwrap_or_else(|| panic!("stop {id}"));
+            assert!(start < stop, "{id}: the start comes with the show function, the stop with the hide one");
+        }
+    }
+
+    #[test]
+    fn the_stop_is_reported_before_any_early_return_of_the_hide_function() {
+        // a single widget in a region has no hide logic of its own
+        let html = translate_xlf(&image_xlf(""));
+        let stop = html.find("window.arexibo.widgetStat(9, 0);").expect("stop");
+        let hide_start = html[..stop].rfind("function() {").expect("a function");
+        assert!(stop - hide_start < 80, "the first statement of the hide function");
+    }
+
+    #[test]
+    fn events_wait_for_the_channel_and_only_widgets_on_the_list_are_sent() {
+        let html = translate_xlf(&widgets_xlf());
+        assert!(html.contains("if (!this.statWidgets.includes(mid)) return;"));
+        assert!(html.contains("jsWidgetStat(this.id, mid, start)"));
+        assert!(html.contains("else this.pendingWidgetStats.push([mid, start]);"));
+        assert!(html.contains("region_geometry || []));\n  window.arexibo.flushWidgetStats();\n});"),
+                "queued events are sent once the channel is up, after jsLayoutInit");
+    }
+
+    #[test]
+    fn the_list_is_written_before_the_regions_start() {
+        let html = translate_xlf(&widgets_xlf());
+        let list = html.find("window.arexibo.statWidgets = [").unwrap();
+        let start = html.find("window.arexibo.region_switch(1, 0, true);").unwrap();
+        assert!(list < start);
     }
 
     /// One image region, options written the way CMS 4.x does.

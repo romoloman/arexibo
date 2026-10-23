@@ -41,6 +41,17 @@ impl CriteriaStore {
         self.values.retain(|_, (_, expires)| *expires > now);
     }
 
+    /// The metrics in force, as (metric, value), sorted by metric.
+    pub fn active(&self) -> Vec<(String, String)> {
+        let now = OffsetDateTime::now_utc();
+        let mut list: Vec<(String, String)> = self.values.iter()
+            .filter(|(_, (_, expires))| *expires > now)
+            .map(|(metric, (value, _))| (metric.clone(), value.clone()))
+            .collect();
+        list.sort();
+        list
+    }
+
     /// Current value of a metric, if set and not (yet pruned as)
     /// expired.
     pub fn get(&self, metric: &str) -> Option<&str> {
@@ -136,5 +147,25 @@ mod tests {
     #[test]
     fn unknown_condition_fails_closed() {
         assert!(!criterion_matches("bogus", "1", "1"));
+    }
+}
+
+#[cfg(test)]
+mod active_tests {
+    use super::*;
+
+    #[test]
+    fn the_active_metrics_are_listed_sorted_without_the_expired() {
+        let mut store = CriteriaStore::default();
+        store.set("weather".into(), "rain".into(), 300);
+        store.set("meteo_temp".into(), "21".into(), 300);
+        store.set("gone".into(), "x".into(), 0);
+        assert_eq!(store.active(), [("meteo_temp".to_string(), "21".to_string()),
+                                    ("weather".to_string(), "rain".to_string())]);
+    }
+
+    #[test]
+    fn nothing_set_nothing_active() {
+        assert!(CriteriaStore::default().active().is_empty());
     }
 }

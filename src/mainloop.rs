@@ -16,7 +16,7 @@ use crate::{logger, schedule, server, syncgroup, util, videowall, xmds, xmr};
 use crate::resource::{Cache, FetchedContent, ReqFile};
 use crate::faults;
 use crate::schedule::{Schedule, CycleState};
-use crate::stats::{StatCollector, LayoutStat};
+use crate::stats::{Aggregation, Play, StatCollector, StatKind};
 use crate::criteria::CriteriaStore;
 use crate::command::Command;
 use crate::util::percent_decode;
@@ -146,6 +146,9 @@ pub enum Kill {
 /// Messages received from the GUI thread
 pub enum FromGui {
     Showing(i64),
+    /// A widget of the main view started or stopped showing (CB_WIDGET_STAT),
+    /// at `at`: for Proof of Play.
+    Widget { layout: i64, widget: i64, start: bool, at: OffsetDateTime },
     /// Sent when the currently-shown layout completes one natural
     /// cycle of its own regions/widgets (CB_LAYOUT_NEXT, matching
     /// jsLayoutDone) -- distinct from `Showing`, which fires when a
@@ -367,6 +370,8 @@ pub struct Handler {
     /// Proof of Play accumulator (layout-level records only, see
     /// stats.rs). Flushed to the CMS at the end of every collection.
     stats: StatCollector,
+    /// Widget plays in progress: (layout, widget) -> (scheduleid, start).
+    open_widgets: std::collections::HashMap<(i64, i64), (i64, OffsetDateTime)>,
     /// Player fault reports (see faults.rs) -- currently only recorded
     /// for layout translation/download failures. Flushed alongside
     /// `stats` at the end of every collection.
@@ -374,8 +379,8 @@ pub struct Handler {
     /// The layout currently being timed for Proof of Play purposes:
     /// (layout id, scheduleid, start time) -- `None` before the very
     /// first `FromGui::Showing` arrives. Closed out into a `LayoutStat`
-    /// (see `record_layout_shown`) whenever a *different* layout starts
-    /// showing.
+    /// (see `record_layout_shown`) when a *different* layout starts
+    /// showing, or (see `close_layout_play`) when it finishes its cycle.
     layout_playing_since: Option<(i64, i64, OffsetDateTime)>,
     /// Runtime state for Schedule Criteria (XMR `criteriaUpdate`) -- see
     /// criteria.rs. Deliberately not persisted across restarts.
@@ -421,6 +426,10 @@ pub struct Handler {
     xmr_in_use: Option<XmrTarget>,
     /// A different target seen at the last registration, to be confirmed.
     xmr_change_pending: Option<XmrTarget>,
+    /// How many dropped XMR messages were already reported to the CMS.
+    xmr_drops_reported: u64,
+    /// A fault for them is open at the CMS.
+    xmr_fault_open: bool,
     /// Unlike `xmr_retry_key` (only `Some` while a retry is actually
     /// pending), this is *always* populated -- kept specifically so
     /// XMR can be restarted later even after it's already running
@@ -466,6 +475,9 @@ pub struct Handler {
     /// Edge-triggered: fires once when screen_shot_requested goes
     /// false->true, not on every cycle it stays true.
     screenshot_requested_seen: bool,
+    /// A capture the CMS asked for through its settings, waiting for the
+    /// run loop to schedule it.
+    screenshot_wanted: bool,
     /// Timer for hiding/advancing the currently-shown overlay. Moved
     /// here (was local to `run()`) since `schedule_check()` needs to
     /// (re)schedule it too, not just XMR's `overlayLayout` handling.
@@ -539,6 +551,72 @@ const MAX_CONSECUTIVE_CONNECTION_FAILURES: u32 = 3;
 /// How soon to register again once the CMS reports different XMR
 /// connection settings, to confirm them before restarting.
 const XMR_CHANGE_CONFIRM_DELAY: Duration = Duration::from_secs(60);
+
+/// Set when the first collection begins.
+static FIRST_COLLECT_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the main loop has to begin its first collection, which it
+/// does at once, before the player says it did not.
+const STARTUP_WATCHDOG: Duration = Duration::from_secs(90);
+
+/// The exit status of the player when it gives up for that reason.
+const STARTUP_STALLED_EXIT_CODE: i32 = 70;
+
+/// What each thread of the process is doing, as (tid, name, kernel wait
+/// point), from a /proc directory: tells a wait on a lock from a wait on
+/// the network or a file.
+fn thread_snapshot(proc: &std::path::Path) -> String {
+    let mut threads: Vec<(u32, String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(proc.join("task")) {
+        for entry in entries.flatten() {
+            let Ok(tid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+            let read = |name: &str| std::fs::read_to_string(entry.path().join(name))
+                .map(|text| text.trim().to_string()).unwrap_or_else(|_| "?".to_string());
+            threads.push((tid, read("comm"), read("wchan")));
+        }
+    }
+    threads.sort();
+    threads.iter().map(|(tid, comm, wchan)| format!("  {tid} {comm} {wchan}")).collect::<Vec<_>>().join("\n")
+}
+
+/// If the main loop has not begun its first collection after
+/// `STARTUP_WATCHDOG`, logs it with what the threads are waiting on -- it was
+/// seen staying silent for minutes at boot -- and exits, for systemd
+/// (`Restart=always`) to start the player again.
+fn startup_watchdog() {
+    let _ = std::thread::Builder::new().name("startup-watchdog".into()).spawn(|| {
+        std::thread::sleep(STARTUP_WATCHDOG);
+        if !FIRST_COLLECT_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
+            log::error!("the main loop has not begun its first collection {}s after it started; \
+                         threads (tid, name, waiting in):\n{}",
+                        STARTUP_WATCHDOG.as_secs(), thread_snapshot(std::path::Path::new("/proc/self")));
+            log::error!("exiting, for systemd to start the player again");
+            // _exit, not exit: Qt's teardown is for the main thread and can
+            // wait forever when run from this one.
+            unsafe { nix::libc::_exit(STARTUP_STALLED_EXIT_CODE) };
+        }
+    });
+}
+
+/// The player fault for dropped XMR messages is cleared at the CMS after
+/// this long without any more.
+const XMR_FAULT_QUIET: Duration = Duration::from_secs(3600);
+
+/// A screenshot the CMS asked for while this player was off is taken this
+/// long after the start: right after it the window has drawn nothing.
+const STARTUP_SCREENSHOT_DELAY: Duration = Duration::from_secs(60);
+
+/// When the first screenshot is due: the pending request of the CMS, else
+/// the first of the periodic ones.
+fn first_screenshot_delay(wanted: bool, interval_minutes: u64) -> Option<Duration> {
+    if wanted {
+        Some(STARTUP_SCREENSHOT_DELAY)
+    } else if interval_minutes != 0 {
+        Some(Duration::from_secs(interval_minutes * 60))
+    } else {
+        None
+    }
+}
 
 /// What the XMR connection is made with: the settings `xmr::start` reads
 /// for the transport it picks.
@@ -844,7 +922,8 @@ impl Handler {
                                  envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
                                  deferred_layout_file: None,
                                  override_layout: None, overlay_layout: None,
-                                 stats: StatCollector::default(),
+                                 stats: StatCollector::load(envdir.join("stats.json"), &cms.address),
+                                 open_widgets: Default::default(),
                                  faults: faults::FaultCollector::default(),
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
@@ -871,8 +950,11 @@ impl Handler {
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
+                                 screenshot_wanted: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key, xmr_in_use, xmr_change_pending: None,
+ xmr_drops_reported: 0,
+ xmr_fault_open: false,
                                  cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
@@ -911,7 +993,8 @@ impl Handler {
                                  envdir: envdir.into(), current_layout: 0, force_reload_after_collect: false, last_collect_had_failures: false,
                                  deferred_layout_file: None,
                                  override_layout: None, overlay_layout: None,
-                                 stats: StatCollector::default(),
+                                 stats: StatCollector::load(envdir.join("stats.json"), &cms.address),
+                                 open_widgets: Default::default(),
                                  faults: faults::FaultCollector::default(),
                                  layout_playing_since: None,
                                  criteria: CriteriaStore::default(), cycle_state: CycleState::default(),
@@ -938,9 +1021,12 @@ impl Handler {
                                  weather_unsupported: false,
                                  process_timezone_applied: None,
                                  screenshot_requested_seen: false,
+                                 screenshot_wanted: false,
                                  debug_override, xmr_privkey: privkey.clone(),
                                  xmr_retry_key: Some(privkey),
                                  xmr_in_use: None, xmr_change_pending: None,
+ xmr_drops_reported: 0,
+ xmr_fault_open: false,
                                  cms: cms.clone(), no_verify };
             slf.sync_splash_state();
             slf.update_settings()?;
@@ -1002,12 +1088,13 @@ impl Handler {
 
     /// Run the main collect loop.
     pub fn run(mut self) -> Result<()> {
+        log::info!("main loop started");
+        crate::splashinfo::set_disk_path(self.cache.dir().to_path_buf());
+        startup_watchdog();
         let mut collect = after(Duration::from_secs(0));  // do first collect immediately
-        let mut screenshot = if self.settings.screenshot_interval != 0 {
-            after(Duration::from_secs(self.settings.screenshot_interval * 60))
-        } else {
-            never()
-        };
+        let mut screenshot = first_screenshot_delay(
+            std::mem::take(&mut self.screenshot_wanted), self.settings.screenshot_interval,
+        ).map_or_else(never, after);
         let schedule_check = tick(Duration::from_secs(60));
         // 5s, comfortably under commands_due's own 10s window (see its
         // own doc comment) -- guarantees at least one check happens
@@ -1033,7 +1120,11 @@ impl Handler {
                         if e.root_cause().downcast_ref::<RestartRequired>().is_some() {
                             return Err(e);
                         }
+                        crate::splashinfo::collect_finished(false);
                         log::error!("during collect: {e:#}");
+                    }
+                    if std::mem::take(&mut self.screenshot_wanted) {
+                        screenshot = after(Duration::from_secs(0));
                     }
                     // A fresh collection may have discovered new data
                     // widgets (v7 GetData polling) whose own interval
@@ -1494,6 +1585,9 @@ impl Handler {
                             log::error!("submitting screenshot: {e:#}");
                         }
                     }
+                    Ok(FromGui::Widget { layout, widget, start, at }) => {
+                        self.widget_event(layout, widget, start, at);
+                    }
                     Ok(FromGui::Showing(layout)) => {
                         self.current_layout = layout;
                         crate::info::set_current_layout(layout);
@@ -1587,6 +1681,7 @@ impl Handler {
                                 };
                                 log::info!("layout {} completed its own natural cycle -- \
                                             reloading it fresh ({reason:?})", available[0]);
+                                self.close_layout_play(available[0]);
                                 self.to_gui.send(ToGui::ForceReloadLayout(
                                     available[0], reason)).unwrap();
                             } else if available != self.layouts {
@@ -1737,6 +1832,8 @@ impl Handler {
 
     /// Do a single collection cycle.
     fn collect_once(&mut self) -> Result<()> {
+        FIRST_COLLECT_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::splashinfo::collect_started();
         log::info!("doing collection");
 
         // A blank placeholder address (Register via Code/manual entry
@@ -2053,6 +2150,7 @@ impl Handler {
         self.send_status_update();
 
         self.flush_stats();
+        self.report_xmr_drops(xmr::last_drop(), std::time::Instant::now());
         self.flush_faults();
 
         // See `first_collection_done`'s own doc comment for the full
@@ -2075,6 +2173,7 @@ impl Handler {
             self.update_sync_group();
         }
 
+        crate::splashinfo::collect_finished(true);
         log::info!("collection successful");
         Ok(())
     }
@@ -2269,25 +2368,102 @@ impl Handler {
         result
     }
 
-    /// Proof of Play (layout-level, see stats.rs): close out the
-    /// previously-playing layout's timing session (if its `enableStat`
-    /// XLF attribute allows it) and start a new one for the layout that
+    /// The aggregation of the Proof of Play records: the CMS's
+    /// `aggregationLevel` (only offered to its Android and Windows
+    /// profiles) unless `AREXIBO_STATS_AGGREGATION` says otherwise.
+    fn aggregation_level(&self) -> Aggregation {
+        if !cfg!(test) {
+            if let Ok(level) = std::env::var("AREXIBO_STATS_AGGREGATION") {
+                return Aggregation::parse(&level);
+            }
+        }
+        Aggregation::parse(&self.settings.aggregation_level)
+    }
+
+    /// Proof of Play (see stats.rs): close out the previously-playing
+    /// layout's timing session and start a new one for the layout that
     /// just started showing. Called from `FromGui::Showing`, which only
-    /// fires for the *main* view (the overlay view's own layout inits are
-    /// deliberately not wired to it -- see CB_OVERLAY_LAYOUT_INIT in
-    /// gui.rs -- so overlay plays are intentionally NOT counted here;
-    /// they aren't part of the normal schedule the CMS is asking about).
+    /// fires for the *main* view (overlay plays are intentionally not
+    /// counted). The same layout showing again is not a new play here (a
+    /// reload after a stuck load shows it again); a layout that restarts
+    /// after finishing its own cycle is closed by `close_layout_play`.
+    /// The widgets still open belonged to the page that is gone.
     fn record_layout_shown(&mut self, new_layout: i64) {
         let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        self.close_open_widgets(now);
         if let Some((prev_id, prev_sid, start)) = self.layout_playing_since.take() {
-            if prev_id != new_layout && self.cache.layout_enable_stat(prev_id) {
-                self.stats.record_layout(LayoutStat {
-                    fromdt: start, todt: now, layoutid: prev_id, scheduleid: prev_sid,
-                });
+            if prev_id != new_layout {
+                self.record_play(prev_id, prev_sid, start, now);
             }
         }
         let sid = self.schedule.scheduleid_for(new_layout);
         self.layout_playing_since = Some((new_layout, sid, now));
+    }
+
+    /// `layout` finished its own cycle and starts over: that was a play of
+    /// its own, and the next one begins now.
+    fn close_layout_play(&mut self, layout: i64) {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        if let Some((id, sid, start)) = self.layout_playing_since {
+            if id == layout {
+                self.close_open_widgets(now);
+                self.record_play(id, sid, start, now);
+                self.layout_playing_since = Some((id, sid, now));
+            }
+        }
+    }
+
+    /// Records one play, unless the CMS has stats off for this display or
+    /// for the layout.
+    fn record_play(&mut self, layout: i64, scheduleid: i64, from: OffsetDateTime, to: OffsetDateTime) {
+        if layout == 0 || !self.settings.stats_enabled || !self.cache.layout_enable_stat(layout) {
+            return;
+        }
+        let level = self.aggregation_level();
+        self.stats.record(Play {
+            kind: StatKind::Layout, layoutid: layout, scheduleid, widgetid: 0, from, to,
+            criteria: crate::stats::criteria_tag(&self.criteria.active()),
+        }, level);
+    }
+
+    /// A widget of the main view started (`start`) or stopped showing.
+    /// A start for a widget that is already open closes that play first:
+    /// the region showed it again without hiding it (a single widget that
+    /// loops has no hide logic). Events of another layout (an overlay, or
+    /// a page that is already gone) are not for the play in progress.
+    fn widget_event(&mut self, layout: i64, widget: i64, start: bool, at: OffsetDateTime) {
+        let Some((current, scheduleid, _)) = self.layout_playing_since else { return };
+        if current != layout {
+            return;
+        }
+        if let Some((sid, from)) = self.open_widgets.remove(&(layout, widget)) {
+            self.record_widget_play(layout, widget, sid, from, at);
+        }
+        if start {
+            self.open_widgets.insert((layout, widget), (scheduleid, at));
+        }
+    }
+
+    /// The widgets still showing stop with their page.
+    fn close_open_widgets(&mut self, at: OffsetDateTime) {
+        let open: Vec<_> = self.open_widgets.drain().collect();
+        for ((layout, widget), (sid, from)) in open {
+            self.record_widget_play(layout, widget, sid, from, at);
+        }
+    }
+
+    /// The widget's own `enableStat` was already applied by the page,
+    /// which reports only the widgets that have it on.
+    fn record_widget_play(&mut self, layout: i64, widget: i64, scheduleid: i64,
+                          from: OffsetDateTime, to: OffsetDateTime) {
+        if !self.settings.stats_enabled || !self.cache.layout_enable_stat(layout) {
+            return;
+        }
+        let level = self.aggregation_level();
+        self.stats.record(Play {
+            kind: StatKind::Media, layoutid: layout, scheduleid, widgetid: widget, from, to,
+            criteria: crate::stats::criteria_tag(&self.criteria.active()),
+        }, level);
     }
 
     /// Send a NotifyStatus update to the CMS with the current layout
@@ -2320,6 +2496,7 @@ impl Handler {
         // comment); an empty result here just means the field gets
         // omitted below, not sent as an empty string.
         let local_ips = util::get_local_ips();
+        let (screen_width, screen_height) = crate::info::screen_size();
         let status = xmds::Status {
             currentLayoutId: self.current_layout,
             availableSpace: avail,
@@ -2328,6 +2505,8 @@ impl Handler {
             deviceName: &self.settings.display_name,
             timeZone: &reported_tz,
             lanIpAddress: local_ips.first().map(String::as_str),
+            width: (screen_width > 0).then_some(screen_width),
+            height: (screen_height > 0).then_some(screen_height),
         };
         if let Err(e) = self.xmds.notify_status(&status) {
             log::error!("sending status update: {e:#}");
@@ -2340,13 +2519,22 @@ impl Handler {
     /// for a first-cut implementation; records naturally accumulate
     /// between collections and get sent in a batch.
     fn flush_stats(&mut self) {
+        self.stats.flush_dirty();
         if self.stats.is_empty() {
             return;
         }
-        let (xml, recs) = self.stats.build_and_clear();
-        if let Err(e) = self.xmds.submit_stats(&xml) {
-            log::error!("submitting Proof of Play stats: {e:#}");
-            self.stats.requeue(recs);
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let level = self.aggregation_level();
+        let (xml, recs) = self.stats.take_ready(now, level);
+        if recs.is_empty() {
+            return;
+        }
+        match self.xmds.submit_stats(&xml) {
+            Ok(()) => self.stats.confirm_sent(),
+            Err(e) => {
+                log::error!("submitting Proof of Play stats: {e:#}");
+                self.stats.requeue(recs);
+            }
         }
     }
 
@@ -3380,8 +3568,8 @@ impl Handler {
         if self.settings.screen_shot_requested {
             if !self.screenshot_requested_seen {
                 log::info!("CMS has a pending screenshot request (screenShotRequested) -- \
-                            likely lost while offline/disconnected, fulfilling it now");
-                self.to_gui.send(ToGui::Screenshot).unwrap();
+                            likely lost while offline/disconnected, taking it a minute after the start");
+                self.screenshot_wanted = true;
                 self.screenshot_requested_seen = true;
             }
         } else {
@@ -3662,6 +3850,39 @@ fn test_video_sync_receivers() -> server::VideoSyncReceivers {
 }
 
 impl Handler {
+    /// Tells the CMS, as a player fault (an alert for the display there),
+    /// that XMR messages are being dropped as expired, and clears it after
+    /// `XMR_FAULT_QUIET` without more. The CMS replaces what it has for the
+    /// display with each report, and ends the alert of a code that is no
+    /// longer in it.
+    fn report_xmr_drops(&mut self, drops: Option<xmr::DropSummary>, now: std::time::Instant) {
+        let Some(drops) = drops else { return };
+        if drops.total != self.xmr_drops_reported {
+            self.xmr_drops_reported = drops.total;
+            self.xmr_fault_open = true;
+            self.faults.record(faults::Fault::new(faults::FAULT_CODE_XMR_MESSAGE_EXPIRED,
+                                                  drops.fault_reason()));
+        } else if self.xmr_fault_open && now.duration_since(drops.last) >= XMR_FAULT_QUIET {
+            self.clear_faults_at_the_cms();
+        }
+    }
+
+    /// An empty list: the CMS closes its Player Fault alert (and any other
+    /// fault it holds for this display).
+    fn clear_faults_at_the_cms(&mut self) {
+        if !xmds::xmds_supports_v6_v7_methods() {
+            self.xmr_fault_open = false;
+            return;
+        }
+        match self.xmds.report_faults("[]") {
+            Ok(()) => {
+                log::info!("no more XMR messages dropped as expired -- player faults cleared at the CMS");
+                self.xmr_fault_open = false;
+            }
+            Err(e) => log::error!("clearing the player faults at the CMS (will try again): {e:#}"),
+        }
+    }
+
     /// Starts, restarts and stops the data connectors the schedule wants right
     /// now (a connector whose script is not downloaded and verified waits).
     /// Run on every schedule check: once a minute, and on any schedule or
@@ -6868,39 +7089,54 @@ mod screenshot_requested_tests {
     }
 
     #[test]
-    fn fulfills_a_pending_request_exactly_once_while_the_flag_stays_true() {
+    fn asks_for_a_pending_request_exactly_once_while_the_flag_stays_true() {
         let port = start_mock_ready();
         let cms = test_cms_settings(port);
         let envdir = test_envdir();
-        let (togui_tx, togui_rx) = crossbeam_channel::bounded(10);
+        let (togui_tx, togui_rx) = crossbeam_channel::unbounded();
         let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
         let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
         let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
         let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
-
         let mut handler = Handler::new(&cms, false, &envdir, true, true, false,
                                         togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
                                     std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
         let _ = count_screenshot_messages(&togui_rx);
+        handler.screenshot_wanted = false;
 
         handler.settings.screen_shot_requested = true;
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 1);
+        assert!(std::mem::take(&mut handler.screenshot_wanted));
+        assert_eq!(count_screenshot_messages(&togui_rx), 0,
+                   "the run loop decides when to take it: nothing goes to the GUI from here");
 
-        // Flag stays true for a second cycle -- must not fire again.
+        // Flag stays true for a second cycle -- must not ask again.
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 0);
+        assert!(!handler.screenshot_wanted);
 
         // CMS resets the flag once it receives our submission.
         handler.settings.screen_shot_requested = false;
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 0);
+        assert!(!handler.screenshot_wanted);
 
-        // A genuinely new request later must fire again.
+        // A genuinely new request later must ask again.
         handler.settings.screen_shot_requested = true;
         handler.update_settings().unwrap();
-        assert_eq!(count_screenshot_messages(&togui_rx), 1,
-                   "a new request (flag re-transitioning false -> true) must fire again");
+        assert!(handler.screenshot_wanted,
+                "a new request (flag re-transitioning false -> true) must ask again");
+    }
+
+    #[test]
+    fn a_pending_request_is_taken_a_minute_after_the_start() {
+        assert_eq!(first_screenshot_delay(true, 0), Some(Duration::from_secs(60)));
+        assert_eq!(first_screenshot_delay(true, 5), Some(Duration::from_secs(60)),
+                   "the pending request does not wait for the periodic one");
+    }
+
+    #[test]
+    fn without_a_pending_request_the_first_screenshot_is_the_periodic_one() {
+        assert_eq!(first_screenshot_delay(false, 5), Some(Duration::from_secs(300)));
+        assert_eq!(first_screenshot_delay(false, 0), None, "none asked for, none scheduled");
     }
 }
 
@@ -7691,6 +7927,436 @@ mod flush_faults_tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A CMS that keeps the body of each ReportFaults and answers it with
+    /// a valid response, or (`works` false) with something unreadable.
+    fn start_capturing_mock(works: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_thread = captured.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                if body.contains("ReportFaults") {
+                    for_thread.lock().unwrap().push(body);
+                }
+                let response = if works {
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><ReportFaultsResponse><success>true</success></ReportFaultsResponse></soap:Body>
+</soap:Envelope>"#
+                } else {
+                    "this is not a SOAP answer"
+                };
+                let _ = request.respond(tiny_http::Response::from_string(response));
+            }
+        });
+        (port, captured)
+    }
+
+    fn handler_for(port: u16) -> (Handler, crossbeam_channel::Receiver<ToGui>) {
+        let cms = test_cms_settings(port);
+        let envdir = test_envdir();
+        let (togui_tx, togui_rx) = crossbeam_channel::unbounded();
+        let (_fromgui_tx, fromgui_rx) = crossbeam_channel::bounded(5);
+        let (_duration_tx, duration_rx) = crossbeam_channel::bounded(5);
+        let (_trigger_tx, trigger_rx) = crossbeam_channel::bounded(5);
+        let (_fault_tx, fault_rx) = crossbeam_channel::bounded(5);
+        let handler = Handler::new(&cms, false, &envdir, true, true, false,
+                                        togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx, test_video_sync_receivers(),
+                                    std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading))).unwrap();
+        (handler, togui_rx)
+    }
+
+    fn drops(total: u64, last: std::time::Instant) -> xmr::DropSummary {
+        xmr::DropSummary { total, action: "screenShot".into(), age_secs: 7199, last }
+    }
+
+    fn pending(handler: &mut Handler) -> Vec<(i32, String)> {
+        let (_json, faults) = handler.faults.build_and_clear();
+        faults.into_iter().map(|f| (f.code, f.reason)).collect()
+    }
+
+    #[test]
+    fn new_dropped_xmr_messages_become_a_fault_with_its_own_code() {
+        let (port, _seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let now = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, now)), now);
+        let faults = pending(&mut handler);
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].0, faults::FAULT_CODE_XMR_MESSAGE_EXPIRED);
+        assert!(faults[0].1.contains("3 so far") && faults[0].1.contains("screenShot"), "{}", faults[0].1);
+        assert!(handler.xmr_fault_open);
+    }
+
+    #[test]
+    fn the_same_drops_are_not_reported_twice_but_new_ones_are() {
+        let (port, _seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let now = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, now)), now);
+        assert_eq!(pending(&mut handler).len(), 1);
+        handler.report_xmr_drops(Some(drops(3, now)), now + Duration::from_secs(600));
+        assert!(pending(&mut handler).is_empty(), "nothing new since the last collection");
+        handler.report_xmr_drops(Some(drops(5, now + Duration::from_secs(700))), now + Duration::from_secs(900));
+        let faults = pending(&mut handler);
+        assert_eq!(faults.len(), 1);
+        assert!(faults[0].1.contains("5 so far"));
+    }
+
+    #[test]
+    fn nothing_dropped_nothing_reported() {
+        let (port, seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.report_xmr_drops(None, std::time::Instant::now());
+        assert!(pending(&mut handler).is_empty());
+        assert!(!handler.xmr_fault_open);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_hour_without_drops_clears_the_fault_at_the_cms_with_an_empty_list() {
+        let (port, seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let last = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, last)), last);
+        let _ = pending(&mut handler);
+        assert!(handler.xmr_fault_open);
+
+        handler.report_xmr_drops(Some(drops(3, last)), last + XMR_FAULT_QUIET - Duration::from_secs(1));
+        assert!(seen.lock().unwrap().is_empty(), "not yet: still within the hour");
+        assert!(handler.xmr_fault_open);
+
+        handler.report_xmr_drops(Some(drops(3, last)), last + XMR_FAULT_QUIET);
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one ReportFaults");
+        assert!(sent[0].contains("<![CDATA[[]]]>"), "an empty list: {}", sent[0]);
+        assert!(!handler.xmr_fault_open);
+
+        handler.report_xmr_drops(Some(drops(3, last)), last + XMR_FAULT_QUIET * 2);
+        assert_eq!(seen.lock().unwrap().len(), 1, "cleared once, not again");
+    }
+
+    #[test]
+    fn a_clearing_that_fails_is_tried_again_at_the_next_collection() {
+        let (port, seen) = start_capturing_mock(false);
+        let (mut handler, _rx) = handler_for(port);
+        let last = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, last)), last);
+        let _ = pending(&mut handler);
+        let later = last + XMR_FAULT_QUIET;
+        handler.report_xmr_drops(Some(drops(3, last)), later);
+        assert!(handler.xmr_fault_open, "the CMS did not take it: still open here");
+        handler.report_xmr_drops(Some(drops(3, last)), later + Duration::from_secs(600));
+        assert_eq!(seen.lock().unwrap().len(), 2, "tried again");
+    }
+
+    #[test]
+    fn new_drops_after_a_clearing_open_a_new_fault() {
+        let (port, _seen) = start_capturing_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        let t0 = std::time::Instant::now();
+        handler.report_xmr_drops(Some(drops(3, t0)), t0);
+        let _ = pending(&mut handler);
+        handler.report_xmr_drops(Some(drops(3, t0)), t0 + XMR_FAULT_QUIET);
+        assert!(!handler.xmr_fault_open);
+        let t1 = t0 + XMR_FAULT_QUIET * 2;
+        handler.report_xmr_drops(Some(drops(4, t1)), t1);
+        assert_eq!(pending(&mut handler).len(), 1);
+        assert!(handler.xmr_fault_open);
+    }
+
+    /// A CMS that keeps the body of each SubmitStats, and answers it or
+    /// (`works` false) with something unreadable.
+    fn start_stats_mock(works: bool) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let for_thread = captured.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                if body.contains("SubmitStats") {
+                    for_thread.lock().unwrap().push(body);
+                }
+                let response = if works {
+                    r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+<soap:Body><SubmitStatsResponse><success>true</success></SubmitStatsResponse></soap:Body>
+</soap:Envelope>"#
+                } else {
+                    "this is not a SOAP answer"
+                };
+                let _ = request.respond(tiny_http::Response::from_string(response));
+            }
+        });
+        (port, captured)
+    }
+
+    /// The plays recorded so far, as (layout, criteria).
+    fn plays(handler: &mut Handler) -> Vec<(i64, String)> {
+        handler.stats.take_all().into_iter()
+            .filter(|r| r.kind == StatKind::Layout)
+            .map(|r| (r.layoutid, r.engagements.keys().next().cloned().unwrap_or_default()))
+            .collect()
+    }
+
+    /// The widget plays recorded so far, as (widget, layout).
+    fn widget_plays(handler: &mut Handler) -> Vec<(i64, i64)> {
+        handler.stats.take_all().into_iter()
+            .filter(|r| r.kind == StatKind::Media)
+            .map(|r| (r.widgetid, r.layoutid))
+            .collect()
+    }
+
+    #[test]
+    fn a_layout_that_finishes_its_cycle_and_starts_over_is_a_play_each_time() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        for _ in 0..3 {
+            handler.close_layout_play(1757);
+            handler.record_layout_shown(1757); // the reload showing it again
+        }
+        assert_eq!(plays(&mut handler), vec![(1757, String::new()); 3]);
+    }
+
+    #[test]
+    fn a_second_showing_of_the_same_layout_without_a_cycle_is_not_a_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.record_layout_shown(1757); // e.g. the load was retried after a stuck one
+        assert!(plays(&mut handler).is_empty());
+    }
+
+    #[test]
+    fn closing_the_play_of_another_layout_changes_nothing() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let before = handler.layout_playing_since;
+        handler.close_layout_play(1758);
+        assert!(plays(&mut handler).is_empty());
+        assert_eq!(handler.layout_playing_since, before, "still timing the same play");
+    }
+
+    #[test]
+    fn the_splash_is_not_a_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(0);
+        handler.record_layout_shown(1757);
+        assert!(plays(&mut handler).is_empty(), "layout 0 is the splash screen");
+        handler.record_layout_shown(0);
+        handler.record_layout_shown(1757);
+        assert_eq!(plays(&mut handler), vec![(1757, String::new())], "and a real layout after it still is");
+    }
+
+    #[test]
+    fn layouts_that_alternate_each_get_their_plays() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        for layout in [1758, 1759, 1758, 1759] {
+            handler.record_layout_shown(layout);
+        }
+        let ids: Vec<i64> = plays(&mut handler).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, [1758, 1759, 1758]);
+    }
+
+    #[test]
+    fn nothing_is_recorded_when_the_cms_has_stats_off() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.settings.stats_enabled = false;
+        handler.record_layout_shown(1757);
+        handler.close_layout_play(1757);
+        handler.record_layout_shown(1758);
+        assert!(plays(&mut handler).is_empty());
+        handler.settings.stats_enabled = true;
+        handler.close_layout_play(1758);
+        assert_eq!(plays(&mut handler).len(), 1, "and recording starts again when it is back on");
+    }
+
+    #[test]
+    fn the_criteria_in_force_are_recorded_with_the_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        handler.criteria.set("meteo_temp".into(), "21".into(), 300);
+        handler.close_layout_play(1757);
+        handler.criteria.set("weather".into(), "sun".into(), 300);
+        handler.close_layout_play(1757);
+        assert_eq!(plays(&mut handler), vec![
+            (1757, "CRITERIA|meteo_temp:21, weather:rain".to_string()),
+            (1757, "CRITERIA|meteo_temp:21, weather:sun".to_string())]);
+    }
+
+    #[test]
+    fn a_play_goes_to_the_cms_with_duration_and_count_and_then_leaves_the_file() {
+        let (port, seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        handler.close_layout_play(1757);
+        let path = handler.stats.path().expect("a file").to_path_buf();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("1757"), "kept until the CMS has it");
+
+        handler.flush_stats();
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        for part in ["layoutid=\"1757\"", "duration=\"", "count=\"1\"", "CRITERIA|weather:rain"] {
+            assert!(sent[0].contains(part), "{part}: {}", sent[0]);
+        }
+        assert!(handler.stats.is_empty());
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["records"].as_array().unwrap().len(), 0, "nothing left to send after a restart");
+    }
+
+    #[test]
+    fn plays_the_cms_does_not_take_are_kept_for_later_and_survive_a_restart() {
+        let (port, seen) = start_stats_mock(false);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.close_layout_play(1757);
+        handler.flush_stats();
+        assert_eq!(seen.lock().unwrap().len(), 1, "it tried");
+        assert!(!handler.stats.is_empty(), "and kept the play");
+        let path = handler.stats.path().unwrap().to_path_buf();
+        let after_restart = crate::stats::StatCollector::load(path, &handler.cms.address);
+        assert!(!after_restart.is_empty());
+    }
+
+    #[test]
+    fn a_widget_that_starts_and_stops_is_a_play_of_its_own() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, false, t + time::Duration::seconds(12));
+        let records = handler.stats.take_all();
+        let widget = records.iter().find(|r| r.kind == StatKind::Media).expect("a widget record");
+        assert_eq!((widget.widgetid, widget.layoutid, widget.duration), (4670, 1757, 12));
+        assert!(handler.open_widgets.is_empty());
+    }
+
+    #[test]
+    fn a_widget_started_again_without_stopping_closes_the_first_play() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, true, t + time::Duration::seconds(10));
+        assert_eq!(widget_plays(&mut handler), vec![(4670, 1757)], "the first play, the second is still open");
+        assert_eq!(handler.open_widgets.len(), 1);
+    }
+
+    #[test]
+    fn a_stop_for_a_widget_that_never_started_is_nothing() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.widget_event(1757, 4670, false, OffsetDateTime::now_utc());
+        assert!(widget_plays(&mut handler).is_empty());
+    }
+
+    #[test]
+    fn widgets_still_showing_when_the_layout_changes_are_closed_with_it() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4671, true, t);
+        handler.record_layout_shown(1758);
+        let mut plays = widget_plays(&mut handler);
+        plays.sort();
+        assert_eq!(plays, vec![(4670, 1757), (4671, 1757)]);
+        assert!(handler.open_widgets.is_empty());
+    }
+
+    #[test]
+    fn widgets_still_showing_when_the_layout_starts_over_are_closed_with_it() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.widget_event(1757, 4670, true, OffsetDateTime::now_utc());
+        handler.close_layout_play(1757);
+        assert_eq!(widget_plays(&mut handler), vec![(4670, 1757)]);
+        assert!(handler.open_widgets.is_empty());
+    }
+
+    #[test]
+    fn the_events_of_another_layout_are_not_for_the_play_in_progress() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.widget_event(1757, 4670, true, OffsetDateTime::now_utc());
+        assert!(handler.open_widgets.is_empty(), "nothing is showing yet");
+        handler.record_layout_shown(1757);
+        handler.widget_event(9999, 4670, true, OffsetDateTime::now_utc());
+        assert!(handler.open_widgets.is_empty(), "an overlay, or a page that is gone");
+    }
+
+    #[test]
+    fn no_widget_is_recorded_when_the_cms_has_stats_off() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.settings.stats_enabled = false;
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, false, t + time::Duration::seconds(5));
+        assert!(widget_plays(&mut handler).is_empty());
+    }
+
+    #[test]
+    fn a_widget_play_carries_the_criteria_in_force() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.record_layout_shown(1757);
+        handler.criteria.set("weather".into(), "rain".into(), 300);
+        let t = OffsetDateTime::now_utc();
+        handler.widget_event(1757, 4670, true, t);
+        handler.widget_event(1757, 4670, false, t + time::Duration::seconds(5));
+        let records = handler.stats.take_all();
+        assert_eq!(records[0].engagements.keys().next().unwrap(), "CRITERIA|weather:rain");
+    }
+
+    #[test]
+    fn the_level_comes_from_the_setting() {
+        let (port, _seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        assert_eq!(handler.aggregation_level(), Aggregation::Individual, "the default");
+        for (text, level) in [("Hourly", Aggregation::Hourly), ("Daily", Aggregation::Daily),
+                              ("individual", Aggregation::Individual), ("nonsense", Aggregation::Individual)] {
+            handler.settings.aggregation_level = text.to_string();
+            assert_eq!(handler.aggregation_level(), level, "{text}");
+        }
+    }
+
+    #[test]
+    fn with_hourly_aggregation_the_current_hour_is_kept_for_later() {
+        let (port, seen) = start_stats_mock(true);
+        let (mut handler, _rx) = handler_for(port);
+        handler.settings.aggregation_level = "Hourly".to_string();
+        handler.record_layout_shown(1757);
+        handler.close_layout_play(1757);
+        handler.close_layout_play(1757);
+        handler.flush_stats();
+        assert!(seen.lock().unwrap().is_empty(), "this hour is not over: nothing is sent");
+        assert!(!handler.stats.is_empty(), "and the plays wait");
+        handler.settings.aggregation_level = "Individual".to_string();
+        handler.flush_stats();
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "back to individual: sent at once");
+        assert!(sent[0].contains("count=\"2\""), "the two plays as one record: {}", sent[0]);
     }
 
     // Sanity check for the *current*, real configuration
@@ -9127,5 +9793,60 @@ mod parallel_download_tests {
         assert_eq!(max_seen.load(Ordering::SeqCst), 1,
                    "max_concurrent_downloads=1 must never let more than one download run \
                     at the same time");
+    }
+}
+
+#[cfg(test)]
+mod startup_watchdog_tests {
+    use super::*;
+
+    fn fake_proc(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("arexibo_proc_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("task")).unwrap();
+        dir
+    }
+
+    fn add_thread(proc: &std::path::Path, tid: u32, comm: Option<&str>, wchan: Option<&str>) {
+        let dir = proc.join("task").join(tid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(comm) = comm {
+            std::fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+        }
+        if let Some(wchan) = wchan {
+            std::fs::write(dir.join("wchan"), wchan).unwrap();
+        }
+    }
+
+    #[test]
+    fn each_thread_is_listed_with_its_name_and_where_it_waits() {
+        let proc = fake_proc("list");
+        add_thread(&proc, 200, Some("startup-watchdog"), Some("hrtimer_nanosleep"));
+        add_thread(&proc, 100, Some("arexibo"), Some("futex_wait_queue"));
+        add_thread(&proc, 150, Some("QtWebEngine"), Some("do_epoll_wait"));
+        assert_eq!(thread_snapshot(&proc),
+                   "  100 arexibo futex_wait_queue\n  150 QtWebEngine do_epoll_wait\n  200 startup-watchdog hrtimer_nanosleep");
+    }
+
+    #[test]
+    fn what_cannot_be_read_is_a_question_mark() {
+        let proc = fake_proc("missing");
+        add_thread(&proc, 7, None, None);
+        add_thread(&proc, 8, Some("arexibo"), None);
+        std::fs::create_dir_all(proc.join("task").join("not-a-thread")).unwrap();
+        assert_eq!(thread_snapshot(&proc), "  7 ? ?\n  8 arexibo ?");
+    }
+
+    #[test]
+    fn no_task_directory_is_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("arexibo_proc_{}_none", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(thread_snapshot(&dir), "");
+    }
+
+    #[test]
+    fn the_real_process_lists_at_least_this_thread() {
+        let snapshot = thread_snapshot(std::path::Path::new("/proc/self"));
+        assert!(snapshot.lines().count() >= 1, "{snapshot:?}");
     }
 }
