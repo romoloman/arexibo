@@ -8,7 +8,7 @@
   #define SourceDir "..\dist-windows"
 #endif
 #ifndef OutputName
-  #define OutputName "arexibo-setup-" + AppVersion
+  #define OutputName "arexibo_" + AppVersion + "-win64"
 #endif
 
 [Setup]
@@ -34,20 +34,19 @@ Name: "autostart"; Description: "Start Arexibo when a user signs in"; Flags: unc
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "arexibo-run.vbs"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-; Through the script that starts the player again when it exits. The player's
-; files go to Documents\arexibo of the user, made if it is missing.
-Name: "{autoprograms}\Arexibo"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs"""; IconFilename: "{app}\arexibo.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\Arexibo"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs"""; IconFilename: "{app}\arexibo.exe"; WorkingDir: "{app}"; Tasks: desktopicon
-Name: "{commonstartup}\Arexibo"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs"""; IconFilename: "{app}\arexibo.exe"; WorkingDir: "{app}"; Tasks: autostart
+; With --watchdog, which starts the player again when it exits. The
+; player's files go to Documents\arexibo of the user, made if it is missing.
+Name: "{autoprograms}\Arexibo"; Filename: "{app}\arexibo.exe"; Parameters: "--watchdog"; WorkingDir: "{app}"
+Name: "{autodesktop}\Arexibo"; Filename: "{app}\arexibo.exe"; Parameters: "--watchdog"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{commonstartup}\Arexibo"; Filename: "{app}\arexibo.exe"; Parameters: "--watchdog"; WorkingDir: "{app}"; Tasks: autostart
 
 [Run]
 ; The Visual C++ runtime, if the machine has none (windeployqt puts the installer in the folder).
 Filename: "{app}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing the Visual C++ runtime..."; Check: NeedsVCRedist; Flags: waituntilterminated skipifdoesntexist
 ; The first start, with what was typed on the CMS page: the player keeps it from then on.
-Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs""{code:FirstRunArgs}"; Description: "Start Arexibo now"; Flags: postinstall nowait skipifsilent runasoriginaluser
+Filename: "{app}\arexibo.exe"; Parameters: "--watchdog{code:FirstRunArgs}"; Description: "Start Arexibo now"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [Code]
 var

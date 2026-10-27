@@ -27,6 +27,7 @@ pub mod dcruntime;
 pub mod clock;
 pub mod splashinfo;
 pub mod osinfo;
+pub mod watchdog;
 mod tls;
 
 use std::path::PathBuf;
@@ -77,6 +78,10 @@ struct Args {
     /// Clear the local file cache and re-download any files.
     #[arg(long)]
     clear: bool,
+    /// Run as a supervisor: start the player and start it again whenever it
+    /// exits (for systems without systemd, such as Windows).
+    #[arg(long)]
+    watchdog: bool,
     /// Enable debug logging.
     #[arg(long)]
     debug: bool,
@@ -119,6 +124,12 @@ fn main() {
 
 fn main_inner() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.watchdog {
+        log::set_max_level(log::LevelFilter::Info);
+        log::info!("Arexibo {} watchdog", clap::crate_version!());
+        watchdog::run(std::env::args_os().skip(1).collect(), util::default_envdir());
+    }
 
     log::info!("Arexibo {} starting up...", clap::crate_version!());
 
@@ -493,5 +504,41 @@ mod mainloop_exit_code_tests {
     fn an_unexpected_normal_return_gets_the_generic_exit_code() {
         let result: std::thread::Result<anyhow::Result<()>> = Ok(Ok(()));
         assert_eq!(mainloop_exit_code(&result), 1);
+    }
+}
+
+#[cfg(test)]
+mod watchdog_options_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn long_options(takes_value: bool) -> Vec<String> {
+        let mut command = Args::command();
+        command.build();
+        let mut names: Vec<String> = command.get_arguments()
+            .filter(|arg| arg.get_long().is_some()
+                    && arg.get_num_args().map_or(false, |n| n.takes_values()) == takes_value)
+            .map(|arg| format!("--{}", arg.get_long().unwrap()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_watchdog_knows_which_options_take_a_value() {
+        let mut known: Vec<String> = watchdog::VALUE_OPTIONS.iter().map(|s| s.to_string()).collect();
+        known.sort();
+        let from_clap: Vec<String> = long_options(true).into_iter()
+            .filter(|name| name != "--help" && name != "--version").collect();
+        assert_eq!(from_clap, known, "an option was added or changed in Args: update VALUE_OPTIONS in watchdog.rs");
+    }
+
+    #[test]
+    fn the_options_the_watchdog_drops_and_adds_exist() {
+        let mut all = long_options(true);
+        all.extend(long_options(false));
+        for name in watchdog::FIRST_START_OPTIONS.iter().chain(["--watchdog"].iter()) {
+            assert!(all.iter().any(|known| known == name), "{name} is not an option of the player");
+        }
     }
 }

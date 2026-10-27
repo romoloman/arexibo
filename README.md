@@ -164,17 +164,20 @@ Windows has it), and it is created if it is missing.
 
 The player exits when it needs to be started again: after the registration with
 a code, when the CMS changes or the connection to it is set up differently.  On
-Linux systemd starts it again (`Restart=always`).  On Windows use
-`installer\arexibo-run.vbs`, which starts the player, waits for it to exit and
-starts it again after 3 seconds:
+Linux systemd starts it again (`Restart=always`).  Elsewhere run it with
+`--watchdog`: the program then starts the player (itself, without
+`--watchdog`), waits for it to exit and starts it again after 3 seconds:
 
 ```
-> wscript installer\arexibo-run.vbs --host https://my.cms/ --key <key>
+> arexibo.exe --watchdog --host https://my.cms/ --key <key>
 ```
 
-The arguments are for the first start only: after it the player has its own
-settings, and giving them again would undo a change of CMS.  To stop the player
-started like this, end `wscript.exe` in the Task Manager.
+The options that write the player's own settings (`--host`, `--key`,
+`--display-id`, `--display-name` and `--clear`) are given only until `cms.json`
+exists in the directory of the files: after that the player has its own
+settings, and giving them again would undo a change of CMS.  The other options
+(the directory, `--screen`, `--proxy` and so on) are given at every start.  To
+stop it, close the console window or press Ctrl+C.
 
 ### Installer
 
@@ -186,17 +189,17 @@ the `PATH`):
 > iscc /DAppVersion=0.6.9 /DSourceDir=%CD%\dist-windows installer\arexibo.iss
 ```
 
-It writes `installer\output\arexibo-setup-0.6.9.exe` (`/DOutputName=<name>`
+It writes `installer\output\arexibo_0.6.9-win64.exe` (`/DOutputName=<name>`
 chooses another file name, without `.exe`).  The installer puts the program in
-`Program Files\Arexibo`, makes shortcuts that go through `arexibo-run.vbs` (in
+`Program Files\Arexibo`, makes shortcuts that start the player with `--watchdog` (in
 the Start menu, and on request on the desktop and at the sign-in of every
 user), asks for the address of the CMS and its key, which are given to the
 first start, and installs the Visual C++ runtime if the machine does not have it.
 The files of the player go to `Documents\arexibo` of the user.
 
 The workflow builds the installer; run it by hand from the Actions tab.  The
-tagged releases and the nightly build attach it as
-`arexibo-setup-<version>.exe` and `arexibo-setup-nightly.exe`.  It is not
+tagged releases and the nightly build attach it, named like the `.deb`
+packages: `arexibo_<version>-win64.exe`.  It is not
 signed, so Windows SmartScreen warns when it is run for the first time.
 
 ### Differences on Windows
