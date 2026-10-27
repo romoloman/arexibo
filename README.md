@@ -5,7 +5,8 @@
 </p>
 
 Arexibo is an unofficial alternate Digital Signage Player for [Xibo](https://xibo.org.uk),
-implemented mostly in Rust but making use of Qt GUI components, for Linux platforms.
+implemented mostly in Rust but making use of Qt GUI components, for Linux platforms and,
+as a more recent and less tested port, for Windows (see [Windows](#windows-experimental)).
 
 It is currently almost complete but there are still some features that may present errors or that maybe are not perfectly working, in particular:
 VideoWall/SyncGroup and Cycle Playback (also not working properly in the windows client)
@@ -30,8 +31,10 @@ To build from source, you need:
 
 * Qt 6 with the QtWebEngine component and its development headers.
 
-* Development headers for `dbus` (>= 1.6), `zeromq` (>= 4.1)
+* On Linux, development headers for `dbus` (>= 1.6), `zeromq` (>= 4.1)
   as well as `pkg-config`.
+
+For Windows, see [Windows](#windows-experimental) below.
 
 To build, run:
 
@@ -60,9 +63,156 @@ zeromq-devel qt6-qtwebengine-devel`.  For Debian derived, install `cmake g++
 cargo libdbus-1-dev libzmq3-dev qt6-webengine-dev`.
 
 
+## Windows (experimental)
+
+Arexibo also builds and runs on Windows (64 bit, MSVC toolchain).  This is a
+recent port and less tested than the Linux one: see "Differences on Windows"
+below.  The steps below are those of the workflow
+`.github/workflows/windows.yml`, which builds it in the CI.
+
+### Installing the tools
+
+None of this is needed just to *get* a Windows build: the CI makes one (see
+"Installer" below).  To build it yourself you need the following.  The commands
+are for a command prompt or PowerShell; `winget` comes with current versions of
+Windows 10 and 11.
+
+1. **Rust**, with the default `x86_64-pc-windows-msvc` target.  Download and run
+   `rustup-init.exe` from https://rustup.rs and accept the defaults.  The version
+   is the one pinned in `rust-toolchain.toml`: in the directory of the sources,
+   run `rustup toolchain install` (without arguments) to get it.
+
+2. **The Visual Studio 2022 Build Tools**, with the C++ workload: the MSVC
+   compiler, the Windows SDK and CMake.  You do not need the full Visual
+   Studio.  This asks for administrator rights and downloads several gigabytes:
+
+   ```
+   > winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"
+   ```
+
+   `--includeRecommended` is what brings "C++ CMake tools for Windows".  If you
+   already have Visual Studio 2022, add the workload "Desktop development with
+   C++" with the Visual Studio Installer instead.  The commands below are meant
+   for the "Developer Command Prompt for VS 2022" in the Start menu.
+
+3. **Qt 6** built for MSVC 2022, 64 bit, with the QtWebEngine, QtWebChannel and
+   QtPositioning modules (the CI uses Qt 6.8).  With
+   [aqtinstall](https://github.com/miurahr/aqtinstall), which needs Python 3 and
+   is what the CI uses:
+
+   ```
+   > py -m pip install aqtinstall
+   > py -m aqt install-qt --outputdir C:\Qt windows desktop 6.8.3 win64_msvc2022_64 -m qtwebengine qtwebchannel qtpositioning
+   ```
+
+   The kit is then in `C:\Qt\6.8.3\msvc2022_64`.  `py -m aqt list-qt windows
+   desktop --modules 6.8.3 win64_msvc2022_64` lists the modules, in case a
+   version names them differently.  Or use the Qt Online Installer from
+   https://www.qt.io/download-open-source (it needs a free Qt account): choose
+   Qt 6.8, "MSVC 2022 64-bit", and under "Additional Libraries" Qt WebEngine,
+   Qt WebChannel and Qt Positioning.
+
+   Set `QT_ROOT_DIR` to the directory of the kit; the build script finds Qt's
+   CMake files and libraries from it.  `setx QT_ROOT_DIR C:\Qt\6.8.3\msvc2022_64`
+   keeps it for the prompts you open afterwards.
+
+4. **Inno Setup 6**, only to make the installer: `choco install innosetup` if you
+   use Chocolatey, or the installer from https://jrsoftware.org/isdl.php.
+
+To check what is installed, in a new Developer Command Prompt:
+
+```
+> rustc --version
+> cl
+> cmake --version
+> %QT_ROOT_DIR%\bin\windeployqt.exe --version
+```
+
+### Building
+
+From a "Developer Command Prompt for VS 2022", run:
+
+```
+> set QT_ROOT_DIR=C:\Qt\6.8.3\msvc2022_64
+> cargo build --release --locked
+```
+
+(If building the `aws-lc-sys` crate complains about NASM, install NASM.)
+
+The binary `target\release\arexibo.exe` needs Qt's DLLs and plugins next to it.
+`windeployqt` collects them; run it from the same Developer Command Prompt,
+because `--compiler-runtime` needs the Visual Studio environment (it puts the
+installer of the Visual C++ runtime in the folder too):
+
+```
+> mkdir dist-windows
+> copy target\release\arexibo.exe dist-windows\
+> %QT_ROOT_DIR%\bin\windeployqt --release --no-translations --compiler-runtime dist-windows\arexibo.exe
+> dist-windows\arexibo.exe --help
+```
+
+### Running
+
+Usage is the same as on Linux, with one difference: the directory can be left
+out.  It is then `Documents\arexibo` (the Documents folder of the user, wherever
+Windows has it), and it is created if it is missing.
+
+```
+> dist-windows\arexibo.exe --host https://my.cms/ --key <key>
+```
+
+The player exits when it needs to be started again: after the registration with
+a code, when the CMS changes or the connection to it is set up differently.  On
+Linux systemd starts it again (`Restart=always`).  On Windows use
+`installer\arexibo-run.vbs`, which starts the player, waits for it to exit and
+starts it again after 3 seconds:
+
+```
+> wscript installer\arexibo-run.vbs --host https://my.cms/ --key <key>
+```
+
+The arguments are for the first start only: after it the player has its own
+settings, and giving them again would undo a change of CMS.  To stop the player
+started like this, end `wscript.exe` in the Task Manager.
+
+### Installer
+
+The installer is made with [Inno Setup](https://jrsoftware.org/isinfo.php) 6
+(`iscc` is `ISCC.exe` in its folder, which the installation of Inno Setup does not add to
+the `PATH`):
+
+```
+> iscc /DAppVersion=0.6.9 /DSourceDir=%CD%\dist-windows installer\arexibo.iss
+```
+
+It writes `installer\output\arexibo-setup-0.6.9.exe` (`/DOutputName=<name>`
+chooses another file name, without `.exe`).  The installer puts the program in
+`Program Files\Arexibo`, makes shortcuts that go through `arexibo-run.vbs` (in
+the Start menu, and on request on the desktop and at the sign-in of every
+user), asks for the address of the CMS and its key, which are given to the
+first start, and installs the Visual C++ runtime if the machine does not have it.
+The files of the player go to `Documents\arexibo` of the user.
+
+The workflow builds the installer; run it by hand from the Actions tab.  The
+tagged releases and the nightly build attach it as
+`arexibo-setup-<version>.exe` and `arexibo-setup-nightly.exe`.  It is not
+signed, so Windows SmartScreen warns when it is run for the first time.
+
+### Differences on Windows
+
+* The timezone of the CMS is not applied: the player uses the one of the machine.
+* A console window with the log messages stays open besides the player's window.
+* The screensaver and the sleep of the machine are inhibited while the player
+  runs.
+* The display id (normally generated from characteristics of the machine), the
+  commands that the CMS can run and the serial (RS232) ports follow Unix
+  conventions and have not been adapted or tested on Windows.  Give
+  `--display-id` explicitly if several machines could otherwise get the same one.
+
 ## Usage
 
-Create a new directory where Arexibo can store configuration and media files.
+Create a new directory where Arexibo can store configuration and media files
+(on Windows the directory can be left out: see [Windows](#windows-experimental)).
 Then, you can use several ways to configure the player:
 
 * at first start, use the following command line 
@@ -162,6 +312,9 @@ the value of the display's tag of that name when the command runs, so a change i
 - Not supported: the macros of the Electron player (`[EPOCH]`, `[UNIX_TIMESTAMP]`, `[TIMESTAMP]`, `[LAT]`, `[LNG]`); they stay as written.
 
 ## Standalone setup with X server
+
+This section is for Linux.  On Windows, the shortcuts made by the installer
+do the equivalent: see [Windows](#windows-experimental).
 
 The following example systemd service file shows how to to start an X server
 with Arexibo and no DPMS/screensaver:
