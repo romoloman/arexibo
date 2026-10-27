@@ -140,9 +140,9 @@ jobs:
     uses: ./.github/workflows/windows.yml
     with:
       version: ${{ needs.check.outputs.windows_version }}
-      # A fixed name, so that each night's installer replaces the last one
-      # instead of adding another file of about 100 MB to the release.
-      installer_name: arexibo-setup-nightly
+      # Named as the .deb packages are, with the same version (GitHub turns
+      # the `~` into a `.` in both names).
+      installer_name: arexibo_${{ needs.check.outputs.nightly_version }}-win64
       skip_folder_artifact: true
 
   publish:
@@ -168,6 +168,18 @@ jobs:
           name: arexibo-windows-installer
           path: dist
 
+      # The files of the previous nights are deleted AFTER the new ones are
+      # published, never before: if the publication fails, yesterday's files
+      # stay, and the release is never empty. They are found by their ids,
+      # not by their names: GitHub changes characters in a name (the `~`).
+      - name: Remember the files of the previous nights
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/${REPO}/releases/tags/nightly" --jq '.assets[].id' > previous-assets.txt || : > previous-assets.txt
+          echo "Files of the previous nights: $(wc -l < previous-assets.txt)"
+
       - name: Publish nightly release
         uses: softprops/action-gh-release@v3
         with:
@@ -180,7 +192,7 @@ jobs:
             `master` every night, may include untested or in-progress
             changes. Use a tagged release for production deployments.
 
-            The Windows installer (`arexibo-setup-nightly.exe`) is
+            The Windows installer (`arexibo_<version>-win64.exe`) is
             experimental and not signed; it is missing when its build fails.
           prerelease: true
           # Overwrites the previous nightly's assets/tag/body each time
@@ -189,4 +201,15 @@ jobs:
           make_latest: false
           files: |
             dist/arexibo_*.deb
-            dist/arexibo-setup-*.exe
+            dist/arexibo_*-win64.exe
+
+      - name: Delete the files of the previous nights
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          while read -r id; do
+            [ -n "$id" ] || continue
+            # One that the new file of the same name replaced is gone already.
+            gh api -X DELETE "repos/${REPO}/releases/assets/${id}" && echo "Deleted ${id}" || echo "Already gone: ${id}"
+          done < previous-assets.txt

@@ -19,7 +19,7 @@ on:
         type: string
         default: ''
       installer_name:
-        description: 'Name of the installer file, without .exe (default: arexibo-setup-<version>)'
+        description: 'Name of the installer file, without .exe (default: arexibo_<version>-win64)'
         type: string
         default: ''
       skip_folder_artifact:

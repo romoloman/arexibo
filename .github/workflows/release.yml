@@ -97,4 +97,4 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/arexibo_*.deb
-            dist/arexibo-setup-*.exe
+            dist/arexibo_*-win64.exe
