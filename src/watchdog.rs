@@ -34,7 +34,7 @@ fn option_name(arg: &OsStr) -> Option<String> {
 }
 
 fn has_inline_value(arg: &OsStr) -> bool {
-    arg.to_str().map_or(false, |text| text.starts_with("--") && text.contains('='))
+    arg.to_str().is_some_and(|text| text.starts_with("--") && text.contains('='))
 }
 
 fn takes_next_value(arg: &OsStr, name: &str) -> bool {
@@ -74,7 +74,7 @@ pub fn envdir_of(args: &[OsString]) -> Option<PathBuf> {
             if takes_next_value(arg, &name) {
                 iter.next();
             }
-        } else if !arg.to_str().map_or(false, |text| text.starts_with('-')) {
+        } else if !arg.to_str().is_some_and(|text| text.starts_with('-')) {
             return Some(PathBuf::from(arg));
         }
     }

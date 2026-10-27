@@ -517,7 +517,7 @@ mod watchdog_options_tests {
         command.build();
         let mut names: Vec<String> = command.get_arguments()
             .filter(|arg| arg.get_long().is_some()
-                    && arg.get_num_args().map_or(false, |n| n.takes_values()) == takes_value)
+                    && arg.get_num_args().is_some_and(|n| n.takes_values()) == takes_value)
             .map(|arg| format!("--{}", arg.get_long().unwrap()))
             .collect();
         names.sort();
