@@ -89,12 +89,41 @@ fn main() {
     convert_wsdl();
 }
 
+/// Qt's libraries on Windows (MSVC): there is no `link.txt` to read them
+/// from, nor `-lstdc++`. `QT_ROOT_DIR` is the Qt kit, as the
+/// install-qt-action sets it.
+fn link_qt_windows(dst: &std::path::Path, qt_root: Option<&str>) {
+    let build = dst.join("build");
+    // The static library is installed in `lib`, and built in `build`, in a
+    // subdirectory per configuration with the Visual Studio generator.
+    println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
+    for sub in ["", "Release", "Debug", "RelWithDebInfo", "MinSizeRel"] {
+        println!("cargo:rustc-link-search=native={}", build.join(sub).display());
+    }
+    println!("cargo:rustc-link-lib=static=arexibogui");
+    let qt_root = qt_root.expect("QT_ROOT_DIR must be the Qt MSVC kit");
+    println!("cargo:rustc-link-search=native={}", PathBuf::from(qt_root).join("lib").display());
+    for lib in ["Qt6Core", "Qt6Gui", "Qt6Widgets", "Qt6WebChannel", "Qt6WebEngineCore", "Qt6WebEngineWidgets"] {
+        println!("cargo:rustc-link-lib={lib}");
+    }
+}
+
 fn build_qtlib() {
-    let dst = cmake::build("gui");
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let qt_root = std::env::var("QT_ROOT_DIR").ok().filter(|dir| !dir.is_empty());
+    let mut config = cmake::Config::new("gui");
+    if let (true, Some(root)) = (windows, &qt_root) {
+        config.define("CMAKE_PREFIX_PATH", root);
+    }
+    let dst = config.build();
     println!("cargo:rerun-if-changed=gui/lib.cpp");
     println!("cargo:rerun-if-changed=gui/lib.h");
     println!("cargo:rerun-if-changed=gui/view.cpp");
     println!("cargo:rerun-if-changed=gui/view.h");
+    if windows {
+        link_qt_windows(&dst, qt_root.as_deref());
+        return;
+    }
     println!("cargo:rustc-link-search=native={}/build", dst.display());
     println!("cargo:rustc-link-lib=static=arexibogui");
     println!("cargo:rustc-link-lib=stdc++");

@@ -560,7 +560,10 @@ fn startup_watchdog() {
             log::error!("exiting, for systemd to start the player again");
             // _exit, not exit: Qt's teardown is for the main thread and can
             // wait forever when run from this one.
+            #[cfg(unix)]
             unsafe { nix::libc::_exit(STARTUP_STALLED_EXIT_CODE) };
+            #[cfg(windows)]
+            std::process::exit(STARTUP_STALLED_EXIT_CODE);
         }
     });
 }

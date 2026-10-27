@@ -6,8 +6,10 @@
 use std::{fs, fmt, path::Path, str::FromStr, time::Duration};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+#[cfg(unix)]
 use dbus::blocking::Connection;
 use md5::{Md5, Digest};
+#[cfg(unix)]
 use nix::{sys::statvfs, unistd::gethostname};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Deserializer, Serializer, de::Error};
@@ -188,14 +190,25 @@ pub fn get_display_id() -> String {
         fs::read_to_string("/sys/devices/virtual/dmi/id/board_name"),
         fs::read_to_string("/sys/devices/virtual/dmi/id/board_version"),
         retrieve_mac(),
-        gethostname().ok().and_then(|s| s.into_string().ok())
+        hostname()
     );
     hex::encode(Md5::digest(idstring.as_bytes()))
 }
 
+/// This machine's name.
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    gethostname().ok().and_then(|s| s.into_string().ok())
+}
+
+#[cfg(windows)]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 /// Generate an initial display name.  Tries the hostname.
 pub fn get_display_name() -> String {
-    gethostname().ok().and_then(|s| s.into_string().ok())
+    hostname()
                       .unwrap_or_else(|| "Arexibo Display".into())
 }
 
@@ -247,12 +260,17 @@ pub fn read_system_timezone() -> Option<String> {
 }
 
 
+#[cfg(unix)]
 const SS_SVC: &str   = "org.freedesktop.ScreenSaver";
+#[cfg(unix)]
 const SS_PATH: &str  = "/ScreenSaver";
+#[cfg(unix)]
 const SS_IFACE: &str = "org.freedesktop.ScreenSaver";
+#[cfg(unix)]
 const SS_METH: &str  = "Inhibit";
 
 /// Inhibit the screensaver.
+#[cfg(unix)]
 pub fn inhibit_screensaver() -> Result<u32> {
     let conn = Connection::new_session().context("connecting to dbus")?;
     let proxy = conn.with_proxy(SS_SVC, SS_PATH, Duration::from_millis(500));
@@ -260,12 +278,40 @@ pub fn inhibit_screensaver() -> Result<u32> {
     Ok(res.0)
 }
 
+/// Keeps the display and the system awake for as long as the calling thread
+/// lives: called once, from the main thread, which is also the GUI's.
+#[cfg(windows)]
+pub fn inhibit_screensaver() -> Result<u32> {
+    use windows_sys::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
+    };
+    // SAFETY: a plain call that takes flags.
+    let previous = unsafe {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+    };
+    anyhow::ensure!(previous != 0, "SetThreadExecutionState failed");
+    Ok(0)
+}
+
 
 /// Get available and total space in directory.
+#[cfg(unix)]
 pub fn space_info(path: &Path) -> Result<(u64, u64)> {
     let res = statvfs::statvfs(path)?;
     Ok((res.blocks_available() * res.fragment_size(),
         res.blocks() * res.fragment_size()))
+}
+
+#[cfg(windows)]
+pub fn space_info(path: &Path) -> Result<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is NUL-terminated and the pointers are to live variables.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
+    anyhow::ensure!(ok != 0, "GetDiskFreeSpaceExW: {}", std::io::Error::last_os_error());
+    Ok((available, total))
 }
 
 /// Get current IANA timezone name ("Europe/Berlin").

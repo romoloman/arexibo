@@ -18,12 +18,18 @@ add_library(arexibogui STATIC
     res.qrc
 )
 target_link_libraries(arexibogui PRIVATE Qt6::WebEngineWidgets)
-target_compile_options(arexibogui PRIVATE -Wall -pedantic)
+if(MSVC)
+    target_compile_options(arexibogui PRIVATE /W3)
+else()
+    target_compile_options(arexibogui PRIVATE -Wall -pedantic)
+endif()
 install(TARGETS arexibogui)
 
 # Create a dummy shared lib to discover libraries that Cargo needs to
-# link against
-add_library(dummy SHARED)
-target_link_libraries(dummy PUBLIC -lc
-    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::WebChannel
-    Qt6::WebEngineCore Qt6::WebEngineWidgets)
+# link against (not on Windows: build.rs names the Qt libraries itself)
+if(NOT WIN32)
+    add_library(dummy SHARED)
+    target_link_libraries(dummy PUBLIC -lc
+        Qt6::Core Qt6::Gui Qt6::Widgets Qt6::WebChannel
+        Qt6::WebEngineCore Qt6::WebEngineWidgets)
+endif()

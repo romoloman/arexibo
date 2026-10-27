@@ -9,6 +9,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 use serde::Serialize;
 
+/// The OS version when there is nothing to read it from.
+const FALLBACK_VERSION: &str = if cfg!(windows) { "windows" } else { "linux" };
+
 /// What firmware leaves where a real name should be (the Windows player's list).
 const GENERIC: [&str; 5] =
     ["System Product Name", "To Be Filled By O.E.M.", "Default string", "Not Applicable", "System Version"];
@@ -91,7 +94,7 @@ fn build(os_release: Option<&str>, kernel: Option<&str>, dmi: impl Fn(&str) -> O
         .unwrap_or_default();
     OperatingSystem {
         manufacturer, brand, model,
-        version: os_release.and_then(os_name).unwrap_or_else(|| "linux".to_string()),
+        version: os_release.and_then(os_name).unwrap_or_else(|| FALLBACK_VERSION.to_string()),
         sdk: kernel.map(str::trim).unwrap_or_default().to_string(),
     }
 }
@@ -212,7 +215,7 @@ mod tests {
     #[test]
     fn without_an_os_release_the_version_is_what_it_used_to_be() {
         let os = build(None, None, |_| None, None);
-        assert_eq!((os.version.as_str(), os.sdk.as_str()), ("linux", ""));
+        assert_eq!((os.version.as_str(), os.sdk.as_str()), (FALLBACK_VERSION, ""));
     }
 
     #[test]
