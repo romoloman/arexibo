@@ -1,13 +1,45 @@
 name: Windows build (experimental)
 
-# The Windows port is a work in progress: this runs only by hand (Actions >
-# Windows build > Run workflow), not on every push, so that it cannot turn
-# the other checks red. It builds with MSVC and Qt 6 (QtWebEngine is only
-# built for the MSVC kits), checks that the executable starts, and uploads
-# it with Qt's libraries and as an installer.
+# The Windows port is a work in progress. By hand (Actions > Windows build >
+# Run workflow) it builds with MSVC and Qt 6 (QtWebEngine is only built for
+# the MSVC kits), checks that the executable starts, and uploads it with
+# Qt's libraries and as an installer. The nightly and the release workflows
+# call it too, to attach the installer to their releases; they do not wait
+# on it, so a broken Windows build does not hold back the .deb packages.
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version of the installer (default: the one in Cargo.toml)'
+        type: string
+        default: ''
+      ref:
+        description: 'Branch, tag or commit to build (default: the one the run is on)'
+        type: string
+        default: ''
+      installer_name:
+        description: 'Name of the installer file, without .exe (default: arexibo-setup-<version>)'
+        type: string
+        default: ''
+      skip_folder_artifact:
+        description: 'Do not upload the folder with Qt, only the installer'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        default: ''
+      ref:
+        type: string
+        default: ''
+      installer_name:
+        type: string
+        default: ''
+      skip_folder_artifact:
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -15,6 +47,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
       - uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.*'
@@ -45,18 +79,29 @@ jobs:
         run: |
           & .\dist-windows\arexibo.exe --help
           if ($LASTEXITCODE -ne 0) { throw "arexibo.exe --help exited with $LASTEXITCODE" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
+        if: ${{ !inputs.skip_folder_artifact }}
         with:
           name: arexibo-windows
           path: dist-windows
       - name: Build the installer
         shell: pwsh
+        env:
+          # Through the environment, not pasted into the script: a tag is
+          # text that somebody typed.
+          VERSION: ${{ inputs.version }}
+          INSTALLER_NAME: ${{ inputs.installer_name }}
         run: |
           choco install innosetup -y --no-progress
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceDir=$PWD\dist-windows" installer\arexibo.iss
+          $version = $env:VERSION -replace '^v', ''
+          if (-not $version) {
+            $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          }
+          $iscc = @("/DAppVersion=$version", "/DSourceDir=$PWD\dist-windows")
+          if ($env:INSTALLER_NAME) { $iscc += "/DOutputName=$env:INSTALLER_NAME" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" @iscc installer\arexibo.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC exited with $LASTEXITCODE" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: arexibo-windows-installer
           path: installer/output/*.exe

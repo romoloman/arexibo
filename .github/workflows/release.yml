@@ -58,9 +58,20 @@ jobs:
           name: deb-${{ matrix.arch }}
           path: dist/arexibo_*.deb
 
+  windows:
+    name: Build the Windows installer
+    uses: ./.github/workflows/windows.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref_name }}
+      version: ${{ github.event.inputs.tag || github.ref_name }}
+      skip_folder_artifact: true
+
   release:
     name: Publish release
-    needs: build
+    # Windows is not waited on to publish: while that port is experimental,
+    # a failure of it must not hold back the .deb packages.
+    needs: [build, windows]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-26.04
     permissions:
       contents: write
@@ -73,8 +84,17 @@ jobs:
           pattern: deb-*
           merge-multiple: true
 
+      - name: Download the Windows installer
+        if: needs.windows.result == 'success'
+        uses: actions/download-artifact@v7
+        with:
+          name: arexibo-windows-installer
+          path: dist
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: dist/arexibo_*.deb
+          files: |
+            dist/arexibo_*.deb
+            dist/arexibo-setup-*.exe

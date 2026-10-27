@@ -10,8 +10,13 @@
   and orientation out from it, and had neither for these players.
 - Start to build on Windows (work in progress, MSVC and Qt 6): the Unix-only parts are separated (`dbus`, `nix`), with Windows versions of the
   disk space, the host name and the screen saver inhibition, and `build.rs` and the CMake file have a Windows branch. A workflow,
-  `windows.yml`, builds it when run by hand, checks that it starts and makes an installer (Inno Setup, `installer/arexibo.iss`).
-  Nothing changes on Linux.
+  `windows.yml`, builds it when run by hand, checks that it starts and makes an installer (Inno Setup, `installer/arexibo.iss`), whose
+  shortcuts start the player through a script that starts it again when it exits, as systemd does on Linux (the registration with a code,
+  among others, ends with an exit that expects it). Nothing changes on Linux.
+- The directory argument can be left out on Windows: the player's files go to `Documents\arexibo` (the real Documents folder), which is
+  made if it is missing. A directory that is given and does not exist is still an error, and elsewhere the argument is still needed.
+- The nightly and the release builds make the Windows installer too (`arexibo-setup-nightly.exe`, `arexibo-setup-X.Y.Z.exe`) and attach
+  it to their releases; they do not wait on it, so a broken Windows build does not hold back the .deb packages.
 - Show on the splash screen, in small type at the bottom, the version, the date and time (ticking), the free and total space of the disk
   and the time and result of the last collection, as an aid for whoever installs or debugs a totem. `AREXIBO_SPLASH_INFO=0` hides it.
   It reads a new local-only `/splash-info`; `/info` keeps the Electron player's fields.

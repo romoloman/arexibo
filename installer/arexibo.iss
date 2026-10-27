@@ -7,6 +7,9 @@
 #ifndef SourceDir
   #define SourceDir "..\dist-windows"
 #endif
+#ifndef OutputName
+  #define OutputName "arexibo-setup-" + AppVersion
+#endif
 
 [Setup]
 AppId={{4E5B8185-473B-4E4B-9290-748938B0ACF4}
@@ -16,7 +19,7 @@ AppPublisher=Arexibo
 DefaultDirName={autopf}\Arexibo
 DisableProgramGroupPage=yes
 OutputDir=output
-OutputBaseFilename=arexibo-setup-{#AppVersion}
+OutputBaseFilename={#OutputName}
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -29,23 +32,22 @@ UninstallDisplayIcon={app}\arexibo.exe
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; Flags: unchecked
 Name: "autostart"; Description: "Start Arexibo when a user signs in"; Flags: unchecked
 
-[Dirs]
-; The player's data (settings, cache): not under Program Files, where users cannot write.
-Name: "{commonappdata}\Arexibo"; Permissions: users-modify
-
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "arexibo-run.vbs"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\Arexibo"; Filename: "{app}\arexibo.exe"; Parameters: """{commonappdata}\Arexibo"""
-Name: "{autodesktop}\Arexibo"; Filename: "{app}\arexibo.exe"; Parameters: """{commonappdata}\Arexibo"""; Tasks: desktopicon
-Name: "{commonstartup}\Arexibo"; Filename: "{app}\arexibo.exe"; Parameters: """{commonappdata}\Arexibo"""; Tasks: autostart
+; Through the script that starts the player again when it exits. The player's
+; files go to Documents\arexibo of the user, made if it is missing.
+Name: "{autoprograms}\Arexibo"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs"""; IconFilename: "{app}\arexibo.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\Arexibo"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs"""; IconFilename: "{app}\arexibo.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{commonstartup}\Arexibo"; Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs"""; IconFilename: "{app}\arexibo.exe"; WorkingDir: "{app}"; Tasks: autostart
 
 [Run]
 ; The Visual C++ runtime, if the machine has none (windeployqt puts the installer in the folder).
 Filename: "{app}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "Installing the Visual C++ runtime..."; Check: NeedsVCRedist; Flags: waituntilterminated skipifdoesntexist
 ; The first start, with what was typed on the CMS page: the player keeps it from then on.
-Filename: "{app}\arexibo.exe"; Parameters: "{code:FirstRunArgs}"; Description: "Start Arexibo now"; Flags: postinstall nowait skipifsilent
+Filename: "{sys}\wscript.exe"; Parameters: """{app}\arexibo-run.vbs""{code:FirstRunArgs}"; Description: "Start Arexibo now"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [Code]
 var
@@ -75,7 +77,7 @@ end;
 
 function FirstRunArgs(Param: string): string;
 begin
-  Result := Quoted(ExpandConstant('{commonappdata}\Arexibo'));
+  Result := '';
   if Trim(CmsPage.Values[0]) <> '' then Result := Result + ' --host ' + Quoted(Trim(CmsPage.Values[0]));
   if Trim(CmsPage.Values[1]) <> '' then Result := Result + ' --key ' + Quoted(Trim(CmsPage.Values[1]));
   if Trim(CmsPage.Values[2]) <> '' then Result := Result + ' --display-name ' + Quoted(Trim(CmsPage.Values[2]));

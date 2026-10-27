@@ -478,3 +478,118 @@ mod tests {
         assert_eq!(hex::decode(back).unwrap(), original);
     }
 }
+
+/// The folder of the player's files when none is given: `Documents\arexibo`
+/// on Windows (the real Documents folder, which OneDrive or the language may
+/// have moved); nothing elsewhere.
+#[cfg(windows)]
+pub fn default_envdir() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath},
+    };
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the call writes `raw`; when it is not null it points to a
+    // NUL-terminated string, which has to be freed with CoTaskMemFree.
+    let documents = unsafe {
+        let result = SHGetKnownFolderPath(&FOLDERID_Documents, 0, 0, &mut raw);
+        let documents = (result >= 0 && !raw.is_null()).then(|| {
+            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+            std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len))
+        });
+        CoTaskMemFree(raw as *const _);
+        documents
+    };
+    documents
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|home| std::path::PathBuf::from(home).join("Documents")))
+        .map(|dir| dir.join("arexibo"))
+}
+
+#[cfg(not(windows))]
+pub fn default_envdir() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// The folder of the player's files: the one given, which has to exist, or
+/// the default one, which is made if it is missing.
+pub fn resolve_envdir(given: Option<std::path::PathBuf>, default: Option<std::path::PathBuf>)
+                      -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+    if let Some(dir) = given {
+        anyhow::ensure!(dir.exists(), "environment directory '{}' does not exist", dir.display());
+        return Ok(dir);
+    }
+    let dir = default.context("no environment directory was given (the first argument), \
+                               and there is no default one on this system")?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating the environment directory '{}'", dir.display()))?;
+    log::info!("no environment directory given: using {}", dir.display());
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod envdir_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("arexibo_envdir_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_given_folder_that_is_there_is_used_as_it_is() {
+        let dir = temp("given");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(resolve_envdir(Some(dir.clone()), Some(temp("unused"))).unwrap(), dir);
+        assert!(!temp("unused").exists(), "the default is left alone");
+    }
+
+    #[test]
+    fn a_given_folder_that_is_missing_is_an_error_not_made() {
+        let dir = temp("missing");
+        let message = format!("{:#}", resolve_envdir(Some(dir.clone()), Some(temp("unused2"))).unwrap_err());
+        assert!(message.contains("does not exist"), "{message}");
+        assert!(!dir.exists(), "a mistyped path is not turned into a folder");
+    }
+
+    #[test]
+    fn the_default_folder_is_made_when_it_is_missing_with_its_parents() {
+        let dir = temp("default").join("deep").join("arexibo");
+        assert_eq!(resolve_envdir(None, Some(dir.clone())).unwrap(), dir);
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn the_default_folder_is_kept_as_it_is_when_it_is_there() {
+        let dir = temp("kept");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cms.json"), "{}").unwrap();
+        assert_eq!(resolve_envdir(None, Some(dir.clone())).unwrap(), dir);
+        assert_eq!(std::fs::read_to_string(dir.join("cms.json")).unwrap(), "{}");
+    }
+
+    #[test]
+    fn with_no_folder_and_no_default_it_says_what_is_needed() {
+        let message = format!("{:#}", resolve_envdir(None, None).unwrap_err());
+        assert!(message.contains("no environment directory was given"), "{message}");
+    }
+
+    #[test]
+    fn a_default_that_cannot_be_made_is_an_error() {
+        let file = temp("a_file");
+        std::fs::write(&file, "x").unwrap();
+        let message = format!("{:#}", resolve_envdir(None, Some(file.join("arexibo"))).unwrap_err());
+        assert!(message.contains("creating the environment directory"), "{message}");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn there_is_no_default_outside_windows() {
+        assert_eq!(default_envdir(), None);
+    }
+}

@@ -31,7 +31,7 @@ mod tls;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -39,7 +39,8 @@ use clap::Parser;
 #[command(help_template = "by {author}{about-section}\n{usage-heading} {usage}\n\n{all-args}")]
 struct Args {
     /// The directory to place config files and cached content.
-    envdir: PathBuf,
+    // Optional on Windows: Documents\arexibo, made if it is missing.
+    envdir: Option<PathBuf>,
     /// The CMS host including scheme, e.g. https://xibo.example.com/
     #[arg(long)]
     host: Option<String>,
@@ -128,9 +129,8 @@ fn main_inner() -> anyhow::Result<()> {
     }
 
     // check environment directory argument
-    ensure!(args.envdir.exists(), "environment directory '{}' does not exist",
-            args.envdir.display());
-    let cmscfg = args.envdir.join("cms.json");
+    let envdir = util::resolve_envdir(args.envdir.clone(), util::default_envdir())?;
+    let cmscfg = envdir.join("cms.json");
 
     // Shared with the "Register via Code" polling thread below.
     let exit_code = Arc::new(Mutex::new(1));
@@ -192,7 +192,7 @@ fn main_inner() -> anyhow::Result<()> {
     let splash_state: server::SplashStateStore =
         std::sync::Arc::new(std::sync::Mutex::new(server::SplashState::Loading));
 
-    let mut handler = mainloop::Handler::new(&cms, args.clear, &args.envdir, args.no_verify,
+    let mut handler = mainloop::Handler::new(&cms, args.clear, &envdir, args.no_verify,
                                               allow_offline, args.debug,
                                               togui_tx, fromgui_rx, duration_rx, trigger_rx, fault_rx,
                                               splash_state.clone())
@@ -235,7 +235,7 @@ fn main_inner() -> anyhow::Result<()> {
     // fixed port specifically.
     let bind_addr = if settings.embedded_server_allow_wan { "0.0.0.0" } else { "127.0.0.1" };
     let port = server::effective_port(settings.embedded_server_port);
-    let webserver = server::Server::new(args.envdir.join("res"), bind_addr, port,
+    let webserver = server::Server::new(envdir.join("res"), bind_addr, port,
                                          duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, splash_state.clone())
         .context("creating internal HTTP server")?;
     settings.embedded_server_port = webserver.port();
@@ -262,7 +262,7 @@ fn main_inner() -> anyhow::Result<()> {
     if bind_addr != "0.0.0.0" {
         for shard in 2..=server::HTML_SHARD_COUNT {
             let addr = format!("127.0.0.{shard}");
-            let shard_server = server::Server::new(args.envdir.join("res"), &addr, shard_port,
+            let shard_server = server::Server::new(envdir.join("res"), &addr, shard_port,
                                                      duration_tx.clone(), trigger_tx.clone(), fault_tx.clone(), manual_register_tx.clone(), local_data.clone(), registration_code.clone(), awaiting_code, splash_state.clone())
                 .with_context(|| format!("creating internal HTTP server shard on {addr}"))?;
             shard_server.start_pool();
