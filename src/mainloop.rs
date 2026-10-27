@@ -6651,19 +6651,27 @@ mod decide_timezone_action_tests {
 mod apply_process_timezone_tests {
     use super::*;
 
+    /// The local offset at noon UTC on the 15th of a month of 2026.
+    fn offset_on(month: time::Month) -> i8 {
+        let noon = time::Date::from_calendar_date(2026, month, 15).unwrap()
+            .with_hms(12, 0, 0).unwrap().assume_utc();
+        time::UtcOffset::local_offset_at(noon).unwrap().whole_hours()
+    }
+
     #[test]
     fn genuinely_changes_this_processs_own_local_offset() {
         // End-to-end: catches missing tzset() calls that a pure
-        // decision-logic test can't. TZ is process-global, so this
-        // could flake if run concurrently with another test relying on
-        // a specific offset -- none currently do.
+        // decision-logic test can't. Fixed dates: it used the current one
+        // and failed the day the summer time ended. TZ is process-global,
+        // so this could flake if run concurrently with another test relying
+        // on a specific offset -- none currently do.
         apply_process_timezone("Europe/Rome");
-        let offset = time::OffsetDateTime::now_local().unwrap().offset();
-        assert_eq!(offset.whole_hours(), 2, "August in Europe/Rome must be UTC+2 (CEST)");
+        assert_eq!(offset_on(time::Month::August), 2, "August in Europe/Rome must be UTC+2 (CEST)");
+        assert_eq!(offset_on(time::Month::January), 1, "January in Europe/Rome must be UTC+1 (CET)");
 
         apply_process_timezone("America/New_York");
-        let offset = time::OffsetDateTime::now_local().unwrap().offset();
-        assert_eq!(offset.whole_hours(), -4, "August in America/New_York must be UTC-4 (EDT)");
+        assert_eq!(offset_on(time::Month::August), -4, "August in America/New_York must be UTC-4 (EDT)");
+        assert_eq!(offset_on(time::Month::January), -5, "January in America/New_York must be UTC-5 (EST)");
     }
 }
 

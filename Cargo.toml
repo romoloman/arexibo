@@ -27,9 +27,7 @@ parking_lot = "0.12"
 hex = "0.4"
 itertools = "0.14"
 log = "0.4"
-nix = { version = "0.31", features = ["fs", "hostname"] }
 rand = "0.8"
-dbus = "0.9"
 
 # crypto
 arc4 = "0.1"
@@ -71,3 +69,10 @@ elementtree = "1.2"
 rcgen = "0.13"
 
 [features]
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["fs", "hostname"] }
+dbus = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Power"] }

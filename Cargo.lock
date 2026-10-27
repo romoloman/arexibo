@@ -121,6 +121,7 @@ dependencies = [
  "tungstenite",
  "ureq",
  "webpki-root-certs",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
