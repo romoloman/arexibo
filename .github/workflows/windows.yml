@@ -3,7 +3,8 @@ name: Windows build (experimental)
 # The Windows port is a work in progress: this runs only by hand (Actions >
 # Windows build > Run workflow), not on every push, so that it cannot turn
 # the other checks red. It builds with MSVC and Qt 6 (QtWebEngine is only
-# built for the MSVC kits) and uploads the executable with Qt's libraries.
+# built for the MSVC kits), checks that the executable starts, and uploads
+# it with Qt's libraries and as an installer.
 
 on:
   workflow_dispatch: {}
@@ -30,13 +31,32 @@ jobs:
           rustflags: ''
       - name: Build
         run: cargo build --release --locked
+      # Sets VCINSTALLDIR, which windeployqt needs to find the Visual C++
+      # runtime installer.
+      - uses: ilammy/msvc-dev-cmd@v1
       - name: Gather the executable and Qt's libraries
         shell: bash
         run: |
           mkdir dist-windows
           cp target/release/arexibo.exe dist-windows/
-          windeployqt --release --no-translations dist-windows/arexibo.exe
+          windeployqt --release --no-translations --compiler-runtime dist-windows/arexibo.exe
+      - name: Smoke test (the executable starts and finds its libraries)
+        shell: pwsh
+        run: |
+          & .\dist-windows\arexibo.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "arexibo.exe --help exited with $LASTEXITCODE" }
       - uses: actions/upload-artifact@v4
         with:
           name: arexibo-windows
           path: dist-windows
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "/DSourceDir=$PWD\dist-windows" installer\arexibo.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC exited with $LASTEXITCODE" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arexibo-windows-installer
+          path: installer/output/*.exe
