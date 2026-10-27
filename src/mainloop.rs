@@ -3719,6 +3719,7 @@ fn is_weather_provider_not_configured_fault(err: &anyhow::Error) -> bool {
 
 // tzset(3): glibc doesn't re-parse TZ on its own after set_var(). One
 // extern fn instead of pulling in `libc` just for this.
+#[cfg(unix)]
 extern "C" {
     fn tzset();
 }
@@ -3728,6 +3729,7 @@ extern "C" {
 /// system-wide timezone. Only call once, before any other thread
 /// exists -- mutating env vars concurrently with another thread
 /// reading them is unsafe regardless of what the compiler enforces.
+#[cfg(unix)]
 fn apply_process_timezone(tz: &str) {
     match util::read_system_timezone() {
         Some(sys_tz) if sys_tz != tz => log::info!(
@@ -3741,6 +3743,13 @@ fn apply_process_timezone(tz: &str) {
     // SAFETY: only reads TZ and updates process-global libc state; safe
     // single-threaded, per this function's own doc comment.
     unsafe { tzset(); }
+}
+
+/// On Windows `TZ` does not take IANA names such as "Europe/Rome", so the
+/// system's own timezone stays.
+#[cfg(windows)]
+fn apply_process_timezone(tz: &str) {
+    log::info!("not applying the CMS's timezone {tz:?} on Windows: this machine's own is used");
 }
 
 /// Pure decision so this can be unit-tested without touching the real
@@ -6652,12 +6661,14 @@ mod apply_process_timezone_tests {
     use super::*;
 
     /// The local offset at noon UTC on the 15th of a month of 2026.
+    #[cfg(unix)]
     fn offset_on(month: time::Month) -> i8 {
         let noon = time::Date::from_calendar_date(2026, month, 15).unwrap()
             .with_hms(12, 0, 0).unwrap().assume_utc();
         time::UtcOffset::local_offset_at(noon).unwrap().whole_hours()
     }
 
+    #[cfg(unix)]
     #[test]
     fn genuinely_changes_this_processs_own_local_offset() {
         // End-to-end: catches missing tzset() calls that a pure

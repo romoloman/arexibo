@@ -3,7 +3,9 @@
 
 //! Various utilities.
 
-use std::{fs, fmt, path::Path, str::FromStr, time::Duration};
+use std::{fs, fmt, path::Path, str::FromStr};
+#[cfg(unix)]
+use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 #[cfg(unix)]

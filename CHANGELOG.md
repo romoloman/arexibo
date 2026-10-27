@@ -8,6 +8,9 @@
   display's details. It received the plain string `linux`. The value is escaped for the request, which the generated SOAP code does not do.
 - Send the screen size (`width`, `height`) in the status notification, as the Windows player does: the CMS works the display's resolution
   and orientation out from it, and had neither for these players.
+- Start to build on Windows (work in progress, MSVC and Qt 6): the Unix-only parts are separated (`dbus`, `nix`), with Windows versions of the
+  disk space, the host name and the screen saver inhibition, and `build.rs` and the CMake file have a Windows branch. A workflow,
+  `windows.yml`, builds it when run by hand. Nothing changes on Linux.
 - Show on the splash screen, in small type at the bottom, the version, the date and time (ticking), the free and total space of the disk
   and the time and result of the last collection, as an aid for whoever installs or debugs a totem. `AREXIBO_SPLASH_INFO=0` hides it.
   It reads a new local-only `/splash-info`; `/info` keeps the Electron player's fields.
