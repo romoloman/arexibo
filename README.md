@@ -20,6 +20,7 @@ All the other settings from the cms should work including allow_wan_access and e
 
 Tagged releases and a nightly build provide `.deb` packages for amd64 and arm64, built on
 Ubuntu 26.04, but it's better to compile from source.
+For Windows they also provide an installer (see [Windows](#windows-experimental)).
 
 To build from source, you need:
 
