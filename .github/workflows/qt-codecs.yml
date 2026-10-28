@@ -42,6 +42,10 @@ jobs:
       VCPKG_DISABLE_METRICS: 1
       TRIPLET: x64-windows-release
       VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\tools\vcpkg-triplets
+      # The host triplet must be the same, or vcpkg builds for a "cross" case and
+      # qtwebengine (its pdf feature depends on the host qtwebengine) is built
+      # a second time, in Debug and Release: Chromium three times.
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-release
     steps:
       - uses: actions/checkout@v5
 
@@ -81,9 +85,9 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: D:\vc
-          key: vcpkg-qt-win-${{ github.run_id }}
+          key: vcpkg-qt-rel-${{ github.run_id }}
           restore-keys: |
-            vcpkg-qt-win-
+            vcpkg-qt-rel-
 
       - name: Stage 1, Qt base
         run: |
@@ -92,7 +96,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           "binary cache $env:VCPKG_DEFAULT_BINARY_CACHE is a directory: $(Test-Path -PathType Container $env:VCPKG_DEFAULT_BINARY_CACHE)"
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          & D:\v\vcpkg.exe install "qtbase:${env:TRIPLET}" --x-buildtrees-root=D:\b --clean-after-build
+          & D:\v\vcpkg.exe install "qtbase:${env:TRIPLET}" --host-triplet=${env:TRIPLET} --x-buildtrees-root=D:\b --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtbase failed" }
           "Stage 1, qtbase: $([int]$sw.Elapsed.TotalMinutes) minutes" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
@@ -100,7 +104,7 @@ jobs:
         if: always()
         with:
           path: D:\vc
-          key: vcpkg-qt-win-${{ github.run_id }}-base
+          key: vcpkg-qt-rel-${{ github.run_id }}-base
 
       # The longest one: Chromium. `webchannel` is what Arexibo needs besides
       # the engine itself.
@@ -113,7 +117,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           "binary cache $env:VCPKG_DEFAULT_BINARY_CACHE is a directory: $(Test-Path -PathType Container $env:VCPKG_DEFAULT_BINARY_CACHE)"
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          & D:\v\vcpkg.exe install "qtwebengine[proprietary-codecs,webchannel]:${env:TRIPLET}" --x-buildtrees-root=D:\b --clean-after-build
+          & D:\v\vcpkg.exe install "qtwebengine[proprietary-codecs,webchannel]:${env:TRIPLET}" --host-triplet=${env:TRIPLET} --x-buildtrees-root=D:\b --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtwebengine failed" }
           "Stage 2, qtwebengine: $([int]$sw.Elapsed.TotalMinutes) minutes" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
@@ -121,7 +125,7 @@ jobs:
         if: always()
         with:
           path: D:\vc
-          key: vcpkg-qt-win-${{ github.run_id }}-webengine
+          key: vcpkg-qt-rel-${{ github.run_id }}-webengine
 
       - name: What the build says about the codecs
         run: |
