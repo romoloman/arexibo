@@ -71,6 +71,16 @@ recent port and less tested than the Linux one: see "Differences on Windows"
 below.  The steps below are those of the workflow
 `.github/workflows/windows.yml`, which builds it in the CI.
 
+**MP4 videos do not play** with the installers that this project distributes,
+nor with a Qt from the official binaries (such as the one the CI installs):
+the H.264 and AAC codecs of an MP4 are in Qt WebEngine only if it was compiled
+from source with `-webengine-proprietary-codecs`.  Qt's documentation warns
+that distributing the proprietary codec libraries requires acquiring licenses
+for them, so the project does not distribute a binary that includes them.  To
+play MP4 videos on Windows, build Qt WebEngine yourself with the codecs (see
+"Installing the tools") and build Arexibo with that Qt; the licensing is then
+your own responsibility.
+
 ### Installing the tools
 
 None of this is needed just to *get* a Windows build: the CI makes one (see
@@ -116,6 +126,24 @@ Windows 10 and 11.
    Set `QT_ROOT_DIR` to the directory of the kit; the build script finds Qt's
    CMake files and libraries from it.  `setx QT_ROOT_DIR C:\Qt\6.8.3\msvc2022_64`
    keeps it for the prompts you open afterwards.
+
+   **Qt with the MP4 codecs.**  Qt's documentation
+   ([Qt WebEngine Features](https://doc.qt.io/qt-6/qtwebengine-features.html))
+   says to configure the Qt WebEngine module with `-webengine-proprietary-codecs`:
+
+   ```
+   > qt-configure-module C:\qt\qtwebengine -webengine-proprietary-codecs
+   > cmake --build .
+   ```
+
+   This builds Chromium and takes several hours; the Qt wiki page
+   "QtWebEngine/Qt6Build" lists what it needs.  To check a Qt, start the player
+   with `--inspect` and run this in the console of the inspector: an empty string
+   means that the codecs are missing, `probably` or `maybe` that they are there.
+
+   ```
+   document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E, mp4a.40.2"')
+   ```
 
 4. **Inno Setup 6**, only to make the installer: `choco install innosetup` if you
    use Chocolatey, or the installer from https://jrsoftware.org/isdl.php.
@@ -204,6 +232,8 @@ signed, so Windows SmartScreen warns when it is run for the first time.
 
 ### Differences on Windows
 
+* MP4 videos (H.264 and AAC) do not play with the installers of the project:
+  see the note at the beginning of this section.
 * The timezone of the CMS is not applied: the player uses the one of the machine.
 * A console window with the log messages stays open besides the player's window.
 * The screensaver and the sleep of the machine are inhibited while the player

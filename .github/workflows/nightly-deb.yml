@@ -194,6 +194,10 @@ jobs:
 
             The Windows installer (`arexibo_<version>-win64.exe`) is
             experimental and not signed; it is missing when its build fails.
+
+            MP4 videos (H.264/AAC) do not play with the Windows installer: the
+            Qt WebEngine it contains has no proprietary codecs (see the README,
+            section "Windows (experimental)").
           prerelease: true
           # Overwrites the previous nightly's assets/tag/body each time
           # -- keeps a single, stable download URL rather than
