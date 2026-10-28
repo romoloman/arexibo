@@ -1,0 +1,145 @@
+name: Qt WebEngine with codecs (experiment)
+
+# An experiment: builds Qt WebEngine from source with vcpkg and its
+# `proprietary-codecs` feature (H.264 and AAC, which MP4 videos need) and
+# checks with tools/codec-check that it plays them. It takes hours (it builds
+# Chromium) and a job is limited to 6 hours: it saves vcpkg's cache after each
+# stage, so that a new run starts from what is built already.
+#
+# It uploads NOTHING: a Qt with the codecs must not be published (see the
+# README, section "Windows (experimental)").
+#
+# To use it in another repository, copy this file and tools/codec-check/.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vcpkg_ref:
+        description: 'Commit or tag of vcpkg to build with (default: the latest)'
+        type: string
+        default: ''
+
+jobs:
+  qt:
+    name: vcpkg Qt WebEngine (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Short paths: Chromium does not build in a long one (the port asks for
+      # a build tree path of at most 22 characters).
+      VCPKG_ROOT: C:\v
+      VCPKG_DEFAULT_BINARY_CACHE: C:\vc
+      VCPKG_DISABLE_METRICS: 1
+      TRIPLET: x64-windows
+    steps:
+      - uses: actions/checkout@v5
+
+      # The port looks for node on the PATH.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: The machine
+        run: |
+          Get-PSDrive -PSProvider FileSystem |
+            Format-Table Name, @{n='FreeGB'; e={[math]::Round($_.Free / 1GB, 1)}}, @{n='UsedGB'; e={[math]::Round($_.Used / 1GB, 1)}}
+          "CPUs: $env:NUMBER_OF_PROCESSORS"
+          git config --system core.longpaths true
+
+      - name: Get vcpkg
+        env:
+          VCPKG_REF: ${{ inputs.vcpkg_ref }}
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg C:\v
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+          if ($env:VCPKG_REF) {
+            git -C C:\v fetch --depth 1 origin $env:VCPKG_REF
+            if ($LASTEXITCODE -ne 0) { throw "git fetch of $env:VCPKG_REF failed" }
+            git -C C:\v checkout FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
+          }
+          & C:\v\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg failed" }
+          $head = git -C C:\v log -1 --format='%H %cs'
+          "vcpkg: $head" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: C:\vc
+          key: vcpkg-qt-win-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-qt-win-
+
+      - name: Stage 1, Qt base
+        run: |
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & C:\v\vcpkg.exe install "qtbase:${env:TRIPLET}" --x-buildtrees-root=C:\b --clean-after-build
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtbase failed" }
+          "Stage 1, qtbase: $([int]$sw.Elapsed.TotalMinutes) minutes" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: C:\vc
+          key: vcpkg-qt-win-${{ github.run_id }}-base
+
+      # The longest one: Chromium. `webchannel` is what Arexibo needs besides
+      # the engine itself.
+      - name: Stage 2, Qt WebEngine with the proprietary codecs
+        run: |
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & C:\v\vcpkg.exe install "qtwebengine[proprietary-codecs,webchannel]:${env:TRIPLET}" --x-buildtrees-root=C:\b --clean-after-build
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtwebengine failed" }
+          "Stage 2, qtwebengine: $([int]$sw.Elapsed.TotalMinutes) minutes" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: C:\vc
+          key: vcpkg-qt-win-${{ github.run_id }}-webengine
+
+      - name: What the build says about the codecs
+        run: |
+          "Installed:" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          & C:\v\vcpkg.exe list | Select-String '^(qtbase|qtwebengine|qtwebchannel|qtdeclarative)' |
+            ForEach-Object { $_.Line } | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "Configure summary:" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          Get-ChildItem C:\b -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+            Select-String -Pattern 'Proprietary Codecs' | Select-Object -First 4 |
+            ForEach-Object { $_.Line.Trim() } | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Build codec-check with this Qt
+        run: |
+          cmake -S tools\codec-check -B C:\cc -A x64 "-DCMAKE_TOOLCHAIN_FILE=C:\v\scripts\buildsystems\vcpkg.cmake" "-DVCPKG_TARGET_TRIPLET=${env:TRIPLET}"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build C:\cc --config Release
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      # Red if this Qt cannot play MP4 or the check did not work.
+      - name: Does this Qt play MP4?
+        run: |
+          $root = "C:\v\installed\${env:TRIPLET}"
+          $proc = Get-ChildItem $root -Recurse -Filter QtWebEngineProcess.exe | Select-Object -First 1
+          $pak  = Get-ChildItem $root -Recurse -Filter qtwebengine_resources.pak | Select-Object -First 1
+          $loc  = Get-ChildItem $root -Recurse -Directory -Filter qtwebengine_locales | Select-Object -First 1
+          $plat = Get-ChildItem $root -Recurse -Filter qoffscreen.dll | Select-Object -First 1
+          "QtWebEngineProcess.exe: $($proc.FullName)"
+          "qtwebengine_resources.pak: $($pak.FullName)"
+          "locales: $($loc.FullName)"
+          "qoffscreen.dll: $($plat.FullName)"
+          if (-not $proc -or -not $pak -or -not $plat) { throw "a file that Qt WebEngine needs is not in $root" }
+          $env:QTWEBENGINEPROCESS_PATH = $proc.FullName
+          $env:QTWEBENGINE_RESOURCES_PATH = $pak.DirectoryName
+          if ($loc) { $env:QTWEBENGINE_LOCALES_PATH = $loc.FullName }
+          $env:QT_PLUGIN_PATH = Split-Path $plat.DirectoryName -Parent
+          $env:PATH = "$root\bin;$root\Qt6\bin;$env:PATH"
+          $output = & C:\cc\Release\codec-check.exe 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { "$_" }
+          "codec-check (exit code $code):" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          $output | Where-Object { "$_" -match '^(mp4|webm|RESULT|no answer|the test page)' } |
+            ForEach-Object { "    $_" } | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          exit $code
