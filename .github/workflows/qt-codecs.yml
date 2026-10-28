@@ -9,6 +9,9 @@ name: Qt WebEngine with codecs (experiment)
 # It uploads NOTHING: a Qt with the codecs must not be published (see the
 # README, section "Windows (experimental)").
 #
+# It builds only the Release configuration (tools/vcpkg-triplets): the
+# triplet of vcpkg builds each package twice, Debug and Release.
+#
 # To use it in another repository, copy this file and tools/codec-check/.
 
 on:
@@ -18,22 +21,27 @@ on:
         description: 'Commit or tag of vcpkg to build with (default: the latest)'
         type: string
         default: ''
+      runner:
+        description: 'Runner: windows-latest has Visual Studio 18, windows-2022 has Visual Studio 2022 (if still available)'
+        type: string
+        default: 'windows-latest'
 
 jobs:
   qt:
     name: vcpkg Qt WebEngine (Windows)
-    runs-on: windows-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     defaults:
       run:
         shell: pwsh
     env:
       # Short paths: Chromium does not build in a long one (the port asks for
-      # a build tree path of at most 22 characters).
-      VCPKG_ROOT: C:\v
-      VCPKG_DEFAULT_BINARY_CACHE: C:\vc
+      # a build tree path of at most 22 characters), on D: (see "The machine").
+      VCPKG_ROOT: D:\v
+      VCPKG_DEFAULT_BINARY_CACHE: D:\vc
       VCPKG_DISABLE_METRICS: 1
-      TRIPLET: x64-windows
+      TRIPLET: x64-windows-release
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\tools\vcpkg-triplets
     steps:
       - uses: actions/checkout@v5
 
@@ -48,27 +56,31 @@ jobs:
             Format-Table Name, @{n='FreeGB'; e={[math]::Round($_.Free / 1GB, 1)}}, @{n='UsedGB'; e={[math]::Round($_.Used / 1GB, 1)}}
           "CPUs: $env:NUMBER_OF_PROCESSORS"
           git config --system core.longpaths true
+          # C: has little room (about 28 GB when this was written), D: much more:
+          # everything is built on D:.
+          $free = [math]::Round((Get-PSDrive D).Free / 1GB, 1)
+          if ($free -lt 60) { Write-Host "::warning::D: has only $free GB free: Qt WebEngine may not fit" }
 
       - name: Get vcpkg
         env:
           VCPKG_REF: ${{ inputs.vcpkg_ref }}
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg C:\v
+          git clone --depth 1 https://github.com/microsoft/vcpkg D:\v
           if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
           if ($env:VCPKG_REF) {
-            git -C C:\v fetch --depth 1 origin $env:VCPKG_REF
+            git -C D:\v fetch --depth 1 origin $env:VCPKG_REF
             if ($LASTEXITCODE -ne 0) { throw "git fetch of $env:VCPKG_REF failed" }
-            git -C C:\v checkout FETCH_HEAD
+            git -C D:\v checkout FETCH_HEAD
             if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
           }
-          & C:\v\bootstrap-vcpkg.bat -disableMetrics
+          & D:\v\bootstrap-vcpkg.bat -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg failed" }
-          $head = git -C C:\v log -1 --format='%H %cs'
+          $head = git -C D:\v log -1 --format='%H %cs'
           "vcpkg: $head" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - uses: actions/cache/restore@v4
         with:
-          path: C:\vc
+          path: D:\vc
           key: vcpkg-qt-win-${{ github.run_id }}
           restore-keys: |
             vcpkg-qt-win-
@@ -80,56 +92,58 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           "binary cache $env:VCPKG_DEFAULT_BINARY_CACHE is a directory: $(Test-Path -PathType Container $env:VCPKG_DEFAULT_BINARY_CACHE)"
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          & C:\v\vcpkg.exe install "qtbase:${env:TRIPLET}" --x-buildtrees-root=C:\b --clean-after-build
+          & D:\v\vcpkg.exe install "qtbase:${env:TRIPLET}" --x-buildtrees-root=D:\b --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtbase failed" }
           "Stage 1, qtbase: $([int]$sw.Elapsed.TotalMinutes) minutes" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - uses: actions/cache/save@v4
         if: always()
         with:
-          path: C:\vc
+          path: D:\vc
           key: vcpkg-qt-win-${{ github.run_id }}-base
 
       # The longest one: Chromium. `webchannel` is what Arexibo needs besides
       # the engine itself.
       - name: Stage 2, Qt WebEngine with the proprietary codecs
+        # Shorter than the job, so that the cache is saved if this does not end.
+        timeout-minutes: 300
         run: |
           # vcpkg wants its binary cache directory to exist, and the restore of
           # the cache does not make it when there is nothing to restore.
           New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
           "binary cache $env:VCPKG_DEFAULT_BINARY_CACHE is a directory: $(Test-Path -PathType Container $env:VCPKG_DEFAULT_BINARY_CACHE)"
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          & C:\v\vcpkg.exe install "qtwebengine[proprietary-codecs,webchannel]:${env:TRIPLET}" --x-buildtrees-root=C:\b --clean-after-build
+          & D:\v\vcpkg.exe install "qtwebengine[proprietary-codecs,webchannel]:${env:TRIPLET}" --x-buildtrees-root=D:\b --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtwebengine failed" }
           "Stage 2, qtwebengine: $([int]$sw.Elapsed.TotalMinutes) minutes" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - uses: actions/cache/save@v4
         if: always()
         with:
-          path: C:\vc
+          path: D:\vc
           key: vcpkg-qt-win-${{ github.run_id }}-webengine
 
       - name: What the build says about the codecs
         run: |
           "Installed:" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          & C:\v\vcpkg.exe list | Select-String '^(qtbase|qtwebengine|qtwebchannel|qtdeclarative)' |
+          & D:\v\vcpkg.exe list | Select-String '^(qtbase|qtwebengine|qtwebchannel|qtdeclarative)' |
             ForEach-Object { $_.Line } | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "Configure summary:" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          Get-ChildItem C:\b -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+          Get-ChildItem D:\b -Recurse -Filter *.log -ErrorAction SilentlyContinue |
             Select-String -Pattern 'Proprietary Codecs' | Select-Object -First 4 |
             ForEach-Object { $_.Line.Trim() } | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Build codec-check with this Qt
         run: |
-          cmake -S tools\codec-check -B C:\cc -A x64 "-DCMAKE_TOOLCHAIN_FILE=C:\v\scripts\buildsystems\vcpkg.cmake" "-DVCPKG_TARGET_TRIPLET=${env:TRIPLET}"
+          cmake -S tools\codec-check -B D:\cc -A x64 "-DCMAKE_TOOLCHAIN_FILE=D:\v\scripts\buildsystems\vcpkg.cmake" "-DVCPKG_TARGET_TRIPLET=${env:TRIPLET}"
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
-          cmake --build C:\cc --config Release
+          cmake --build D:\cc --config Release
           if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 
       # Red if this Qt cannot play MP4 or the check did not work.
       - name: Does this Qt play MP4?
         run: |
-          $root = "C:\v\installed\${env:TRIPLET}"
+          $root = "D:\v\installed\${env:TRIPLET}"
           $proc = Get-ChildItem $root -Recurse -Filter QtWebEngineProcess.exe | Select-Object -First 1
           $pak  = Get-ChildItem $root -Recurse -Filter qtwebengine_resources.pak | Select-Object -First 1
           $loc  = Get-ChildItem $root -Recurse -Directory -Filter qtwebengine_locales | Select-Object -First 1
@@ -144,10 +158,29 @@ jobs:
           if ($loc) { $env:QTWEBENGINE_LOCALES_PATH = $loc.FullName }
           $env:QT_PLUGIN_PATH = Split-Path $plat.DirectoryName -Parent
           $env:PATH = "$root\bin;$root\Qt6\bin;$env:PATH"
-          $output = & C:\cc\Release\codec-check.exe 2>&1
+          $output = & D:\cc\Release\codec-check.exe 2>&1
           $code = $LASTEXITCODE
           $output | ForEach-Object { "$_" }
           "codec-check (exit code $code):" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
           $output | Where-Object { "$_" -match '^(mp4|webm|RESULT|no answer|the test page)' } |
             ForEach-Object { "    $_" } | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
           exit $code
+
+      # The cause of a failure is at the end of vcpkg's logs, not in what the
+      # step prints first: the lines that matter are gathered here.
+      - name: What failed (from the logs of the build)
+        if: failure()
+        run: |
+          $logs = Get-ChildItem D:\b -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 4
+          foreach ($log in $logs) {
+            "===== $($log.FullName)" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Select-String -Path $log.FullName -Pattern 'FAILED:|error C\d+|fatal error|: error ' |
+              Select-Object -First 12 | ForEach-Object { $_.Line.Trim() } |
+              ForEach-Object { $_.Substring(0, [math]::Min($_.Length, 400)) } |
+              Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "----- last lines" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            Get-Content $log.FullName -Tail 25 |
+              ForEach-Object { $_.Substring(0, [math]::Min($_.Length, 300)) } |
+              Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
