@@ -66,6 +66,11 @@ jobs:
           $head = git -C C:\v log -1 --format='%H %cs'
           "vcpkg: $head" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
+      # vcpkg wants its binary cache directory to exist; the restore of the
+      # cache does not make it when there is nothing to restore.
+      - name: Make vcpkg's cache directory
+        run: New-Item -ItemType Directory -Force -Path C:\vc | Out-Null
+
       - uses: actions/cache/restore@v4
         with:
           path: C:\vc
