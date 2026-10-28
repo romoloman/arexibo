@@ -13,6 +13,8 @@
   `windows.yml`, builds it when run by hand, checks that it starts and makes an installer (Inno Setup, `installer/arexibo.iss`), whose
   shortcuts start the player with `--watchdog`, which starts it again when it exits, as systemd does on Linux (the registration with a code,
   among others, ends with an exit that expects it). Nothing changes on Linux.
+- On Windows the splash screen shows the addresses of the network adapters (it said that none was found: `hostname -I` does not exist
+  there), and the LAN address sent to the CMS comes from the same list.
 - New option `--watchdog`: the program starts the player (itself, without the option) and starts it again whenever it exits, after 3 seconds,
   as `Restart=always` of the systemd service does. The options that write the player's settings (`--host`, `--key`, `--display-id`,
   `--display-name`, `--clear`) are given only until `cms.json` exists; the others at every start.

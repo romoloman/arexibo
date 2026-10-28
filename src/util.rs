@@ -225,6 +225,7 @@ pub fn get_display_name() -> String {
 /// not anything safety/correctness-critical, so a missing/failing
 /// command just means an empty result (handled gracefully by the
 /// caller), not a hard failure.
+#[cfg(unix)]
 pub fn get_local_ips() -> Vec<String> {
     std::process::Command::new("hostname")
         .arg("-I")
@@ -233,6 +234,69 @@ pub fn get_local_ips() -> Vec<String> {
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default()
+}
+
+/// The same on Windows, where `hostname -I` does not exist: the unicast
+/// addresses of the network adapters, listed natively.
+#[cfg(windows)]
+pub fn get_local_ips() -> Vec<String> {
+    let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
+    displayable_ips(interfaces.iter().map(if_addrs::Interface::ip))
+}
+
+/// The addresses worth showing, as `hostname -I` does: no loopback, no
+/// unspecified and no IPv6 link-local one; each once, IPv4 first (the first
+/// is the one sent to the CMS as the LAN address).
+#[cfg(any(windows, test))]
+fn displayable_ips(ips: impl Iterator<Item = std::net::IpAddr>) -> Vec<String> {
+    use std::net::IpAddr;
+    let mut kept: Vec<IpAddr> = Vec::new();
+    for ip in ips {
+        let link_local_v6 = matches!(ip, IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80);
+        if !ip.is_loopback() && !ip.is_unspecified() && !link_local_v6 && !kept.contains(&ip) {
+            kept.push(ip);
+        }
+    }
+    kept.sort_by_key(|ip| ip.is_ipv6());
+    kept.iter().map(IpAddr::to_string).collect()
+}
+
+#[cfg(test)]
+mod local_ips_tests {
+    use super::displayable_ips;
+    use std::net::IpAddr;
+
+    fn shown(ips: &[&str]) -> Vec<String> {
+        displayable_ips(ips.iter().map(|ip| ip.parse::<IpAddr>().unwrap()))
+    }
+
+    #[test]
+    fn loopback_unspecified_and_ipv6_link_local_are_left_out() {
+        assert_eq!(shown(&["127.0.0.1", "::1", "0.0.0.0", "::", "fe80::1", "febf::2", "192.168.1.5"]), ["192.168.1.5"]);
+    }
+
+    #[test]
+    fn ipv4_comes_first_and_each_address_once() {
+        assert_eq!(shown(&["2001:db8::1", "192.168.1.5", "192.168.1.5", "10.0.0.2", "2001:db8::1"]),
+                   ["192.168.1.5", "10.0.0.2", "2001:db8::1"]);
+    }
+
+    #[test]
+    fn an_ipv4_address_in_169_254_and_a_unique_local_ipv6_one_are_kept() {
+        // as hostname -I does: only the IPv6 link-local range is omitted
+        assert_eq!(shown(&["169.254.10.2", "fd00::7"]), ["169.254.10.2", "fd00::7"]);
+    }
+
+    #[test]
+    fn the_first_one_after_the_ordering_is_the_ipv4_address() {
+        assert_eq!(shown(&["2001:db8::9", "172.16.0.4"]).first().map(String::as_str), Some("172.16.0.4"));
+    }
+
+    #[test]
+    fn nothing_to_show_gives_an_empty_list() {
+        assert!(shown(&[]).is_empty());
+        assert!(shown(&["127.0.0.1", "fe80::1"]).is_empty());
+    }
 }
 
 /// Converts a JSON value to a plain string for Schedule Criteria (see
