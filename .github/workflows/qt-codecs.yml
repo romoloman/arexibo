@@ -66,11 +66,6 @@ jobs:
           $head = git -C C:\v log -1 --format='%H %cs'
           "vcpkg: $head" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-      # vcpkg wants its binary cache directory to exist; the restore of the
-      # cache does not make it when there is nothing to restore.
-      - name: Make vcpkg's cache directory
-        run: New-Item -ItemType Directory -Force -Path C:\vc | Out-Null
-
       - uses: actions/cache/restore@v4
         with:
           path: C:\vc
@@ -80,6 +75,10 @@ jobs:
 
       - name: Stage 1, Qt base
         run: |
+          # vcpkg wants its binary cache directory to exist, and the restore of
+          # the cache does not make it when there is nothing to restore.
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          "binary cache $env:VCPKG_DEFAULT_BINARY_CACHE is a directory: $(Test-Path -PathType Container $env:VCPKG_DEFAULT_BINARY_CACHE)"
           $sw = [Diagnostics.Stopwatch]::StartNew()
           & C:\v\vcpkg.exe install "qtbase:${env:TRIPLET}" --x-buildtrees-root=C:\b --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtbase failed" }
@@ -95,6 +94,10 @@ jobs:
       # the engine itself.
       - name: Stage 2, Qt WebEngine with the proprietary codecs
         run: |
+          # vcpkg wants its binary cache directory to exist, and the restore of
+          # the cache does not make it when there is nothing to restore.
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          "binary cache $env:VCPKG_DEFAULT_BINARY_CACHE is a directory: $(Test-Path -PathType Container $env:VCPKG_DEFAULT_BINARY_CACHE)"
           $sw = [Diagnostics.Stopwatch]::StartNew()
           & C:\v\vcpkg.exe install "qtwebengine[proprietary-codecs,webchannel]:${env:TRIPLET}" --x-buildtrees-root=C:\b --clean-after-build
           if ($LASTEXITCODE -ne 0) { throw "vcpkg install qtwebengine failed" }
